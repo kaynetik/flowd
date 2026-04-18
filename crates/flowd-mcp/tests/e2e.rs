@@ -32,6 +32,7 @@ use flowd_core::rules::{InMemoryRuleEvaluator, Rule, RuleEvaluator};
 use flowd_core::types::Embedding;
 use flowd_mcp::protocol::JsonRpcResponse;
 use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig};
+use flowd_storage::plan_store::SqlitePlanStore;
 use flowd_storage::sqlite::SqliteBackend;
 
 /// Full concrete handler type. Pins the generics so `McpServer<Handlers>`
@@ -40,7 +41,7 @@ type Handlers = FlowdHandlers<
     SqliteBackend,
     MemVectors,
     HashEmbedder,
-    InMemoryPlanExecutor<EchoSpawner>,
+    InMemoryPlanExecutor<EchoSpawner, SqlitePlanStore>,
     InMemoryRuleEvaluator,
 >;
 
@@ -129,6 +130,7 @@ fn build_harness() -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("flowd.db");
     let backend = SqliteBackend::open(&db_path).expect("open sqlite");
+    let plan_store = backend.plan_store();
 
     let memory = Arc::new(MemoryService::new(
         backend,
@@ -137,7 +139,10 @@ fn build_harness() -> Harness {
     ));
 
     let spawner = EchoSpawner::default();
-    let executor = Arc::new(InMemoryPlanExecutor::new(spawner.clone()));
+    let executor = Arc::new(InMemoryPlanExecutor::with_plan_store(
+        spawner.clone(),
+        plan_store,
+    ));
 
     let mut rules = InMemoryRuleEvaluator::new();
     rules
@@ -182,6 +187,7 @@ fn tool_payload(resp: &JsonRpcResponse) -> Value {
 // ---------- The test ------------------------------------------------------
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn full_composed_session_roundtrip() {
     let harness = build_harness();
 
@@ -249,11 +255,11 @@ async fn full_composed_session_roundtrip() {
     // initialize: protocol handshake sanity
     assert!(responses[0].result.as_ref().unwrap()["protocolVersion"].is_string());
 
-    // tools/list: we ship exactly the 8 MCP tools
+    // tools/list: we ship exactly the 9 MCP tools
     let tools = responses[1].result.as_ref().unwrap()["tools"]
         .as_array()
         .unwrap();
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 9);
 
     // memory_store: returns the new UUID
     let stored = tool_payload(&responses[2]);

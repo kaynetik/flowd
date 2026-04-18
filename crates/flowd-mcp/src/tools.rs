@@ -60,6 +60,11 @@ pub struct PlanStatusParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlanResumeParams {
+    pub plan_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RulesCheckParams {
     pub tool: String,
     #[serde(default)]
@@ -225,6 +230,16 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
             }),
         },
         ToolSchema {
+            name: "plan_resume".into(),
+            description: "Reset failed steps to pending, confirm the plan, and re-run execution in the background."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["plan_id"],
+                "properties": { "plan_id": { "type": "string", "description": "UUID of the plan to resume" } }
+            }),
+        },
+        ToolSchema {
             name: "rules_check".into(),
             description: "Validate a proposed tool invocation against loaded rules (warn / deny)."
                 .into(),
@@ -265,7 +280,7 @@ mod tests {
             assert!(!s.description.trim().is_empty());
             assert_eq!(s.input_schema["type"], "object");
         }
-        assert_eq!(schemas.len(), 8);
+        assert_eq!(schemas.len(), 9);
     }
 
     #[test]

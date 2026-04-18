@@ -12,6 +12,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+use crate::plan_store::SqlitePlanStore;
+
 #[derive(Clone)]
 pub struct SqliteBackend {
     conn: Arc<Mutex<Connection>>,
@@ -35,6 +37,12 @@ impl SqliteBackend {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Persistent plan store sharing this database connection (same mutex as queries).
+    #[must_use]
+    pub fn plan_store(&self) -> SqlitePlanStore {
+        SqlitePlanStore::from_connection(Arc::clone(&self.conn))
     }
 }
 

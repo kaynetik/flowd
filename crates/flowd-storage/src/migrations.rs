@@ -4,7 +4,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[MIGRATION_001];
+const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002];
 
 const MIGRATION_001: &str = r"
 CREATE TABLE IF NOT EXISTS migrations (
@@ -92,6 +92,10 @@ CREATE INDEX IF NOT EXISTS idx_observations_tier ON observations(tier);
 CREATE INDEX IF NOT EXISTS idx_observations_created ON observations(created_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_plan_steps_status ON plan_steps(status);
+";
+
+const MIGRATION_002: &str = r"
+ALTER TABLE plans ADD COLUMN project TEXT;
 ";
 
 /// Run all pending migrations.

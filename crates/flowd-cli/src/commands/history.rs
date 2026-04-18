@@ -35,7 +35,7 @@ pub async fn run(
     if let Some(cutoff) = since_ts {
         sessions.retain(|s| s.started_at >= cutoff);
     }
-    sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
     sessions.truncate(limit);
 
     let title = match project.as_deref() {

@@ -3,6 +3,27 @@
 //!
 //! This command intentionally runs foreground. Service managers
 //! (systemd / launchd) or the shell's `&` handle detachment.
+//!
+//! ## Wiring overview
+//!
+//! `start` is the integration point where every flowd subsystem meets:
+//!
+//! ```text
+//!  SqliteBackend ──┐
+//!  QdrantIndex   ──┼─→ MemoryService::from_shared ──→ FlowdHandlers ──→ McpServer
+//!  OnnxEmbedder  ──┘                                       │
+//!                  │                                       │
+//!                  └─→ Compactor (background tokio task) ←─┴─ ActivityMonitor
+//!                          │                                  (touched on every
+//!                          └─→ NoopSummarizer (Hot → Warm)     handler call)
+//!
+//!  LocalShellSpawner / UnconfiguredSpawner ─→ InMemoryPlanExecutor + SqlitePlanStore ─→ FlowdHandlers
+//! ```
+//!
+//! Sharing the three backends as `Arc` is what unlocks the compactor:
+//! the same `SQLite` connection / Qdrant client / ONNX session powers both
+//! the live request path and the background sweep, so a summarized
+//! observation is immediately visible to the next `memory_context` call.
 
 use std::sync::Arc;
 
@@ -10,10 +31,12 @@ use anyhow::{Context, Result};
 use tokio::signal::unix::{SignalKind, signal};
 
 use flowd_core::memory::EmbeddingProvider;
+use flowd_core::memory::compactor::{ActivityMonitor, Compactor, CompactorConfig};
 use flowd_core::memory::service::MemoryService;
+use flowd_core::memory::tier::TieringPolicy;
 use flowd_core::orchestration::executor::InMemoryPlanExecutor;
-use flowd_core::orchestration::{AgentOutput, PlanStep};
 use flowd_core::rules::{InMemoryRuleEvaluator, RuleEvaluator};
+use flowd_mcp::summarizer::NoopSummarizer;
 use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig};
 use flowd_onnx::provider::OnnxEmbedder;
 use flowd_storage::sqlite::SqliteBackend;
@@ -22,20 +45,7 @@ use flowd_vector::qdrant::{QdrantConfig, QdrantIndex};
 use crate::daemon::PidFile;
 use crate::output::Style;
 use crate::paths::FlowdPaths;
-
-/// Placeholder `AgentSpawner` used until a real implementation lands in a
-/// later issue. Every step returns an immediate "not configured" error so
-/// any plan confirmation fails loudly rather than silently no-opping.
-#[derive(Debug, Default, Clone)]
-struct StubAgentSpawner;
-
-impl flowd_core::orchestration::executor::AgentSpawner for StubAgentSpawner {
-    async fn spawn(&self, _step: &PlanStep) -> flowd_core::error::Result<AgentOutput> {
-        Err(flowd_core::error::FlowdError::PlanExecution(
-            "no agent spawner configured -- plan execution is not wired yet".into(),
-        ))
-    }
-}
+use crate::spawner::BoxedSpawner;
 
 pub async fn run(paths: &FlowdPaths, style: Style, qdrant_url: Option<String>) -> Result<()> {
     paths.ensure_home()?;
@@ -49,17 +59,40 @@ pub async fn run(paths: &FlowdPaths, style: Style, qdrant_url: Option<String>) -
         pid.path().display()
     );
 
-    // Compose backends. Failures here bubble up; the PidFile guard takes
-    // care of cleanup on drop.
-    let memory_service = compose_memory(paths, qdrant_url.as_deref()).await?;
-    let executor = Arc::new(InMemoryPlanExecutor::new(StubAgentSpawner));
-    let rules = compose_rules(paths, style)?;
-    let handlers = Arc::new(FlowdHandlers::new(
-        Arc::new(memory_service),
-        executor,
-        Arc::new(rules),
-    ));
+    // ---- Memory backends (shared between live handlers & compactor) ----
+    let backends = compose_backends(paths, qdrant_url.as_deref()).await?;
+    let memory_service = MemoryService::from_shared(
+        Arc::clone(&backends.sqlite),
+        Arc::clone(&backends.qdrant),
+        Arc::clone(&backends.embedder),
+    );
 
+    // ---- Background compactor: Hot → Warm summaries, Warm → Cold demotion.
+    let monitor = ActivityMonitor::new();
+    let compactor_handle = spawn_compactor(&backends, monitor.clone(), style);
+
+    // ---- Plan execution wiring: select an agent CLI from $PATH or env.
+    let spawner = Arc::new(BoxedSpawner::auto());
+    eprintln!(
+        "{} agent spawner: {}",
+        style.cyan("using"),
+        spawner.description()
+    );
+    let plan_store = backends.sqlite.plan_store();
+    let executor = Arc::new(InMemoryPlanExecutor::from_shared_with_store(
+        spawner, plan_store,
+    ));
+    executor
+        .rehydrate()
+        .await
+        .map_err(|e| anyhow::anyhow!("rehydrate orchestration plans: {e}"))?;
+
+    let rules = compose_rules(paths, style)?;
+
+    let handlers = Arc::new(
+        FlowdHandlers::new(Arc::new(memory_service), executor, Arc::new(rules))
+            .with_activity_monitor(monitor),
+    );
     let server = McpServer::new(handlers, McpServerConfig::default());
 
     eprintln!(
@@ -85,15 +118,28 @@ pub async fn run(paths: &FlowdPaths, style: Style, qdrant_url: Option<String>) -
         }
     }
 
+    // Stop the compactor *before* dropping the PID file so any in-flight
+    // compaction completes (or aborts cleanly) while the daemon is still
+    // marked alive. `stop` is idempotent and short-circuits on Drop.
+    compactor_handle.stop().await;
+
     drop(pid); // explicit for clarity; would run anyway at scope exit
     eprintln!("{} daemon stopped", style.green("done"));
     Ok(())
 }
 
-async fn compose_memory(
+/// Backends needed by both the live request path and the background
+/// compactor. Held as `Arc`s so cloning is cheap and refcount-managed.
+struct SharedBackends {
+    sqlite: Arc<SqliteBackend>,
+    qdrant: Arc<QdrantIndex>,
+    embedder: Arc<OnnxEmbedder>,
+}
+
+async fn compose_backends(
     paths: &FlowdPaths,
     qdrant_url_override: Option<&str>,
-) -> Result<MemoryService<SqliteBackend, QdrantIndex, OnnxEmbedder>> {
+) -> Result<SharedBackends> {
     let sqlite = SqliteBackend::open(&paths.db_file())
         .with_context(|| format!("open sqlite at {}", paths.db_file().display()))?;
 
@@ -113,7 +159,41 @@ async fn compose_memory(
         .await
         .with_context(|| format!("connect to qdrant at {}", qcfg.url))?;
 
-    Ok(MemoryService::new(sqlite, qdrant, embedder))
+    Ok(SharedBackends {
+        sqlite: Arc::new(sqlite),
+        qdrant: Arc::new(qdrant),
+        embedder: Arc::new(embedder),
+    })
+}
+
+/// Construct and spawn the background compactor. Returns the handle whose
+/// `stop()` must be awaited at shutdown so any in-flight pass drains cleanly.
+fn spawn_compactor(
+    backends: &SharedBackends,
+    monitor: ActivityMonitor,
+    style: Style,
+) -> flowd_core::memory::compactor::CompactorHandle {
+    let summarizer = Arc::new(NoopSummarizer::new());
+    let policy = TieringPolicy::standard();
+    let config = CompactorConfig::default();
+    let compactor = Compactor::new(
+        Arc::clone(&backends.sqlite),
+        Arc::clone(&backends.qdrant),
+        Arc::clone(&backends.embedder),
+        summarizer,
+        policy,
+        monitor,
+        config,
+    );
+
+    eprintln!(
+        "{} compactor (idle threshold: {:?}, hot→warm: {:?}, warm→cold: {:?})",
+        style.cyan("spawned"),
+        config.idle_threshold,
+        policy.hot_max_age().to_std().unwrap_or_default(),
+        policy.warm_max_age().to_std().unwrap_or_default(),
+    );
+    compactor.spawn()
 }
 
 fn compose_rules(paths: &FlowdPaths, style: Style) -> Result<InMemoryRuleEvaluator> {

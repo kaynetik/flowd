@@ -4,4 +4,5 @@
 //! bundled `SQLite` and FTS5 for full-text keyword search.
 
 pub mod migrations;
+pub mod plan_store;
 pub mod sqlite;

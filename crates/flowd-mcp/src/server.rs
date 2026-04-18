@@ -21,8 +21,8 @@ use crate::handlers::McpHandlers;
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::tools::{
     MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanConfirmParams,
-    PlanCreateParams, PlanStatusParams, RulesCheckParams, RulesListParams, ToolResult,
-    all_tool_schemas,
+    PlanCreateParams, PlanResumeParams, PlanStatusParams, RulesCheckParams, RulesListParams,
+    ToolResult, all_tool_schemas,
 };
 
 /// MCP server configuration.
@@ -197,6 +197,10 @@ async fn dispatch_tool_call<H: McpHandlers>(
             Ok(p) => handlers.plan_status(p).await,
             Err(e) => return Err(e),
         },
+        "plan_resume" => match parse_params::<PlanResumeParams>(arguments) {
+            Ok(p) => handlers.plan_resume(p).await,
+            Err(e) => return Err(e),
+        },
         "rules_check" => match parse_params::<RulesCheckParams>(arguments) {
             Ok(p) => handlers.rules_check(p).await,
             Err(e) => return Err(e),
@@ -275,6 +279,12 @@ mod tests {
         ) -> flowd_core::error::Result<Value> {
             Ok(json!({"status": "running"}))
         }
+        async fn plan_resume(
+            &self,
+            _: crate::tools::PlanResumeParams,
+        ) -> flowd_core::error::Result<Value> {
+            Ok(json!({"status": "running"}))
+        }
         async fn rules_check(
             &self,
             _: crate::tools::RulesCheckParams,
@@ -319,7 +329,7 @@ mod tests {
         .await
         .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
     }
 
     #[tokio::test]

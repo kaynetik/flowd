@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use flowd_core::error::{FlowdError, Result};
+use flowd_core::memory::compactor::ActivityMonitor;
 use flowd_core::memory::context::AutoContextQuery;
 use flowd_core::memory::service::MemoryService;
 use flowd_core::memory::{EmbeddingProvider, MemoryBackend, VectorIndex};
@@ -27,7 +28,7 @@ use flowd_core::types::SearchQuery;
 
 use crate::tools::{
     MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanConfirmParams,
-    PlanCreateParams, PlanStatusParams, RulesCheckParams, RulesListParams,
+    PlanCreateParams, PlanResumeParams, PlanStatusParams, RulesCheckParams, RulesListParams,
 };
 
 /// Surface exposed by the MCP server. Return values are arbitrary JSON;
@@ -54,6 +55,8 @@ pub trait McpHandlers: Send + Sync {
 
     fn plan_status(&self, params: PlanStatusParams) -> impl Future<Output = Result<Value>> + Send;
 
+    fn plan_resume(&self, params: PlanResumeParams) -> impl Future<Output = Result<Value>> + Send;
+
     fn rules_check(&self, params: RulesCheckParams) -> impl Future<Output = Result<Value>> + Send;
 
     fn rules_list(&self, params: RulesListParams) -> impl Future<Output = Result<Value>> + Send;
@@ -75,6 +78,13 @@ where
     memory: Arc<MemoryService<M, V, E>>,
     executor: Arc<PE>,
     rules: Arc<R>,
+    /// Idle-detector consulted by the background compactor.
+    ///
+    /// Touched on every incoming MCP request so the compactor's "is the
+    /// daemon idle?" check sees real activity rather than wall-clock
+    /// elapsed time. Optional so test/stub composers don't have to wire
+    /// a monitor when they don't run a compactor.
+    monitor: Option<ActivityMonitor>,
 }
 
 impl<M, V, E, PE, R> FlowdHandlers<M, V, E, PE, R>
@@ -90,7 +100,16 @@ where
             memory,
             executor,
             rules,
+            monitor: None,
         }
+    }
+
+    /// Attach an `ActivityMonitor` so each handler call resets the idle
+    /// timer the background compactor watches. Returns `self` for chaining.
+    #[must_use]
+    pub fn with_activity_monitor(mut self, monitor: ActivityMonitor) -> Self {
+        self.monitor = Some(monitor);
+        self
     }
 
     #[must_use]
@@ -107,6 +126,13 @@ where
     pub fn rules(&self) -> &Arc<R> {
         &self.rules
     }
+
+    /// Mark "we just did something". Cheap; safe to call on every handler.
+    fn touch_activity(&self) {
+        if let Some(m) = &self.monitor {
+            m.touch();
+        }
+    }
 }
 
 fn parse_uuid(raw: &str) -> Result<Uuid> {
@@ -122,6 +148,7 @@ where
     R: RuleEvaluator + 'static,
 {
     async fn memory_store(&self, p: MemoryStoreParams) -> Result<Value> {
+        self.touch_activity();
         let session = parse_uuid(&p.session_id)?;
         // MCP clients hold the session UUID (Claude/Cursor assign it at
         // session start) but do not issue a separate start_session call.
@@ -136,6 +163,7 @@ where
     }
 
     async fn memory_search(&self, p: MemorySearchParams) -> Result<Value> {
+        self.touch_activity();
         let query = SearchQuery {
             text: p.query,
             project: p.project,
@@ -147,6 +175,7 @@ where
     }
 
     async fn memory_context(&self, p: MemoryContextParams) -> Result<Value> {
+        self.touch_activity();
         let mut ctx = AutoContextQuery::new(&p.project);
         if let Some(f) = p.file_path.as_deref() {
             ctx = ctx.with_file(f);
@@ -177,6 +206,7 @@ where
     }
 
     async fn plan_create(&self, p: PlanCreateParams) -> Result<Value> {
+        self.touch_activity();
         let def: PlanDefinition = serde_json::from_value(p.definition)
             .map_err(|e| FlowdError::PlanValidation(format!("invalid PlanDefinition: {e}")))?;
         let plan = def.into_plan();
@@ -189,6 +219,7 @@ where
     }
 
     async fn plan_confirm(&self, p: PlanConfirmParams) -> Result<Value> {
+        self.touch_activity();
         let id = parse_uuid(&p.plan_id)?;
         let preview = self.executor.confirm(id).await?;
         // Kick off execution in the background; plan_status is the polling
@@ -208,12 +239,31 @@ where
     }
 
     async fn plan_status(&self, p: PlanStatusParams) -> Result<Value> {
+        // Deliberately do *not* touch_activity here: status polling should
+        // not keep the daemon "busy" forever and starve the compactor.
         let id = parse_uuid(&p.plan_id)?;
         let plan = self.executor.status(id).await?;
         serde_json::to_value(&plan).map_err(|e| FlowdError::Serialization(e.to_string()))
     }
 
+    async fn plan_resume(&self, p: PlanResumeParams) -> Result<Value> {
+        self.touch_activity();
+        let id = parse_uuid(&p.plan_id)?;
+        self.executor.resume_plan(id).await?;
+        let exec = Arc::clone(&self.executor);
+        tokio::spawn(async move {
+            if let Err(e) = exec.execute(id).await {
+                tracing::warn!(plan_id = %id, error = %e, "plan resume execution failed");
+            }
+        });
+        Ok(json!({
+            "plan_id": id.to_string(),
+            "status": "running",
+        }))
+    }
+
     async fn rules_check(&self, p: RulesCheckParams) -> Result<Value> {
+        self.touch_activity();
         let mut action = ProposedAction::new(p.tool);
         if let Some(f) = p.file_path {
             action = action.with_file(f);
@@ -226,6 +276,8 @@ where
     }
 
     async fn rules_list(&self, p: RulesListParams) -> Result<Value> {
+        // rules_list is a read-only metadata query; treat like plan_status
+        // and leave activity alone.
         let matches = self
             .rules
             .matching_rules(p.project.as_deref(), p.file_path.as_deref());

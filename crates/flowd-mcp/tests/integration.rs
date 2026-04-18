@@ -11,7 +11,7 @@ use flowd_core::error::Result;
 use flowd_mcp::protocol::{JSON_RPC_VERSION, JsonRpcResponse};
 use flowd_mcp::tools::{
     MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanConfirmParams,
-    PlanCreateParams, PlanStatusParams, RulesCheckParams, RulesListParams,
+    PlanCreateParams, PlanResumeParams, PlanStatusParams, RulesCheckParams, RulesListParams,
 };
 use flowd_mcp::{McpHandlers, McpServer, McpServerConfig};
 use serde_json::{Value, json};
@@ -38,6 +38,9 @@ impl McpHandlers for EchoHandlers {
     }
     async fn plan_status(&self, _: PlanStatusParams) -> Result<Value> {
         Ok(json!({"ok": "plan_status"}))
+    }
+    async fn plan_resume(&self, _: PlanResumeParams) -> Result<Value> {
+        Ok(json!({"ok": "plan_resume"}))
     }
     async fn rules_check(&self, _: RulesCheckParams) -> Result<Value> {
         Ok(json!({"ok": "rules_check"}))
@@ -102,11 +105,11 @@ async fn full_mcp_session_roundtrip() {
             .is_some()
     );
 
-    // tools/list has 8 tools
+    // tools/list has 9 tools
     let tools = responses[1].result.as_ref().unwrap()["tools"]
         .as_array()
         .unwrap();
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 9);
 
     // tools/call rules_check -> success envelope
     let ok_result = responses[2].result.as_ref().unwrap();

@@ -23,7 +23,9 @@
 //!
 //! Plan state lives in a `std::sync::Mutex<HashMap>`. Critical sections only
 //! hold the lock while reading or mutating the store -- never across an
-//! `.await` boundary -- so the executor remains responsive under load.
+//! `.await` boundary -- so the executor remains responsive under load. When a
+//! [`crate::orchestration::PlanStore`] is configured, every transition is
+//! mirrored to durable storage so the daemon can `rehydrate` after restart.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -39,7 +41,8 @@ use uuid::Uuid;
 use crate::error::{FlowdError, Result};
 
 use super::{
-    Plan, PlanExecutor, PlanPreview, PlanStatus, PlanStep, StepStatus, build_preview, validate_plan,
+    NoOpPlanStore, Plan, PlanExecutor, PlanPreview, PlanStatus, PlanStep, PlanStore, StepStatus,
+    build_preview, validate_plan,
 };
 
 /// Output captured from an agent invocation.
@@ -85,27 +88,69 @@ struct PlanRuntime {
     in_flight: Vec<AbortHandle>,
 }
 
-/// Default executor. Generic over the spawner so the type system encodes the
-/// concrete agent-invocation strategy chosen at composition time -- no
-/// dynamic dispatch on the hot path.
-pub struct InMemoryPlanExecutor<S: AgentSpawner + 'static> {
+/// Default executor. Generic over the spawner and an optional [`PlanStore`].
+pub struct InMemoryPlanExecutor<S: AgentSpawner + 'static, PS: PlanStore = NoOpPlanStore> {
     spawner: Arc<S>,
     plans: Arc<Mutex<HashMap<Uuid, PlanRuntime>>>,
+    store: PS,
 }
 
-impl<S: AgentSpawner + 'static> InMemoryPlanExecutor<S> {
+impl<S: AgentSpawner + 'static> InMemoryPlanExecutor<S, NoOpPlanStore> {
     pub fn new(spawner: S) -> Self {
-        Self {
-            spawner: Arc::new(spawner),
-            plans: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::with_plan_store(spawner, NoOpPlanStore)
     }
 
     pub fn from_shared(spawner: Arc<S>) -> Self {
         Self {
             spawner,
             plans: Arc::new(Mutex::new(HashMap::new())),
+            store: NoOpPlanStore,
         }
+    }
+}
+
+impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
+    pub fn with_plan_store(spawner: S, store: PS) -> Self {
+        Self {
+            spawner: Arc::new(spawner),
+            plans: Arc::new(Mutex::new(HashMap::new())),
+            store,
+        }
+    }
+
+    pub fn from_shared_with_store(spawner: Arc<S>, store: PS) -> Self {
+        Self {
+            spawner,
+            plans: Arc::new(Mutex::new(HashMap::new())),
+            store,
+        }
+    }
+
+    /// Reload non-terminal plans from [`PlanStore`] into the in-memory map.
+    ///
+    /// # Errors
+    /// Propagates storage failures.
+    pub async fn rehydrate(&self) -> Result<()> {
+        let summaries = self.store.list_plans(None).await?;
+        for s in summaries {
+            if s.status.is_terminal() {
+                continue;
+            }
+            let Some(plan) = self.store.load_plan(s.id).await? else {
+                continue;
+            };
+            let runtime = PlanRuntime {
+                plan,
+                cancel: Arc::new(AtomicBool::new(false)),
+                in_flight: Vec::new(),
+            };
+            let mut guard = self
+                .plans
+                .lock()
+                .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
+            guard.insert(s.id, runtime);
+        }
+        Ok(())
     }
 
     /// Look up a plan by id without mutating; used by external callers that
@@ -117,6 +162,13 @@ impl<S: AgentSpawner + 'static> InMemoryPlanExecutor<S> {
             .ok()?
             .get(&plan_id)
             .map(|r| r.plan.clone())
+    }
+
+    async fn persist_snapshot(&self, plan_id: Uuid) -> Result<()> {
+        let plan = self
+            .snapshot(plan_id)
+            .ok_or(FlowdError::PlanNotFound(plan_id))?;
+        self.store.save_plan(&plan).await
     }
 
     fn with_plan_mut<R>(&self, plan_id: Uuid, f: impl FnOnce(&mut PlanRuntime) -> R) -> Result<R> {
@@ -131,7 +183,7 @@ impl<S: AgentSpawner + 'static> InMemoryPlanExecutor<S> {
     }
 }
 
-impl<S: AgentSpawner + 'static> PlanExecutor for InMemoryPlanExecutor<S> {
+impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExecutor<S, PS> {
     fn validate(&self, plan: &Plan) -> Result<()> {
         validate_plan(plan)
     }
@@ -148,16 +200,22 @@ impl<S: AgentSpawner + 'static> PlanExecutor for InMemoryPlanExecutor<S> {
             cancel: Arc::new(AtomicBool::new(false)),
             in_flight: Vec::new(),
         };
-        let mut guard = self
-            .plans
-            .lock()
-            .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
-        guard.insert(id, runtime);
+        // Scope the guard so its destructor runs *before* the `.await`.
+        // Explicit `drop(guard)` is not enough for the future's auto-Send
+        // analysis — a syntactic scope block is.
+        {
+            let mut guard = self
+                .plans
+                .lock()
+                .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
+            guard.insert(id, runtime);
+        }
+        self.persist_snapshot(id).await?;
         Ok(id)
     }
 
     async fn confirm(&self, plan_id: Uuid) -> Result<PlanPreview> {
-        self.with_plan_mut(plan_id, |runtime| {
+        let preview = self.with_plan_mut(plan_id, |runtime| {
             if runtime.plan.status != PlanStatus::Draft {
                 return Err(FlowdError::PlanExecution(format!(
                     "plan `{plan_id}` is not in Draft state (currently {:?})",
@@ -167,7 +225,9 @@ impl<S: AgentSpawner + 'static> PlanExecutor for InMemoryPlanExecutor<S> {
             let preview = build_preview(&runtime.plan)?;
             runtime.plan.status = PlanStatus::Confirmed;
             Ok(preview)
-        })?
+        })??;
+        self.persist_snapshot(plan_id).await?;
+        Ok(preview)
     }
 
     async fn execute(&self, plan_id: Uuid) -> Result<()> {
@@ -190,6 +250,8 @@ impl<S: AgentSpawner + 'static> PlanExecutor for InMemoryPlanExecutor<S> {
             runtime.plan.started_at = Some(Utc::now());
             (runtime.plan.clone(), Arc::clone(&runtime.cancel))
         };
+
+        self.persist_snapshot(plan_id).await?;
 
         let layers = plan.execution_layers()?;
         let mut overall_failed = false;
@@ -253,6 +315,9 @@ impl<S: AgentSpawner + 'static> PlanExecutor for InMemoryPlanExecutor<S> {
             self.with_plan_mut(plan_id, |runtime| {
                 runtime.plan.steps.clone_from(&plan.steps);
             })?;
+            self.persist_snapshot(plan_id).await?;
+            // Allow other tasks (and tests) to observe state between DAG layers.
+            tokio::task::yield_now().await;
 
             if overall_failed {
                 break 'outer;
@@ -274,6 +339,7 @@ impl<S: AgentSpawner + 'static> PlanExecutor for InMemoryPlanExecutor<S> {
             runtime.plan.steps.clone_from(&plan.steps);
             runtime.in_flight.clear();
         })?;
+        self.persist_snapshot(plan_id).await?;
 
         Ok(())
     }
@@ -300,6 +366,34 @@ impl<S: AgentSpawner + 'static> PlanExecutor for InMemoryPlanExecutor<S> {
             h.abort();
         }
         Ok(())
+    }
+
+    async fn resume_plan(&self, plan_id: Uuid) -> Result<()> {
+        self.with_plan_mut(plan_id, |runtime| {
+            // Only `Failed` is resumable. `Completed` has nothing to do;
+            // `Cancelled` is an explicit user stop (re-create the plan if
+            // you want to retry); `Running` is racing with another caller.
+            if runtime.plan.status != PlanStatus::Failed {
+                return Err(FlowdError::PlanExecution(format!(
+                    "plan `{plan_id}` is in {:?} state; only Failed plans can be resumed",
+                    runtime.plan.status
+                )));
+            }
+            for step in &mut runtime.plan.steps {
+                if step.status == StepStatus::Failed {
+                    step.status = StepStatus::Pending;
+                    step.error = None;
+                    step.output = None;
+                    step.started_at = None;
+                    step.completed_at = None;
+                }
+            }
+            runtime.plan.status = PlanStatus::Confirmed;
+            runtime.cancel = Arc::new(AtomicBool::new(false));
+            runtime.in_flight.clear();
+            Ok(())
+        })??;
+        self.persist_snapshot(plan_id).await
     }
 }
 
@@ -396,6 +490,68 @@ mod tests {
         }
     }
 
+    /// In-memory [`PlanStore`] for unit tests.
+    #[derive(Clone, Default)]
+    struct MapPlanStore(Arc<Mutex<HashMap<Uuid, Plan>>>);
+
+    impl PlanStore for MapPlanStore {
+        fn save_plan(&self, plan: &Plan) -> impl Future<Output = Result<()>> + Send {
+            let m = Arc::clone(&self.0);
+            let plan = plan.clone();
+            async move {
+                m.lock()
+                    .map_err(|_| FlowdError::PlanExecution("map store poisoned".into()))?
+                    .insert(plan.id, plan);
+                Ok(())
+            }
+        }
+
+        fn load_plan(&self, id: Uuid) -> impl Future<Output = Result<Option<Plan>>> + Send {
+            let m = Arc::clone(&self.0);
+            async move {
+                Ok(m.lock()
+                    .map_err(|_| FlowdError::PlanExecution("map store poisoned".into()))?
+                    .get(&id)
+                    .cloned())
+            }
+        }
+
+        fn list_plans(
+            &self,
+            project: Option<&str>,
+        ) -> impl Future<Output = Result<Vec<crate::orchestration::PlanSummary>>> + Send {
+            let m = Arc::clone(&self.0);
+            async move {
+                let guard = m
+                    .lock()
+                    .map_err(|_| FlowdError::PlanExecution("map store poisoned".into()))?;
+                let mut out: Vec<crate::orchestration::PlanSummary> = guard
+                    .values()
+                    .filter(|p| project.is_none_or(|pr| p.project.as_deref() == Some(pr)))
+                    .map(|p| crate::orchestration::PlanSummary {
+                        id: p.id,
+                        name: p.name.clone(),
+                        status: p.status,
+                        created_at: p.created_at,
+                        project: p.project.clone(),
+                    })
+                    .collect();
+                out.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+                Ok(out)
+            }
+        }
+
+        fn delete_plan(&self, id: Uuid) -> impl Future<Output = Result<()>> + Send {
+            let m = Arc::clone(&self.0);
+            async move {
+                m.lock()
+                    .map_err(|_| FlowdError::PlanExecution("map store poisoned".into()))?
+                    .remove(&id);
+                Ok(())
+            }
+        }
+    }
+
     /// Spawner that records invocations and returns canned responses.
     struct EchoSpawner {
         invocations: Arc<AtomicUsize>,
@@ -429,8 +585,36 @@ mod tests {
         }
     }
 
+    /// First global spawn attempt fails; later attempts succeed (for resume).
+    struct FailOnceThenSucceed {
+        n: Arc<AtomicUsize>,
+    }
+
+    impl AgentSpawner for FailOnceThenSucceed {
+        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+            let c = self.n.fetch_add(1, Ordering::SeqCst);
+            if c == 0 {
+                Err(FlowdError::PlanExecution("first run fails".into()))
+            } else {
+                Ok(AgentOutput::success(format!("ok:{}", step.id)))
+            }
+        }
+    }
+
+    /// Blocks indefinitely on step id `"c"` (for partial multi-layer runs).
+    struct BlockStepC;
+
+    impl AgentSpawner for BlockStepC {
+        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+            if step.id == "c" {
+                std::future::poll_fn(|_| std::task::Poll::<()>::Pending).await;
+            }
+            Ok(AgentOutput::success(format!("ran:{}", step.id)))
+        }
+    }
+
     fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
+        tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
@@ -559,6 +743,80 @@ mod tests {
         rt().block_on(async {
             let err = exec.status(Uuid::new_v4()).await.unwrap_err();
             assert!(matches!(err, FlowdError::PlanNotFound(_)));
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn survives_restart() {
+        let store = MapPlanStore::default();
+        let spawner = BlockStepC;
+        let exec1 = InMemoryPlanExecutor::with_plan_store(spawner, store.clone());
+
+        let plan = Plan::new(
+            "p",
+            vec![step("a", &[]), step("b", &[]), step("c", &["a", "b"])],
+        );
+        let id = plan.id;
+        exec1.submit(plan).await.unwrap();
+        exec1.confirm(id).await.unwrap();
+
+        let exec_a = Arc::new(exec1);
+        let jh = tokio::spawn({
+            let e = Arc::clone(&exec_a);
+            async move { e.execute(id).await }
+        });
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            if let Ok(p) = exec_a.status(id).await {
+                if p.status == PlanStatus::Running
+                    && p.steps.iter().find(|s| s.id == "a").unwrap().status == StepStatus::Completed
+                    && p.steps.iter().find(|s| s.id == "b").unwrap().status == StepStatus::Completed
+                    && p.steps.iter().find(|s| s.id == "c").unwrap().status == StepStatus::Pending
+                {
+                    break;
+                }
+            }
+        }
+
+        jh.abort();
+
+        let exec2 = InMemoryPlanExecutor::with_plan_store(BlockStepC, store.clone());
+        exec2.rehydrate().await.unwrap();
+        let p = exec2.status(id).await.unwrap();
+        assert_eq!(p.status, PlanStatus::Running);
+        assert_eq!(p.steps[0].status, StepStatus::Completed);
+        assert_eq!(p.steps[1].status, StepStatus::Completed);
+        assert_eq!(p.steps[2].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn resume_resets_failed_steps() {
+        let store = MapPlanStore::default();
+        let spawner = FailOnceThenSucceed {
+            n: Arc::new(AtomicUsize::new(0)),
+        };
+        let exec = InMemoryPlanExecutor::with_plan_store(spawner, store);
+
+        let plan = Plan::new("p", vec![step("a", &[]), step("b", &["a"])]);
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            exec.execute(id).await.unwrap();
+            let failed = exec.status(id).await.unwrap();
+            assert_eq!(failed.status, PlanStatus::Failed);
+            assert_eq!(failed.steps[0].status, StepStatus::Failed);
+
+            exec.resume_plan(id).await.unwrap();
+            let ready = exec.status(id).await.unwrap();
+            assert_eq!(ready.status, PlanStatus::Confirmed);
+            assert_eq!(ready.steps[0].status, StepStatus::Pending);
+
+            exec.execute(id).await.unwrap();
+            let done = exec.status(id).await.unwrap();
+            assert_eq!(done.status, PlanStatus::Completed);
+            assert!(done.steps.iter().all(|s| s.status == StepStatus::Completed));
         });
     }
 }

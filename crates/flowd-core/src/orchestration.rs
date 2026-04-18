@@ -15,6 +15,7 @@
 
 pub mod executor;
 pub mod loader;
+pub mod store;
 
 use crate::error::{FlowdError, Result};
 use chrono::{DateTime, Utc};
@@ -25,12 +26,16 @@ use uuid::Uuid;
 
 pub use executor::{AgentOutput, AgentSpawner, InMemoryPlanExecutor};
 pub use loader::{PlanDefinition, StepDefinition, load_plan, load_plan_json, load_plan_yaml};
+pub use store::{NoOpPlanStore, PlanStore, PlanSummary};
 
 /// A complete orchestration plan (DAG of steps).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub id: Uuid,
     pub name: String,
+    /// Optional scope label (e.g. repo id) for filtering; not required for execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     pub steps: Vec<PlanStep>,
     pub status: PlanStatus,
     pub created_at: DateTime<Utc>,
@@ -63,6 +68,13 @@ pub enum PlanStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl PlanStatus {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +155,17 @@ pub trait PlanExecutor: Send + Sync {
     /// # Errors
     /// Returns `FlowdError::PlanNotFound` if the plan is unknown.
     fn cancel(&self, plan_id: Uuid) -> impl Future<Output = Result<()>> + Send;
+
+    /// Reset every [`crate::orchestration::StepStatus::Failed`] step to
+    /// [`StepStatus::Pending`], move the plan to [`PlanStatus::Confirmed`],
+    /// and clear the cancellation latch so [`Self::execute`] can run again.
+    ///
+    /// Does not start execution; callers typically follow with `execute`.
+    ///
+    /// # Errors
+    /// Returns `FlowdError::PlanNotFound` if the plan is unknown, or
+    /// `FlowdError::PlanExecution` if the plan is in a terminal state.
+    fn resume_plan(&self, plan_id: Uuid) -> impl Future<Output = Result<()>> + Send;
 }
 
 impl Plan {
@@ -152,6 +175,7 @@ impl Plan {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
+            project: None,
             steps,
             status: PlanStatus::Draft,
             created_at: Utc::now(),

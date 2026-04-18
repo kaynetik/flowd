@@ -13,6 +13,7 @@ mod commands;
 mod daemon;
 mod output;
 mod paths;
+mod spawner;
 
 use cli::{Cli, Command, RulesAction};
 use output::Style;

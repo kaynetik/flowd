@@ -18,9 +18,11 @@
 pub mod handlers;
 pub mod protocol;
 pub mod server;
+pub mod summarizer;
 pub mod tools;
 
 pub use handlers::{FlowdHandlers, McpHandlers};
 pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use server::{McpServer, McpServerConfig, dispatch};
+pub use summarizer::NoopSummarizer;
 pub use tools::{ToolContent, ToolResult, ToolSchema};
