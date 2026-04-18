@@ -1,0 +1,12 @@
+{
+  "_note": "Place at ~/.cursor/mcp.json (global) or <project>/.cursor/mcp.json (per-project). The 'flowd' binary must be on $PATH.",
+  "mcpServers": {
+    "flowd": {
+      "command": "flowd",
+      "args": ["start"],
+      "env": {
+        "RUST_LOG": "flowd=info"
+      }
+    }
+  }
+}

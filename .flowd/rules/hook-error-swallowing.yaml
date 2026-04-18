@@ -1,0 +1,10 @@
+id: hooks-swallow-errors-by-design
+scope: "hooks/**"
+level: warn
+description: |
+  Hooks intentionally swallow errors so they never block Claude Code.
+  A future agent will look at the missing error handling and try to
+  "fix" it -- don't. Persistence guarantees go through MCP
+  (`memory_store`), not hooks. See README "Recommendations" before
+  changing the error-handling shape of any script under hooks/.
+match: "hooks/.*\\.(sh|bash)$"

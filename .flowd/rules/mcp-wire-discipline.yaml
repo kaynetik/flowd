@@ -1,0 +1,10 @@
+id: mcp-wire-discipline
+scope: "crates/flowd-mcp/src/**"
+level: warn
+description: |
+  Stdout is reserved for JSON-RPC 2.0 frames when flowd runs as an MCP
+  stdio subprocess. Diagnostics MUST go to stderr -- use `eprintln!`,
+  `tracing::*`, or write to `std::io::stderr()`. A single stray
+  `println!`, `print!`, or `dbg!` corrupts the wire and breaks every
+  connected MCP client silently.
+match: "crates/flowd-mcp/src/.*\\.rs$"

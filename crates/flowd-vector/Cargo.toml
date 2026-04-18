@@ -1,0 +1,22 @@
+[package]
+name = "flowd-vector"
+version = "0.1.0"
+description = "Qdrant embedded vector index and hybrid search for flowd"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+flowd-core = { workspace = true }
+qdrant-client = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

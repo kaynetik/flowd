@@ -1,0 +1,31 @@
+[package]
+name = "flowd-cli"
+version = "0.1.0"
+description = "CLI binary for the flowd daemon"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flowd"
+path = "src/main.rs"
+
+[dependencies]
+flowd-core = { workspace = true }
+flowd-storage = { workspace = true }
+flowd-vector = { workspace = true }
+flowd-onnx = { workspace = true }
+flowd-mcp = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+libc = "0.2.185"
+
+[lints]
+workspace = true

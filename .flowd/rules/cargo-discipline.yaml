@@ -1,0 +1,24 @@
+- id: cargo-no-build
+  scope: "**"
+  level: deny
+  description: |
+    Use `cargo check` instead of `cargo build` for agent-driven feedback loops.
+    Full builds are wall-clock expensive; only run them on explicit user request
+    or as part of a release step.
+  match: "(^|[^a-zA-Z])cargo[ \\t]+build([ \\t]|$)"
+
+- id: cargo-no-workspace-test
+  scope: "**"
+  level: warn
+  description: |
+    Scope tests with `-p <crate>`; `cargo test --workspace` runs the full
+    suite and is reserved for explicit user request or pre-commit.
+  match: "cargo[ \\t]+test[ \\t]+--workspace"
+
+- id: cargo-no-install-from-path
+  scope: "**"
+  level: warn
+  description: |
+    Don't `cargo install --path` during dev iteration; that's an explicit
+    release / smoke-test step, not a feedback loop.
+  match: "cargo[ \\t]+install[ \\t]+--path"

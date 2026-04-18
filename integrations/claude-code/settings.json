@@ -1,0 +1,38 @@
+{
+  "_note": "Merge this into ~/.claude/settings.json. Replace /ABSOLUTE/PATH with your repo checkout. The 'flowd' binary must be on $PATH; if not, use the absolute path to the built binary (target/release/flowd).",
+  "mcpServers": {
+    "flowd": {
+      "command": "flowd",
+      "args": ["start"],
+      "env": {
+        "RUST_LOG": "flowd=info"
+      }
+    }
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "/ABSOLUTE/PATH/integrations/claude-code/hooks/session-start.sh" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "/ABSOLUTE/PATH/integrations/claude-code/hooks/post-tool-use.sh" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "/ABSOLUTE/PATH/integrations/claude-code/hooks/session-end.sh" }
+        ]
+      }
+    ]
+  }
+}

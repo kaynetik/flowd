@@ -1,0 +1,23 @@
+[package]
+name = "flowd-core"
+version = "0.1.0"
+description = "Core domain logic for flowd: memory, orchestration, rules"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+glob = { workspace = true }
+regex = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

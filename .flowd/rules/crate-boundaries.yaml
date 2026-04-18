@@ -1,0 +1,9 @@
+id: flowd-core-no-io-deps
+scope: "**"
+level: deny
+description: |
+  flowd-core defines traits and domain types only. Adding tokio, sqlx,
+  reqwest, qdrant-client, or ort to its Cargo.toml violates the
+  architecture: I/O belongs in flowd-storage, flowd-vector, or flowd-onnx,
+  with the trait definition staying in flowd-core.
+match: "crates/flowd-core/Cargo\\.toml$"

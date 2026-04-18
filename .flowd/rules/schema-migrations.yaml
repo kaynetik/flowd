@@ -1,0 +1,9 @@
+id: forward-only-migrations
+scope: "crates/flowd-storage/migrations/**"
+level: deny
+description: |
+  Schema migrations are forward-only by project policy. Editing an
+  existing migration file is a breaking change for every installed
+  user -- add a new, higher-numbered migration instead. Renaming or
+  reordering existing migrations is also forbidden.
+match: "crates/flowd-storage/migrations/.*\\.sql$"
