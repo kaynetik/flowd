@@ -32,18 +32,57 @@ pub use loader::{PlanDefinition, StepDefinition, load_plan, load_plan_json, load
 pub use store::{NoOpPlanStore, PlanStore, PlanSummary};
 
 /// A complete orchestration plan (DAG of steps).
+///
+/// `project` is the central namespace key across plans, rules, and
+/// observations: every rule's scope glob is matched against it, the plan
+/// observer scopes its writes by it, and `flowd history` / `flowd search`
+/// filter by it. Making it required (rather than `Option<String>`) removes
+/// an entire class of "silent skip" bugs that previously bit rules with
+/// `scope: "**"` and the memory plan observer when no project was set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub id: Uuid,
     pub name: String,
-    /// Optional scope label (e.g. repo id) for filtering; not required for execution.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
+    /// Required namespace label (e.g. repo id). Used for rule scoping,
+    /// observation grouping, and listing filters.
+    ///
+    /// Deserialisation tolerates a missing `project` for one specific
+    /// reason: pre-`HL-38` plan JSON stored in the `plans.definition`
+    /// column can be missing the field entirely (or `null`). Such rows
+    /// are backfilled to `__legacy__` -- matching the `SQLite` migration
+    /// `MIGRATION_003` -- so callers never see a partially-migrated
+    /// Plan. New code paths supply a real value via [`Self::new`] and
+    /// [`crate::orchestration::loader::PlanDefinition::into_plan`].
+    #[serde(
+        default = "default_legacy_project",
+        deserialize_with = "deserialize_project_with_legacy_fallback"
+    )]
+    pub project: String,
     pub steps: Vec<PlanStep>,
     pub status: PlanStatus,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+fn default_legacy_project() -> String {
+    "__legacy__".to_owned()
+}
+
+fn deserialize_project_with_legacy_fallback<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.map_or_else(default_legacy_project, |s| {
+        if s.trim().is_empty() {
+            default_legacy_project()
+        } else {
+            s
+        }
+    }))
 }
 
 /// An individual step within a plan.
@@ -179,12 +218,16 @@ pub trait PlanExecutor: Send + Sync {
 
 impl Plan {
     /// Construct a `Draft` plan from authored data.
+    ///
+    /// `project` is required because every downstream subsystem (rule
+    /// evaluator, plan observer, persistence layer) treats it as a
+    /// non-null namespace key.
     #[must_use]
-    pub fn new(name: impl Into<String>, steps: Vec<PlanStep>) -> Self {
+    pub fn new(name: impl Into<String>, project: impl Into<String>, steps: Vec<PlanStep>) -> Self {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
-            project: None,
+            project: project.into(),
             steps,
             status: PlanStatus::Draft,
             created_at: Utc::now(),
@@ -266,6 +309,9 @@ impl Plan {
 pub fn validate_plan(plan: &Plan) -> Result<()> {
     if plan.name.trim().is_empty() {
         return Err(FlowdError::PlanValidation("plan name is empty".into()));
+    }
+    if plan.project.trim().is_empty() {
+        return Err(FlowdError::PlanValidation("plan project is empty".into()));
     }
     if plan.steps.is_empty() {
         return Err(FlowdError::PlanValidation("plan has no steps".into()));
@@ -362,27 +408,34 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_plan() {
-        let plan = Plan::new("p", vec![]);
+        let plan = Plan::new("p", "proj", vec![]);
         assert!(validate_plan(&plan).is_err());
     }
 
     #[test]
+    fn validate_rejects_empty_project() {
+        let plan = Plan::new("p", "", vec![step("a", &[])]);
+        let err = validate_plan(&plan).unwrap_err();
+        assert!(matches!(err, FlowdError::PlanValidation(msg) if msg.contains("project")));
+    }
+
+    #[test]
     fn validate_rejects_unknown_dependency() {
-        let plan = Plan::new("p", vec![step("a", &["ghost"])]);
+        let plan = Plan::new("p", "proj", vec![step("a", &["ghost"])]);
         let err = validate_plan(&plan).unwrap_err();
         assert!(matches!(err, FlowdError::PlanValidation(msg) if msg.contains("ghost")));
     }
 
     #[test]
     fn validate_rejects_duplicate_ids() {
-        let plan = Plan::new("p", vec![step("a", &[]), step("a", &[])]);
+        let plan = Plan::new("p", "proj", vec![step("a", &[]), step("a", &[])]);
         let err = validate_plan(&plan).unwrap_err();
         assert!(matches!(err, FlowdError::PlanValidation(msg) if msg.contains("duplicate")));
     }
 
     #[test]
     fn validate_rejects_self_dependency() {
-        let plan = Plan::new("p", vec![step("a", &["a"])]);
+        let plan = Plan::new("p", "proj", vec![step("a", &["a"])]);
         let err = validate_plan(&plan).unwrap_err();
         assert!(matches!(err, FlowdError::PlanValidation(msg) if msg.contains("itself")));
     }
@@ -391,6 +444,7 @@ mod tests {
     fn validate_rejects_cycle() {
         let plan = Plan::new(
             "p",
+            "proj",
             vec![step("a", &["b"]), step("b", &["c"]), step("c", &["a"])],
         );
         let err = validate_plan(&plan).unwrap_err();
@@ -402,6 +456,7 @@ mod tests {
         // a -> c, b -> c, c -> d
         let plan = Plan::new(
             "p",
+            "proj",
             vec![
                 step("a", &[]),
                 step("b", &[]),
@@ -420,6 +475,7 @@ mod tests {
     fn build_preview_reports_parallelism() {
         let plan = Plan::new(
             "p",
+            "proj",
             vec![
                 step("a", &[]),
                 step("b", &[]),

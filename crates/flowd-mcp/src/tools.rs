@@ -45,7 +45,13 @@ pub struct MemoryContextParams {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PlanCreateParams {
+    /// Project namespace this plan belongs to. Required: every Plan in
+    /// flowd is project-scoped (see HL-38). Overrides any `project` field
+    /// embedded in `definition`.
+    pub project: String,
     /// Plan definition matching [`flowd_core::orchestration::PlanDefinition`].
+    /// May omit the `project` field; the top-level `project` parameter
+    /// is authoritative.
     pub definition: Value,
 }
 
@@ -202,8 +208,12 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
                 .into(),
             input_schema: json!({
                 "type": "object",
-                "required": ["definition"],
+                "required": ["project", "definition"],
                 "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project namespace for this plan; overrides any project in `definition`."
+                    },
                     "definition": {
                         "type": "object",
                         "description": "PlanDefinition as defined by flowd-core"

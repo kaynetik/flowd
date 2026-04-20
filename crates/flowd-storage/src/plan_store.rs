@@ -76,7 +76,7 @@ impl PlanStore for SqlitePlanStore {
                         plan.created_at.to_rfc3339(),
                         plan.started_at.map(|t| t.to_rfc3339()),
                         plan.completed_at.map(|t| t.to_rfc3339()),
-                        plan.project.as_deref(),
+                        &plan.project,
                     ],
                 )
                 .map_err(storage_err)?;
@@ -217,7 +217,9 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanSummary> {
     let id_str: String = row.get(0)?;
     let status_str: String = row.get(2)?;
     let created_str: String = row.get(3)?;
-    let project: Option<String> = row.get(4)?;
+    // After migration 003 the column is NOT NULL; legacy rows backfilled
+    // to '__legacy__'. Read as String directly.
+    let project: String = row.get(4)?;
 
     Ok(PlanSummary {
         id: Uuid::parse_str(&id_str).unwrap_or_default(),

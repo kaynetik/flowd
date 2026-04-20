@@ -356,7 +356,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
                     template::substitute(&step.prompt, &outputs, template::DEFAULT_PER_REF_BYTES);
 
                 if let Some(gate) = &self.rule_gate {
-                    let result = gate.gate(&step, plan.project.as_deref());
+                    let result = gate.gate(&step, plan.project.as_str());
                     for w in result.warnings() {
                         tracing::warn!(
                             plan_id = %plan_id,
@@ -712,7 +712,7 @@ mod tests {
                     .map_err(|_| FlowdError::PlanExecution("map store poisoned".into()))?;
                 let mut out: Vec<crate::orchestration::PlanSummary> = guard
                     .values()
-                    .filter(|p| project.is_none_or(|pr| p.project.as_deref() == Some(pr)))
+                    .filter(|p| project.is_none_or(|pr| p.project == pr))
                     .map(|p| crate::orchestration::PlanSummary {
                         id: p.id,
                         name: p.name.clone(),
@@ -832,6 +832,7 @@ mod tests {
 
         let plan = Plan::new(
             "p",
+            "proj",
             vec![step("a", &[]), step("b", &["a"]), step("c", &["b"])],
         );
 
@@ -860,7 +861,7 @@ mod tests {
         });
         rt().block_on(async {
             let id = exec
-                .submit(Plan::new("p", vec![step("a", &[])]))
+                .submit(Plan::new("p", "proj", vec![step("a", &[])]))
                 .await
                 .unwrap();
             let err = exec.execute(id).await.unwrap_err();
@@ -878,7 +879,7 @@ mod tests {
 
         let mut s = step("a", &[]);
         s.retry_count = 2;
-        let plan = Plan::new("p", vec![s]);
+        let plan = Plan::new("p", "proj", vec![s]);
 
         rt().block_on(async {
             let id = exec.submit(plan).await.unwrap();
@@ -894,7 +895,7 @@ mod tests {
     #[test]
     fn panicking_step_fails_isolated() {
         let exec = InMemoryPlanExecutor::new(PanicSpawner);
-        let plan = Plan::new("p", vec![step("a", &[])]);
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
         rt().block_on(async {
             let id = exec.submit(plan).await.unwrap();
             exec.confirm(id).await.unwrap();
@@ -919,7 +920,7 @@ mod tests {
         };
         let exec = InMemoryPlanExecutor::new(spawner);
 
-        let plan = Plan::new("p", vec![step("a", &[]), step("b", &["a"])]);
+        let plan = Plan::new("p", "proj", vec![step("a", &[]), step("b", &["a"])]);
 
         rt().block_on(async {
             let id = exec.submit(plan).await.unwrap();
@@ -956,6 +957,7 @@ mod tests {
 
         let plan = Plan::new(
             "p",
+            "proj",
             vec![step("a", &[]), step("b", &[]), step("c", &["a", "b"])],
         );
         let id = plan.id;
@@ -1013,7 +1015,7 @@ mod tests {
         })
         .with_observer(Arc::clone(&obs) as Arc<dyn PlanObserver>);
 
-        let plan = Plan::new("p", vec![step("a", &[]), step("b", &["a"])]);
+        let plan = Plan::new("p", "proj", vec![step("a", &[]), step("b", &["a"])]);
         let plan_id = plan.id;
 
         rt().block_on(async {
@@ -1076,11 +1078,9 @@ mod tests {
         })
         .with_rule_gate(gate);
 
-        // The rule's scope (`**`) is matched against project/file_path; the
-        // executor passes `plan.project` to the gate, so an empty project
-        // would put the rule out of scope and the deny would not fire.
-        let mut plan = Plan::new("p", vec![step("a", &[])]);
-        plan.project = Some("flowd".into());
+        // The rule's scope (`**`) is matched against the plan's project,
+        // which is now required, so always-on deny rules fire reliably.
+        let plan = Plan::new("p", "flowd", vec![step("a", &[])]);
 
         rt().block_on(async {
             let id = exec.submit(plan).await.unwrap();
@@ -1113,7 +1113,7 @@ mod tests {
         a.prompt = "produce-A".into();
         let mut b = step("b", &["a"]);
         b.prompt = "carry: {{steps.a.output}}".into();
-        let plan = Plan::new("p", vec![a, b]);
+        let plan = Plan::new("p", "proj", vec![a, b]);
 
         rt().block_on(async {
             let id = exec.submit(plan).await.unwrap();
@@ -1137,7 +1137,7 @@ mod tests {
         };
         let exec = InMemoryPlanExecutor::with_plan_store(spawner, store);
 
-        let plan = Plan::new("p", vec![step("a", &[]), step("b", &["a"])]);
+        let plan = Plan::new("p", "proj", vec![step("a", &[]), step("b", &["a"])]);
 
         rt().block_on(async {
             let id = exec.submit(plan).await.unwrap();

@@ -28,23 +28,24 @@ use uuid::Uuid;
 use super::PlanStatus;
 
 /// Lifecycle event emitted by the executor at well-defined transitions.
+///
+/// Every variant carries a non-optional `project` string -- mirroring the
+/// `Plan.project` invariant. Adapters can rely on it being a usable scope
+/// key without nil-checks.
 #[derive(Debug, Clone)]
 pub enum PlanEvent {
     /// A plan has been validated and registered (post-`submit`).
     Submitted {
         plan_id: Uuid,
         name: String,
-        project: Option<String>,
+        project: String,
     },
     /// `execute` has begun draining DAG layers.
-    Started {
-        plan_id: Uuid,
-        project: Option<String>,
-    },
+    Started { plan_id: Uuid, project: String },
     /// A step finished successfully and its output was captured.
     StepCompleted {
         plan_id: Uuid,
-        project: Option<String>,
+        project: String,
         step_id: String,
         agent_type: String,
         /// May be truncated by the adapter for storage.
@@ -53,7 +54,7 @@ pub enum PlanEvent {
     /// A step failed after exhausting retries (or never ran due to a panic).
     StepFailed {
         plan_id: Uuid,
-        project: Option<String>,
+        project: String,
         step_id: String,
         agent_type: String,
         error: String,
@@ -61,7 +62,7 @@ pub enum PlanEvent {
     /// A step was refused by the executor's gate (currently the rule gate).
     StepRefused {
         plan_id: Uuid,
-        project: Option<String>,
+        project: String,
         step_id: String,
         agent_type: String,
         reason: String,
@@ -69,14 +70,14 @@ pub enum PlanEvent {
     /// A step was aborted by user-initiated `cancel`.
     StepCancelled {
         plan_id: Uuid,
-        project: Option<String>,
+        project: String,
         step_id: String,
         agent_type: String,
     },
     /// `execute` has finished -- success, failure, or cancellation.
     Finished {
         plan_id: Uuid,
-        project: Option<String>,
+        project: String,
         status: PlanStatus,
     },
 }
@@ -96,9 +97,9 @@ impl PlanEvent {
         }
     }
 
-    /// Project every variant carries; `None` for plans without a project.
+    /// Project every variant carries.
     #[must_use]
-    pub fn project(&self) -> Option<&str> {
+    pub fn project(&self) -> &str {
         match self {
             Self::Submitted { project, .. }
             | Self::Started { project, .. }
@@ -106,7 +107,7 @@ impl PlanEvent {
             | Self::StepFailed { project, .. }
             | Self::StepRefused { project, .. }
             | Self::StepCancelled { project, .. }
-            | Self::Finished { project, .. } => project.as_deref(),
+            | Self::Finished { project, .. } => project.as_str(),
         }
     }
 }
@@ -132,19 +133,19 @@ mod tests {
         let id = Uuid::nil();
         let evt = PlanEvent::Started {
             plan_id: id,
-            project: Some("flowd".into()),
+            project: "flowd".into(),
         };
         assert_eq!(evt.plan_id(), id);
-        assert_eq!(evt.project(), Some("flowd"));
+        assert_eq!(evt.project(), "flowd");
     }
 
     #[test]
-    fn project_helper_handles_missing_project() {
+    fn project_helper_round_trips() {
         let evt = PlanEvent::Finished {
             plan_id: Uuid::nil(),
-            project: None,
+            project: "demo".into(),
             status: PlanStatus::Completed,
         };
-        assert!(evt.project().is_none());
+        assert_eq!(evt.project(), "demo");
     }
 }

@@ -256,6 +256,7 @@ mod tests {
     fn validate_accepts_transitive_dep() {
         let plan = Plan::new(
             "p",
+            "proj",
             vec![
                 step("a", &[], "first"),
                 step("b", &["a"], "depends on a"),
@@ -267,14 +268,18 @@ mod tests {
 
     #[test]
     fn validate_rejects_self_reference() {
-        let plan = Plan::new("p", vec![step("a", &[], "loop {{steps.a.output}}")]);
+        let plan = Plan::new("p", "proj", vec![step("a", &[], "loop {{steps.a.output}}")]);
         let err = validate_step_references(&plan).unwrap_err();
         assert!(matches!(err, FlowdError::PlanValidation(m) if m.contains("its own output")));
     }
 
     #[test]
     fn validate_rejects_unknown_ref() {
-        let plan = Plan::new("p", vec![step("a", &[], "use {{steps.ghost.output}}")]);
+        let plan = Plan::new(
+            "p",
+            "proj",
+            vec![step("a", &[], "use {{steps.ghost.output}}")],
+        );
         let err = validate_step_references(&plan).unwrap_err();
         assert!(matches!(err, FlowdError::PlanValidation(m) if m.contains("ghost")));
     }
@@ -283,6 +288,7 @@ mod tests {
     fn validate_rejects_non_dependency_ref() {
         let plan = Plan::new(
             "p",
+            "proj",
             vec![
                 step("a", &[], "first"),
                 step("b", &[], "use {{steps.a.output}}"),

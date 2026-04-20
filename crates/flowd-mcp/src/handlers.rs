@@ -207,9 +207,17 @@ where
 
     async fn plan_create(&self, p: PlanCreateParams) -> Result<Value> {
         self.touch_activity();
+        if p.project.trim().is_empty() {
+            return Err(FlowdError::PlanValidation(
+                "plan_create: `project` must be a non-empty string".into(),
+            ));
+        }
         let def: PlanDefinition = serde_json::from_value(p.definition)
             .map_err(|e| FlowdError::PlanValidation(format!("invalid PlanDefinition: {e}")))?;
-        let plan = def.into_plan();
+        // Top-level `project` is authoritative: it overrides any value the
+        // caller embedded in the definition payload, so the trusted handler
+        // is the single source of truth for project scoping.
+        let plan = def.into_plan_with_project(p.project);
         let preview = self.executor.preview(&plan)?;
         let plan_id = self.executor.submit(plan).await?;
         Ok(json!({

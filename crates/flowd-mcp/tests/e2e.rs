@@ -227,7 +227,7 @@ async fn full_composed_session_roundtrip() {
         }}),
         json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{
             "name": "plan_create",
-            "arguments": { "definition": plan_def }
+            "arguments": { "project": "rnd", "definition": plan_def }
         }}),
     ];
 

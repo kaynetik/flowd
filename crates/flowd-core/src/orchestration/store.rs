@@ -21,7 +21,8 @@ pub struct PlanSummary {
     pub name: String,
     pub status: PlanStatus,
     pub created_at: DateTime<Utc>,
-    pub project: Option<String>,
+    /// Required project namespace (matches [`crate::orchestration::Plan::project`]).
+    pub project: String,
 }
 
 /// Persists orchestration [`Plan`] snapshots so the daemon can rehydrate

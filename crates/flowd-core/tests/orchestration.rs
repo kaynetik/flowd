@@ -55,6 +55,7 @@ fn load_plan_from_yaml_file_and_execute() {
         &plan_path,
         r#"
 name: nightly
+project: nightly-proj
 steps:
   - id: gather
     agent: summarizer
@@ -100,7 +101,7 @@ fn load_plan_from_json_file() {
     let plan_path = dir.join("plan.json");
     fs::write(
         &plan_path,
-        r#"{"name": "j", "steps": [{"id": "a", "agent_type": "echo", "prompt": "x"}]}"#,
+        r#"{"name": "j", "project": "p", "steps": [{"id": "a", "agent_type": "echo", "prompt": "x"}]}"#,
     )
     .unwrap();
     let plan = load_plan(&plan_path).unwrap();
@@ -113,6 +114,7 @@ fn cancel_aborts_in_flight_plan() {
     let exec = Arc::new(InMemoryPlanExecutor::new(SleepySpawner));
     let plan = flowd_core::orchestration::Plan::new(
         "p",
+        "proj",
         vec![PlanStep {
             id: "long".into(),
             agent_type: "echo".into(),

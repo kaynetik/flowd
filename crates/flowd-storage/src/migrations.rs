@@ -4,7 +4,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002];
+const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003];
 
 const MIGRATION_001: &str = r"
 CREATE TABLE IF NOT EXISTS migrations (
@@ -96,6 +96,36 @@ CREATE INDEX IF NOT EXISTS idx_plan_steps_status ON plan_steps(status);
 
 const MIGRATION_002: &str = r"
 ALTER TABLE plans ADD COLUMN project TEXT;
+";
+
+// SQLite cannot ALTER a column to NOT NULL or add a NOT NULL constraint
+// in place, so we rebuild the table. Pre-existing rows with NULL projects
+// are backfilled to '__legacy__' so the new constraint never trips on
+// historic data; new code paths now require a real project up-front.
+//
+// NOTE: this is a destructive schema change for the column shape; the row
+// data (incl. `definition` JSON) is preserved verbatim.
+const MIGRATION_003: &str = r"
+CREATE TABLE plans_new (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft',
+    definition TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at TEXT,
+    completed_at TEXT,
+    project TEXT NOT NULL DEFAULT '__legacy__'
+);
+
+INSERT INTO plans_new (id, name, status, definition, created_at, started_at, completed_at, project)
+SELECT id, name, status, definition, created_at, started_at, completed_at,
+       COALESCE(NULLIF(TRIM(project), ''), '__legacy__')
+FROM plans;
+
+DROP TABLE plans;
+ALTER TABLE plans_new RENAME TO plans;
+
+CREATE INDEX IF NOT EXISTS idx_plans_project ON plans(project);
 ";
 
 /// Run all pending migrations.

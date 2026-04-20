@@ -47,20 +47,22 @@ use super::PlanStep;
 /// Implementations decide whether the step is allowed to proceed. Returning
 /// a `GateResult` with `allowed = false` causes the executor to mark the
 /// step `StepStatus::Skipped` and fail the plan.
+///
+/// `project` is required because every plan now carries one; gating is
+/// only ever invoked from the plan path. This guarantees that always-on
+/// deny rules (e.g. `scope: "**"`) actually fire, where previously a
+/// projectless plan would have silently bypassed them.
 pub trait RuleGate: Send + Sync {
     /// Inspect a step in the context of its plan's project and decide.
-    fn gate(&self, step: &PlanStep, project: Option<&str>) -> GateResult;
+    fn gate(&self, step: &PlanStep, project: &str) -> GateResult;
 }
 
 impl<T> RuleGate for T
 where
     T: RuleEvaluator + Send + Sync + ?Sized,
 {
-    fn gate(&self, step: &PlanStep, project: Option<&str>) -> GateResult {
-        let mut action = ProposedAction::new(&step.agent_type);
-        if let Some(p) = project {
-            action = action.with_project(p);
-        }
+    fn gate(&self, step: &PlanStep, project: &str) -> GateResult {
+        let action = ProposedAction::new(&step.agent_type).with_project(project);
         <T as RuleEvaluator>::check(self, &action)
     }
 }
@@ -107,7 +109,7 @@ mod tests {
         ev.register_rule(rule("no-codex", "**", RuleLevel::Deny, "^codex$"))
             .unwrap();
         let gate: Arc<dyn RuleGate> = Arc::new(ev);
-        let result = gate.gate(&step("codex"), Some("flowd"));
+        let result = gate.gate(&step("codex"), "flowd");
         assert!(!result.allowed);
         assert_eq!(result.violations.len(), 1);
         assert_eq!(result.violations[0].rule_id, "no-codex");
@@ -119,7 +121,7 @@ mod tests {
         ev.register_rule(rule("no-codex", "**", RuleLevel::Deny, "^codex$"))
             .unwrap();
         let gate: Arc<dyn RuleGate> = Arc::new(ev);
-        let result = gate.gate(&step("claude"), Some("flowd"));
+        let result = gate.gate(&step("claude"), "flowd");
         assert!(result.allowed);
         assert!(result.violations.is_empty());
     }
@@ -130,7 +132,7 @@ mod tests {
         ev.register_rule(rule("loud", "**", RuleLevel::Warn, "^codex$"))
             .unwrap();
         let gate: Arc<dyn RuleGate> = Arc::new(ev);
-        let result = gate.gate(&step("codex"), Some("flowd"));
+        let result = gate.gate(&step("codex"), "flowd");
         assert!(result.allowed);
         assert!(result.has_warnings());
     }

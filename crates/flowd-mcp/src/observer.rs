@@ -11,10 +11,9 @@
 //! ## Session synthesis
 //!
 //! `MemoryService::record` requires both a `project` and a `session_id`.
-//! Plans carry an optional project but no session, so this adapter:
+//! Every plan now carries a non-optional project (HL-38), so this adapter
+//! no longer needs a "skip if missing" branch. It only:
 //!
-//! - **Skips events with no project.** Without a project we cannot satisfy
-//!   the storage FK; logging via `tracing::debug!` makes the skip visible.
 //! - **Synthesises a deterministic session per plan** via
 //!   `Uuid::new_v5(NAMESPACE_OID, plan_id.as_bytes())`. Every event from the
 //!   same plan thus lands under the same session row, so listing the
@@ -80,14 +79,7 @@ where
 {
     fn on_event(&self, event: PlanEvent) {
         let plan_id = event.plan_id();
-        let Some(project) = event.project().map(str::to_owned) else {
-            tracing::debug!(
-                plan_id = %plan_id,
-                event = ?event_kind(&event),
-                "skipping plan-event memory write: plan has no project",
-            );
-            return;
-        };
+        let project = event.project().to_owned();
         let session_id = session_for_plan(plan_id);
 
         let (content, metadata) = render(&event);
@@ -105,19 +97,6 @@ where
                 log_record_failure(&e, plan_id, "record");
             }
         });
-    }
-}
-
-/// Short identifier used in tracing skip-logs.
-fn event_kind(event: &PlanEvent) -> &'static str {
-    match event {
-        PlanEvent::Submitted { .. } => "submitted",
-        PlanEvent::Started { .. } => "started",
-        PlanEvent::StepCompleted { .. } => "step_completed",
-        PlanEvent::StepFailed { .. } => "step_failed",
-        PlanEvent::StepRefused { .. } => "step_refused",
-        PlanEvent::StepCancelled { .. } => "step_cancelled",
-        PlanEvent::Finished { .. } => "finished",
     }
 }
 
@@ -274,7 +253,7 @@ mod tests {
         let big = "x".repeat(MAX_OUTPUT_BYTES * 2);
         let (body, meta) = render(&PlanEvent::StepCompleted {
             plan_id: Uuid::nil(),
-            project: Some("flowd".into()),
+            project: "flowd".into(),
             step_id: "build".into(),
             agent_type: "codex".into(),
             output: big,
@@ -289,7 +268,7 @@ mod tests {
     fn render_finished_lowercases_status_for_metadata() {
         let (_body, meta) = render(&PlanEvent::Finished {
             plan_id: Uuid::nil(),
-            project: Some("flowd".into()),
+            project: "flowd".into(),
             status: PlanStatus::Failed,
         });
         assert_eq!(meta["status"], "failed");

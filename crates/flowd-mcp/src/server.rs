@@ -366,7 +366,7 @@ mod tests {
     async fn tools_call_maps_handler_error_to_is_error() {
         let params = json!({
             "name": "plan_create",
-            "arguments": { "definition": {"name": "x", "steps": []} }
+            "arguments": { "project": "p", "definition": {"name": "x", "steps": []} }
         });
         let result = dispatch(
             &StubHandlers,
