@@ -35,9 +35,11 @@ use flowd_core::memory::compactor::{ActivityMonitor, Compactor, CompactorConfig}
 use flowd_core::memory::service::MemoryService;
 use flowd_core::memory::tier::TieringPolicy;
 use flowd_core::orchestration::executor::InMemoryPlanExecutor;
+use flowd_core::orchestration::gate::RuleGate;
+use flowd_core::orchestration::observer::PlanObserver;
 use flowd_core::rules::{InMemoryRuleEvaluator, RuleEvaluator};
 use flowd_mcp::summarizer::NoopSummarizer;
-use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig};
+use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig, MemoryPlanObserver};
 use flowd_onnx::provider::OnnxEmbedder;
 use flowd_storage::sqlite::SqliteBackend;
 use flowd_vector::qdrant::{QdrantConfig, QdrantIndex};
@@ -61,11 +63,11 @@ pub async fn run(paths: &FlowdPaths, style: Style, qdrant_url: Option<String>) -
 
     // ---- Memory backends (shared between live handlers & compactor) ----
     let backends = compose_backends(paths, qdrant_url.as_deref()).await?;
-    let memory_service = MemoryService::from_shared(
+    let memory_service = Arc::new(MemoryService::from_shared(
         Arc::clone(&backends.sqlite),
         Arc::clone(&backends.qdrant),
         Arc::clone(&backends.embedder),
-    );
+    ));
 
     // ---- Background compactor: Hot → Warm summaries, Warm → Cold demotion.
     let monitor = ActivityMonitor::new();
@@ -79,19 +81,33 @@ pub async fn run(paths: &FlowdPaths, style: Style, qdrant_url: Option<String>) -
         spawner.description()
     );
     let plan_store = backends.sqlite.plan_store();
-    let executor = Arc::new(InMemoryPlanExecutor::from_shared_with_store(
-        spawner, plan_store,
-    ));
+
+    // Build the rules evaluator once and share it between the MCP handlers
+    // (`rules_check` / `rules_list` tools) and the executor's step-boundary
+    // gate, so an agent that ignores `rules_check` is still blocked by the
+    // executor before its step is spawned.
+    let rules = Arc::new(compose_rules(paths, style)?);
+    let rule_gate: Arc<dyn RuleGate> = Arc::clone(&rules) as Arc<dyn RuleGate>;
+
+    // The plan observer mirrors every executor lifecycle event into flowd's
+    // memory under a deterministic per-plan session, so `flowd history` and
+    // semantic search both surface what the executor actually did -- no
+    // longer dependent on the agent voluntarily calling `memory_store`.
+    let plan_observer: Arc<dyn PlanObserver> =
+        Arc::new(MemoryPlanObserver::new(Arc::clone(&memory_service)));
+
+    let executor = Arc::new(
+        InMemoryPlanExecutor::from_shared_with_store(spawner, plan_store)
+            .with_rule_gate(rule_gate)
+            .with_observer(plan_observer),
+    );
     executor
         .rehydrate()
         .await
         .map_err(|e| anyhow::anyhow!("rehydrate orchestration plans: {e}"))?;
 
-    let rules = compose_rules(paths, style)?;
-
     let handlers = Arc::new(
-        FlowdHandlers::new(Arc::new(memory_service), executor, Arc::new(rules))
-            .with_activity_monitor(monitor),
+        FlowdHandlers::new(memory_service, executor, rules).with_activity_monitor(monitor),
     );
     let server = McpServer::new(handlers, McpServerConfig::default());
 

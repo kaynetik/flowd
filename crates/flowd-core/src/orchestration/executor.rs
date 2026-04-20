@@ -33,6 +33,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::gate::SharedRuleGate;
+use super::observer::{PlanEvent, SharedPlanObserver};
+use super::template;
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -89,10 +93,15 @@ struct PlanRuntime {
 }
 
 /// Default executor. Generic over the spawner and an optional [`PlanStore`].
+///
+/// An optional [`SharedRuleGate`] can be installed via [`Self::with_rule_gate`];
+/// when present it is consulted before each step is spawned (see `execute`).
 pub struct InMemoryPlanExecutor<S: AgentSpawner + 'static, PS: PlanStore = NoOpPlanStore> {
     spawner: Arc<S>,
     plans: Arc<Mutex<HashMap<Uuid, PlanRuntime>>>,
     store: PS,
+    rule_gate: Option<SharedRuleGate>,
+    observer: Option<SharedPlanObserver>,
 }
 
 impl<S: AgentSpawner + 'static> InMemoryPlanExecutor<S, NoOpPlanStore> {
@@ -105,6 +114,8 @@ impl<S: AgentSpawner + 'static> InMemoryPlanExecutor<S, NoOpPlanStore> {
             spawner,
             plans: Arc::new(Mutex::new(HashMap::new())),
             store: NoOpPlanStore,
+            rule_gate: None,
+            observer: None,
         }
     }
 }
@@ -115,6 +126,8 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
             spawner: Arc::new(spawner),
             plans: Arc::new(Mutex::new(HashMap::new())),
             store,
+            rule_gate: None,
+            observer: None,
         }
     }
 
@@ -123,6 +136,36 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
             spawner,
             plans: Arc::new(Mutex::new(HashMap::new())),
             store,
+            rule_gate: None,
+            observer: None,
+        }
+    }
+
+    /// Install a rule gate that the executor will consult before spawning
+    /// each step. With no gate (the default), the executor runs every step
+    /// the DAG allows -- preserving pre-existing behaviour.
+    #[must_use]
+    pub fn with_rule_gate(mut self, gate: SharedRuleGate) -> Self {
+        self.rule_gate = Some(gate);
+        self
+    }
+
+    /// Install a plan observer that will receive lifecycle events.
+    ///
+    /// With no observer (the default), no events are emitted -- preserving
+    /// the executor's previous zero-side-effect behaviour. Observer impls
+    /// are expected to be fast and to defer heavy work to spawned tasks.
+    #[must_use]
+    pub fn with_observer(mut self, observer: SharedPlanObserver) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Fan out an event to the installed observer (if any). Hot-path call:
+    /// inlined to a single `Option::if_let` when no observer is present.
+    fn emit(&self, event: PlanEvent) {
+        if let Some(obs) = &self.observer {
+            obs.on_event(event);
         }
     }
 
@@ -195,6 +238,8 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
     async fn submit(&self, plan: Plan) -> Result<Uuid> {
         validate_plan(&plan)?;
         let id = plan.id;
+        let name = plan.name.clone();
+        let project = plan.project.clone();
         let runtime = PlanRuntime {
             plan,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -211,6 +256,11 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             guard.insert(id, runtime);
         }
         self.persist_snapshot(id).await?;
+        self.emit(PlanEvent::Submitted {
+            plan_id: id,
+            name,
+            project,
+        });
         Ok(id)
     }
 
@@ -230,6 +280,11 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
         Ok(preview)
     }
 
+    // The plan lifecycle (pre-flight, per-layer fan-out, gate, spawn,
+    // outcome reduction, observer fan-out, finalisation, persist) is
+    // genuinely linear and is easier to follow as one function than as a
+    // chain of small helpers each carrying half a dozen captured locals.
+    #[allow(clippy::too_many_lines)]
     async fn execute(&self, plan_id: Uuid) -> Result<()> {
         // ---- Pre-flight: take an owned plan snapshot + the cancel flag ----
         let (mut plan, cancel) = {
@@ -252,6 +307,10 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
         };
 
         self.persist_snapshot(plan_id).await?;
+        self.emit(PlanEvent::Started {
+            plan_id,
+            project: plan.project.clone(),
+        });
 
         let layers = plan.execution_layers()?;
         let mut overall_failed = false;
@@ -261,13 +320,84 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
                 break 'outer;
             }
 
-            // Spawn all steps in this layer in parallel.
+            // Materialise per-layer step prompts: resolve any
+            // `{{steps.<id>.output}}` references against outputs already
+            // captured in earlier layers. Validation guarantees that every
+            // reference points to a transitive dependency, so by the time
+            // we reach this layer the value is either present (referenced
+            // step Completed) or a placeholder (Failed/Cancelled — which
+            // would normally have aborted the plan, but we resolve to the
+            // sentinel rather than crash so the substituter is total).
+            //
+            // We snapshot owned (id, output) pairs here so we can mutate
+            // `plan.steps` later in the loop (e.g. when a refused step is
+            // settled inline) without borrow-checker conflicts.
+            let outputs_owned: Vec<(String, String)> = plan
+                .steps
+                .iter()
+                .filter_map(|s| s.output.as_ref().map(|o| (s.id.clone(), o.clone())))
+                .collect();
+            let outputs: HashMap<&str, &str> = outputs_owned
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+
+            // Spawn all steps in this layer in parallel. A configured rule
+            // gate is consulted per-step before spawn: a `deny` violation
+            // marks the step `Skipped` with an actionable error and fails
+            // the plan; `warn` violations are logged and the step proceeds.
             let mut handles: Vec<(String, JoinHandle<StepOutcome>)> =
                 Vec::with_capacity(layer.len());
             for step_id in &layer {
-                let Some(step) = plan.steps.iter().find(|s| &s.id == step_id).cloned() else {
+                let Some(mut step) = plan.steps.iter().find(|s| &s.id == step_id).cloned() else {
                     continue;
                 };
+                step.prompt =
+                    template::substitute(&step.prompt, &outputs, template::DEFAULT_PER_REF_BYTES);
+
+                if let Some(gate) = &self.rule_gate {
+                    let result = gate.gate(&step, plan.project.as_deref());
+                    for w in result.warnings() {
+                        tracing::warn!(
+                            plan_id = %plan_id,
+                            step_id = %step.id,
+                            agent = %step.agent_type,
+                            rule_id = %w.rule_id,
+                            description = %w.description,
+                            "rule gate warning at step boundary"
+                        );
+                    }
+                    if !result.allowed {
+                        let denial = result.denials().next().map_or_else(
+                            || "denied by rule gate".to_owned(),
+                            |d| format!("denied by rule `{}`: {}", d.rule_id, d.description),
+                        );
+                        tracing::warn!(
+                            plan_id = %plan_id,
+                            step_id = %step.id,
+                            agent = %step.agent_type,
+                            denial,
+                            "rule gate refused to spawn step"
+                        );
+                        apply_outcome(
+                            &mut plan,
+                            &step.id,
+                            &StepOutcome::Refused {
+                                reason: denial.clone(),
+                            },
+                        );
+                        self.emit(PlanEvent::StepRefused {
+                            plan_id,
+                            project: plan.project.clone(),
+                            step_id: step.id.clone(),
+                            agent_type: step.agent_type.clone(),
+                            reason: denial,
+                        });
+                        overall_failed = true;
+                        continue;
+                    }
+                }
+
                 let spawner = Arc::clone(&self.spawner);
                 let cancel = Arc::clone(&cancel);
                 let handle = tokio::spawn(async move { run_step(&*spawner, step, cancel).await });
@@ -301,12 +431,48 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
 
                 apply_outcome(&mut plan, &step_id, &outcome);
 
+                let agent_type = plan
+                    .steps
+                    .iter()
+                    .find(|s| s.id == step_id)
+                    .map(|s| s.agent_type.clone())
+                    .unwrap_or_default();
+
                 match outcome {
-                    StepOutcome::Failed { .. } => overall_failed = true,
+                    StepOutcome::Failed { error } => {
+                        overall_failed = true;
+                        self.emit(PlanEvent::StepFailed {
+                            plan_id,
+                            project: plan.project.clone(),
+                            step_id: step_id.clone(),
+                            agent_type,
+                            error,
+                        });
+                    }
                     StepOutcome::Cancelled => {
                         cancel.store(true, Ordering::SeqCst);
+                        self.emit(PlanEvent::StepCancelled {
+                            plan_id,
+                            project: plan.project.clone(),
+                            step_id: step_id.clone(),
+                            agent_type,
+                        });
                     }
-                    StepOutcome::Completed { .. } => {}
+                    StepOutcome::Completed { output } => {
+                        self.emit(PlanEvent::StepCompleted {
+                            plan_id,
+                            project: plan.project.clone(),
+                            step_id: step_id.clone(),
+                            agent_type,
+                            output,
+                        });
+                    }
+                    // Refused outcomes never reach this loop: a denied step
+                    // is settled inline in the spawn loop above and is not
+                    // pushed into `handles`.
+                    StepOutcome::Refused { .. } => {
+                        debug_assert!(false, "Refused outcome should never reach the join loop");
+                    }
                 }
             }
 
@@ -340,6 +506,12 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             runtime.in_flight.clear();
         })?;
         self.persist_snapshot(plan_id).await?;
+
+        self.emit(PlanEvent::Finished {
+            plan_id,
+            project: plan.project.clone(),
+            status: final_status,
+        });
 
         Ok(())
     }
@@ -399,9 +571,18 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
 
 /// Outcome of a single step's execution attempt.
 enum StepOutcome {
-    Completed { output: String },
-    Failed { error: String },
+    Completed {
+        output: String,
+    },
+    Failed {
+        error: String,
+    },
     Cancelled,
+    /// Step was never spawned because an executor-side gate (currently the
+    /// rule gate) refused to run it. Settles into `StepStatus::Skipped`.
+    Refused {
+        reason: String,
+    },
 }
 
 /// Execute one step, honouring its retry / timeout configuration. Runs inside
@@ -462,8 +643,12 @@ fn apply_outcome(plan: &mut Plan, step_id: &str, outcome: &StepOutcome) {
             step.error = Some(error.clone());
         }
         StepOutcome::Cancelled => {
-            step.status = StepStatus::Skipped;
+            step.status = StepStatus::Cancelled;
             step.error = Some("cancelled".into());
+        }
+        StepOutcome::Refused { reason } => {
+            step.status = StepStatus::Skipped;
+            step.error = Some(reason.clone());
         }
     }
 }
@@ -561,6 +746,23 @@ mod tests {
         async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
             self.invocations.fetch_add(1, Ordering::SeqCst);
             Ok(AgentOutput::success(format!("ran:{}", step.id)))
+        }
+    }
+
+    /// Spawner whose output is the exact prompt it received. Lets tests
+    /// assert that `{{steps.<id>.output}}` substitution happened before the
+    /// spawner saw the prompt.
+    struct RecordingSpawner {
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl AgentSpawner for RecordingSpawner {
+        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+            self.seen
+                .lock()
+                .expect("seen poisoned")
+                .push((step.id.clone(), step.prompt.clone()));
+            Ok(AgentOutput::success(step.prompt.clone()))
         }
     }
 
@@ -788,6 +990,143 @@ mod tests {
         assert_eq!(p.steps[0].status, StepStatus::Completed);
         assert_eq!(p.steps[1].status, StepStatus::Completed);
         assert_eq!(p.steps[2].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn observer_receives_full_plan_lifecycle() {
+        use crate::orchestration::observer::{PlanEvent, PlanObserver};
+
+        #[derive(Default)]
+        struct CollectingObserver {
+            events: Mutex<Vec<PlanEvent>>,
+        }
+        impl PlanObserver for CollectingObserver {
+            fn on_event(&self, event: PlanEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let obs = Arc::new(CollectingObserver::default());
+        let exec = InMemoryPlanExecutor::new(EchoSpawner {
+            invocations: Arc::clone(&invocations),
+        })
+        .with_observer(Arc::clone(&obs) as Arc<dyn PlanObserver>);
+
+        let plan = Plan::new("p", vec![step("a", &[]), step("b", &["a"])]);
+        let plan_id = plan.id;
+
+        rt().block_on(async {
+            exec.submit(plan).await.unwrap();
+            exec.confirm(plan_id).await.unwrap();
+            exec.execute(plan_id).await.unwrap();
+        });
+
+        let events = obs.events.lock().unwrap().clone();
+        let kinds: Vec<&'static str> = events
+            .iter()
+            .map(|e| match e {
+                PlanEvent::Submitted { .. } => "submitted",
+                PlanEvent::Started { .. } => "started",
+                PlanEvent::StepCompleted { .. } => "step_completed",
+                PlanEvent::StepFailed { .. } => "step_failed",
+                PlanEvent::StepRefused { .. } => "step_refused",
+                PlanEvent::StepCancelled { .. } => "step_cancelled",
+                PlanEvent::Finished { .. } => "finished",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "submitted",
+                "started",
+                "step_completed",
+                "step_completed",
+                "finished"
+            ],
+            "unexpected event sequence: {kinds:?}"
+        );
+
+        match &events[4] {
+            PlanEvent::Finished { status, .. } => assert_eq!(*status, PlanStatus::Completed),
+            other => panic!("expected Finished event, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rule_gate_deny_skips_step_and_fails_plan() {
+        use crate::error::RuleLevel;
+        use crate::orchestration::gate::RuleGate;
+        use crate::rules::{InMemoryRuleEvaluator, Rule, RuleEvaluator};
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut ev = InMemoryRuleEvaluator::new();
+        ev.register_rule(Rule {
+            id: "no-echo".into(),
+            scope: "**".into(),
+            level: RuleLevel::Deny,
+            description: "echo agent banned".into(),
+            match_pattern: "^echo$".into(),
+        })
+        .unwrap();
+        let gate: Arc<dyn RuleGate> = Arc::new(ev);
+
+        let exec = InMemoryPlanExecutor::new(EchoSpawner {
+            invocations: Arc::clone(&invocations),
+        })
+        .with_rule_gate(gate);
+
+        // The rule's scope (`**`) is matched against project/file_path; the
+        // executor passes `plan.project` to the gate, so an empty project
+        // would put the rule out of scope and the deny would not fire.
+        let mut plan = Plan::new("p", vec![step("a", &[])]);
+        plan.project = Some("flowd".into());
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            exec.execute(id).await.unwrap();
+
+            let final_plan = exec.status(id).await.unwrap();
+            assert_eq!(final_plan.status, PlanStatus::Failed);
+            assert_eq!(final_plan.steps[0].status, StepStatus::Skipped);
+            let err = final_plan.steps[0].error.as_deref().unwrap_or_default();
+            assert!(err.contains("no-echo"), "expected rule id in error: {err}");
+        });
+
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "denied step must not be spawned"
+        );
+    }
+
+    #[test]
+    fn step_prompt_substitutes_dependency_output_before_spawn() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let spawner = RecordingSpawner {
+            seen: Arc::clone(&seen),
+        };
+        let exec = InMemoryPlanExecutor::new(spawner);
+
+        let mut a = step("a", &[]);
+        a.prompt = "produce-A".into();
+        let mut b = step("b", &["a"]);
+        b.prompt = "carry: {{steps.a.output}}".into();
+        let plan = Plan::new("p", vec![a, b]);
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            exec.execute(id).await.unwrap();
+        });
+
+        let log = seen.lock().unwrap().clone();
+        let b_prompt = log
+            .iter()
+            .find_map(|(id, p)| (id == "b").then_some(p.clone()))
+            .expect("b should have been spawned");
+        assert_eq!(b_prompt, "carry: produce-A");
     }
 
     #[test]

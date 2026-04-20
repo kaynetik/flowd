@@ -16,12 +16,14 @@
 //! FlowdHandlers}` and hand the server their composed backends.
 
 pub mod handlers;
+pub mod observer;
 pub mod protocol;
 pub mod server;
 pub mod summarizer;
 pub mod tools;
 
 pub use handlers::{FlowdHandlers, McpHandlers};
+pub use observer::{MemoryPlanObserver, session_for_plan};
 pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use server::{McpServer, McpServerConfig, dispatch};
 pub use summarizer::NoopSummarizer;

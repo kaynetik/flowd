@@ -255,5 +255,6 @@ fn step_status_str(s: StepStatus) -> &'static str {
         StepStatus::Completed => "completed",
         StepStatus::Failed => "failed",
         StepStatus::Skipped => "skipped",
+        StepStatus::Cancelled => "cancelled",
     }
 }

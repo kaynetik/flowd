@@ -153,7 +153,7 @@ fn cancel_aborts_in_flight_plan() {
 
         let final_plan = exec.status(id).await.unwrap();
         assert_eq!(final_plan.status, PlanStatus::Cancelled);
-        assert_eq!(final_plan.steps[0].status, StepStatus::Skipped);
+        assert_eq!(final_plan.steps[0].status, StepStatus::Cancelled);
     });
 }
 

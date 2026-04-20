@@ -56,6 +56,20 @@ impl GateResult {
     pub fn has_denials(&self) -> bool {
         self.violations.iter().any(|v| v.level == RuleLevel::Deny)
     }
+
+    /// Iterate over only the warning-level violations.
+    pub fn warnings(&self) -> impl Iterator<Item = &RuleViolation> {
+        self.violations
+            .iter()
+            .filter(|v| v.level == RuleLevel::Warn)
+    }
+
+    /// Iterate over only the deny-level violations.
+    pub fn denials(&self) -> impl Iterator<Item = &RuleViolation> {
+        self.violations
+            .iter()
+            .filter(|v| v.level == RuleLevel::Deny)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -14,8 +14,11 @@
 //! by the CLI / MCP layer.
 
 pub mod executor;
+pub mod gate;
 pub mod loader;
+pub mod observer;
 pub mod store;
+pub mod template;
 
 use crate::error::{FlowdError, Result};
 use chrono::{DateTime, Utc};
@@ -85,7 +88,13 @@ pub enum StepStatus {
     Running,
     Completed,
     Failed,
+    /// Executor-side refusal: the step was never spawned because something
+    /// upstream of the agent (a rule gate, a missing precondition) declined
+    /// to run it. Distinct from `Cancelled`, which is a user-initiated stop.
     Skipped,
+    /// User-initiated stop while the step was pending or in flight. Reached
+    /// via [`PlanExecutor::cancel`].
+    Cancelled,
 }
 
 /// Preview of a plan before confirmation.
@@ -300,6 +309,7 @@ pub fn validate_plan(plan: &Plan) -> Result<()> {
     }
 
     plan.execution_layers()?;
+    template::validate_step_references(plan)?;
     Ok(())
 }
 
