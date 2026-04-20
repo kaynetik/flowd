@@ -31,6 +31,16 @@ pub enum Command {
         /// Qdrant URL (overrides the default <http://localhost:6334>).
         #[arg(long)]
         qdrant_url: Option<String>,
+
+        /// Bounded mpsc capacity for the plan-event observer (HL-40).
+        ///
+        /// Plan-lifecycle events are buffered between the executor's
+        /// hot path and the `SQLite` writer. When the buffer is full,
+        /// new events are dropped (counted, not silently lost) so the
+        /// executor never stalls on slow storage. Increase if your
+        /// workload is bursty; decrease for tighter back-pressure.
+        #[arg(long, default_value_t = 1024)]
+        plan_event_buffer: usize,
     },
 
     /// Stop the running flowd daemon (sends SIGTERM).
@@ -65,14 +75,10 @@ pub enum Command {
         limit: usize,
     },
 
-    /// Load and preview an orchestration plan.
+    /// Inspect orchestration plans.
     Plan {
-        /// Path to the plan YAML or JSON file.
-        file: PathBuf,
-
-        /// Only show preview, skip the confirmation prompt.
-        #[arg(long)]
-        dry_run: bool,
+        #[command(subcommand)]
+        action: PlanAction,
     },
 
     /// Manage rules.
@@ -114,6 +120,41 @@ pub enum Command {
         /// Filter to a single project.
         #[arg(short, long)]
         project: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PlanAction {
+    /// Load a plan file, render its preview, and optionally prompt
+    /// the operator for Y/N confirmation.
+    Preview {
+        /// Path to the plan YAML or JSON file.
+        file: PathBuf,
+
+        /// Only show preview, skip the confirmation prompt.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Print the persisted lifecycle event log for a plan.
+    ///
+    /// Reads directly from `SQLite` (WAL-safe) so it works even while
+    /// `flowd start` is running.
+    Events {
+        /// Plan UUID.
+        plan_id: String,
+
+        /// Maximum events to return (oldest first).
+        #[arg(short, long, default_value_t = 100)]
+        limit: usize,
+
+        /// Restrict to one or more event kinds. Pass either repeatedly
+        /// (`--kind step_failed --kind step_completed`) or as a single
+        /// comma-separated value. Allowed: `submitted`, `started`,
+        /// `step_completed`, `step_failed`, `step_refused`,
+        /// `step_cancelled`, `finished`.
+        #[arg(short, long, value_delimiter = ',')]
+        kind: Vec<String>,
     },
 }
 

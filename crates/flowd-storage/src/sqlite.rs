@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+use crate::plan_event_store::SqlitePlanEventStore;
 use crate::plan_store::SqlitePlanStore;
 
 #[derive(Clone)]
@@ -43,6 +44,13 @@ impl SqliteBackend {
     #[must_use]
     pub fn plan_store(&self) -> SqlitePlanStore {
         SqlitePlanStore::from_connection(Arc::clone(&self.conn))
+    }
+
+    /// Plan-lifecycle event log sharing this database connection. Used by
+    /// the daemon's plan observer (HL-39) and `flowd plan events`.
+    #[must_use]
+    pub fn plan_event_store(&self) -> SqlitePlanEventStore {
+        SqlitePlanEventStore::from_connection(Arc::clone(&self.conn))
     }
 }
 

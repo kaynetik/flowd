@@ -4,7 +4,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003];
+const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004];
 
 const MIGRATION_001: &str = r"
 CREATE TABLE IF NOT EXISTS migrations (
@@ -126,6 +126,33 @@ DROP TABLE plans;
 ALTER TABLE plans_new RENAME TO plans;
 
 CREATE INDEX IF NOT EXISTS idx_plans_project ON plans(project);
+";
+
+// Dedicated audit log for plan-lifecycle events (HL-39). Replaces the
+// previous behaviour of writing plan events into the `observations` table
+// via `MemoryService`. Keeping plan telemetry separate avoids polluting
+// hybrid-search results and the embedding budget with structured logging.
+//
+// Idempotent (`IF NOT EXISTS`) so re-running on a partially-migrated DB is
+// safe, even though the `migrations` table normally guards re-execution.
+const MIGRATION_004: &str = r"
+CREATE TABLE IF NOT EXISTS plan_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id     TEXT NOT NULL,
+    project     TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    step_id     TEXT,
+    agent_type  TEXT,
+    payload     TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_events_plan
+    ON plan_events(plan_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plan_events_project
+    ON plan_events(project, created_at);
+CREATE INDEX IF NOT EXISTS idx_plan_events_kind
+    ON plan_events(kind);
 ";
 
 /// Run all pending migrations.

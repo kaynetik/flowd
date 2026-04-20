@@ -15,7 +15,7 @@ mod output;
 mod paths;
 mod spawner;
 
-use cli::{Cli, Command, RulesAction};
+use cli::{Cli, Command, PlanAction, RulesAction};
 use output::Style;
 use paths::FlowdPaths;
 
@@ -44,7 +44,10 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Command::Start { qdrant_url } => commands::start::run(&paths, style, qdrant_url).await,
+        Command::Start {
+            qdrant_url,
+            plan_event_buffer,
+        } => commands::start::run(&paths, style, qdrant_url, plan_event_buffer).await,
         Command::Stop => commands::stop::run(&paths, style),
         Command::Search {
             query,
@@ -56,7 +59,16 @@ async fn main() -> Result<()> {
             since,
             limit,
         } => commands::history::run(&paths, style, project, since, limit).await,
-        Command::Plan { file, dry_run } => commands::plan::run(&paths, style, file, dry_run).await,
+        Command::Plan { action } => match action {
+            PlanAction::Preview { file, dry_run } => {
+                commands::plan::preview(&paths, style, file, dry_run).await
+            }
+            PlanAction::Events {
+                plan_id,
+                limit,
+                kind,
+            } => commands::plan::events(&paths, style, plan_id, limit, kind).await,
+        },
         Command::Rules { action } => match action {
             RulesAction::List { project, file } => {
                 commands::rules::list(&paths, style, project.as_deref(), file.as_deref())

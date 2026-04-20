@@ -34,12 +34,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::gate::SharedRuleGate;
+use super::layer_runner::LayerRunner;
 use super::observer::{PlanEvent, SharedPlanObserver};
-use super::template;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::AbortHandle;
 use uuid::Uuid;
 
 use crate::error::{FlowdError, Result};
@@ -81,15 +81,19 @@ pub trait AgentSpawner: Send + Sync {
 }
 
 /// Internal record kept per registered plan.
-struct PlanRuntime {
-    plan: Plan,
-    cancel: Arc<AtomicBool>,
+///
+/// `pub(super)` so the sibling [`super::layer_runner`] module can publish
+/// abort handles into `in_flight` between spawn and await; nothing outside
+/// the orchestration module sees this type.
+pub(super) struct PlanRuntime {
+    pub(super) plan: Plan,
+    pub(super) cancel: Arc<AtomicBool>,
     /// Abort handles for the currently in-flight step tasks. Populated by
-    /// `execute` at every layer boundary; consumed by `cancel`. We store
-    /// `AbortHandle` (cheap to clone, can be shared across owners) rather
-    /// than the `JoinHandle` itself, which `execute` needs to keep so it can
-    /// `.await` each task.
-    in_flight: Vec<AbortHandle>,
+    /// [`super::layer_runner::LayerRunner`] at every layer boundary;
+    /// consumed by `cancel`. We store `AbortHandle` (cheap to clone, can
+    /// be shared across owners) rather than the `JoinHandle` itself,
+    /// which the runner needs to keep so it can `.await` each task.
+    pub(super) in_flight: Vec<AbortHandle>,
 }
 
 /// Default executor. Generic over the spawner and an optional [`PlanStore`].
@@ -224,6 +228,83 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
             .ok_or(FlowdError::PlanNotFound(plan_id))?;
         Ok(f(entry))
     }
+
+    /// Pre-flight phase of `execute`: take an owned plan snapshot, flip
+    /// the runtime to `Running`, persist, and emit
+    /// [`PlanEvent::Started`]. Returns the plan snapshot and the shared
+    /// cancellation latch the per-layer runner mutates.
+    ///
+    /// Errors propagate the same `PlanNotFound` / `PlanExecution` codes
+    /// the inlined version returned, so the public `execute` contract
+    /// is unchanged.
+    async fn start_execution(&self, plan_id: Uuid) -> Result<(Plan, Arc<AtomicBool>)> {
+        // Scope the lock so its destructor runs *before* the `.await`.
+        // Required for the future's auto-`Send` analysis even though
+        // `MutexGuard: Send` would otherwise be fine.
+        let (plan, cancel) = {
+            let mut guard = self
+                .plans
+                .lock()
+                .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
+            let runtime = guard
+                .get_mut(&plan_id)
+                .ok_or(FlowdError::PlanNotFound(plan_id))?;
+            if runtime.plan.status != PlanStatus::Confirmed {
+                return Err(FlowdError::PlanExecution(format!(
+                    "plan `{plan_id}` must be Confirmed before execute (currently {:?})",
+                    runtime.plan.status
+                )));
+            }
+            runtime.plan.status = PlanStatus::Running;
+            runtime.plan.started_at = Some(Utc::now());
+            (runtime.plan.clone(), Arc::clone(&runtime.cancel))
+        };
+
+        self.persist_snapshot(plan_id).await?;
+        self.emit(PlanEvent::Started {
+            plan_id,
+            project: plan.project.clone(),
+        });
+        Ok((plan, cancel))
+    }
+
+    /// Finalise phase of `execute`: derive the terminal `PlanStatus`,
+    /// commit the final step snapshot to the runtime, persist, and emit
+    /// [`PlanEvent::Finished`].
+    ///
+    /// Cancellation always wins over failure: a plan whose first layer
+    /// failed *and* was then cancelled mid-finalise still settles as
+    /// `Cancelled`, matching the pre-HL-41 ordering.
+    async fn finalize_execution(
+        &self,
+        plan_id: Uuid,
+        plan: &Plan,
+        cancel: &AtomicBool,
+        overall_failed: bool,
+    ) -> Result<()> {
+        let final_status = if cancel.load(Ordering::SeqCst) {
+            PlanStatus::Cancelled
+        } else if overall_failed {
+            PlanStatus::Failed
+        } else {
+            PlanStatus::Completed
+        };
+
+        self.with_plan_mut(plan_id, |runtime| {
+            runtime.plan.status = final_status;
+            runtime.plan.completed_at = Some(Utc::now());
+            runtime.plan.steps.clone_from(&plan.steps);
+            runtime.in_flight.clear();
+        })?;
+        self.persist_snapshot(plan_id).await?;
+
+        self.emit(PlanEvent::Finished {
+            plan_id,
+            project: plan.project.clone(),
+            status: final_status,
+        });
+        Ok(())
+    }
 }
 
 impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExecutor<S, PS> {
@@ -280,240 +361,48 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
         Ok(preview)
     }
 
-    // The plan lifecycle (pre-flight, per-layer fan-out, gate, spawn,
-    // outcome reduction, observer fan-out, finalisation, persist) is
-    // genuinely linear and is easier to follow as one function than as a
-    // chain of small helpers each carrying half a dozen captured locals.
-    #[allow(clippy::too_many_lines)]
+    // The plan lifecycle reads top-to-bottom: pre-flight, fan-out one
+    // layer at a time via [`LayerRunner`], finalise. Per-layer logic
+    // lives in [`super::layer_runner`] (HL-41) so this method stays a
+    // readable sketch of the state machine.
     async fn execute(&self, plan_id: Uuid) -> Result<()> {
-        // ---- Pre-flight: take an owned plan snapshot + the cancel flag ----
-        let (mut plan, cancel) = {
-            let mut guard = self
-                .plans
-                .lock()
-                .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
-            let runtime = guard
-                .get_mut(&plan_id)
-                .ok_or(FlowdError::PlanNotFound(plan_id))?;
-            if runtime.plan.status != PlanStatus::Confirmed {
-                return Err(FlowdError::PlanExecution(format!(
-                    "plan `{plan_id}` must be Confirmed before execute (currently {:?})",
-                    runtime.plan.status
-                )));
-            }
-            runtime.plan.status = PlanStatus::Running;
-            runtime.plan.started_at = Some(Utc::now());
-            (runtime.plan.clone(), Arc::clone(&runtime.cancel))
+        let (mut plan, cancel) = self.start_execution(plan_id).await?;
+
+        let runner = LayerRunner {
+            spawner: &self.spawner,
+            rule_gate: self.rule_gate.as_ref(),
+            observer: self.observer.as_ref(),
+            plans: &self.plans,
         };
 
-        self.persist_snapshot(plan_id).await?;
-        self.emit(PlanEvent::Started {
-            plan_id,
-            project: plan.project.clone(),
-        });
-
-        let layers = plan.execution_layers()?;
         let mut overall_failed = false;
-
-        'outer: for layer in layers {
+        for layer in plan.execution_layers()? {
+            // Cancellation can be set by an external `cancel(plan_id)`
+            // call between layers, or by a `Cancelled` step outcome
+            // within the previous layer.
             if cancel.load(Ordering::SeqCst) {
-                break 'outer;
+                break;
             }
 
-            // Materialise per-layer step prompts: resolve any
-            // `{{steps.<id>.output}}` references against outputs already
-            // captured in earlier layers. Validation guarantees that every
-            // reference points to a transitive dependency, so by the time
-            // we reach this layer the value is either present (referenced
-            // step Completed) or a placeholder (Failed/Cancelled — which
-            // would normally have aborted the plan, but we resolve to the
-            // sentinel rather than crash so the substituter is total).
-            //
-            // We snapshot owned (id, output) pairs here so we can mutate
-            // `plan.steps` later in the loop (e.g. when a refused step is
-            // settled inline) without borrow-checker conflicts.
-            let outputs_owned: Vec<(String, String)> = plan
-                .steps
-                .iter()
-                .filter_map(|s| s.output.as_ref().map(|o| (s.id.clone(), o.clone())))
-                .collect();
-            let outputs: HashMap<&str, &str> = outputs_owned
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
+            let outcome = runner.run(plan_id, &mut plan, &layer, &cancel).await?;
 
-            // Spawn all steps in this layer in parallel. A configured rule
-            // gate is consulted per-step before spawn: a `deny` violation
-            // marks the step `Skipped` with an actionable error and fails
-            // the plan; `warn` violations are logged and the step proceeds.
-            let mut handles: Vec<(String, JoinHandle<StepOutcome>)> =
-                Vec::with_capacity(layer.len());
-            for step_id in &layer {
-                let Some(mut step) = plan.steps.iter().find(|s| &s.id == step_id).cloned() else {
-                    continue;
-                };
-                step.prompt =
-                    template::substitute(&step.prompt, &outputs, template::DEFAULT_PER_REF_BYTES);
-
-                if let Some(gate) = &self.rule_gate {
-                    let result = gate.gate(&step, plan.project.as_str());
-                    for w in result.warnings() {
-                        tracing::warn!(
-                            plan_id = %plan_id,
-                            step_id = %step.id,
-                            agent = %step.agent_type,
-                            rule_id = %w.rule_id,
-                            description = %w.description,
-                            "rule gate warning at step boundary"
-                        );
-                    }
-                    if !result.allowed {
-                        let denial = result.denials().next().map_or_else(
-                            || "denied by rule gate".to_owned(),
-                            |d| format!("denied by rule `{}`: {}", d.rule_id, d.description),
-                        );
-                        tracing::warn!(
-                            plan_id = %plan_id,
-                            step_id = %step.id,
-                            agent = %step.agent_type,
-                            denial,
-                            "rule gate refused to spawn step"
-                        );
-                        apply_outcome(
-                            &mut plan,
-                            &step.id,
-                            &StepOutcome::Refused {
-                                reason: denial.clone(),
-                            },
-                        );
-                        self.emit(PlanEvent::StepRefused {
-                            plan_id,
-                            project: plan.project.clone(),
-                            step_id: step.id.clone(),
-                            agent_type: step.agent_type.clone(),
-                            reason: denial,
-                        });
-                        overall_failed = true;
-                        continue;
-                    }
-                }
-
-                let spawner = Arc::clone(&self.spawner);
-                let cancel = Arc::clone(&cancel);
-                let handle = tokio::spawn(async move { run_step(&*spawner, step, cancel).await });
-                handles.push((step_id.clone(), handle));
-            }
-
-            // Publish abort handles so `cancel` can terminate this layer's
-            // in-flight tasks. The `JoinHandle`s themselves stay below for
-            // `.await`, since they cannot be cloned.
-            {
-                let mut guard = self
-                    .plans
-                    .lock()
-                    .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
-                if let Some(runtime) = guard.get_mut(&plan_id) {
-                    runtime.in_flight = handles.iter().map(|(_, h)| h.abort_handle()).collect();
-                }
-            }
-
-            for (step_id, handle) in handles {
-                let outcome = match handle.await {
-                    Ok(o) => o,
-                    Err(join_err) if join_err.is_cancelled() => StepOutcome::Cancelled,
-                    Err(join_err) if join_err.is_panic() => StepOutcome::Failed {
-                        error: format!("step `{step_id}` panicked: {join_err}"),
-                    },
-                    Err(join_err) => StepOutcome::Failed {
-                        error: format!("step `{step_id}` join error: {join_err}"),
-                    },
-                };
-
-                apply_outcome(&mut plan, &step_id, &outcome);
-
-                let agent_type = plan
-                    .steps
-                    .iter()
-                    .find(|s| s.id == step_id)
-                    .map(|s| s.agent_type.clone())
-                    .unwrap_or_default();
-
-                match outcome {
-                    StepOutcome::Failed { error } => {
-                        overall_failed = true;
-                        self.emit(PlanEvent::StepFailed {
-                            plan_id,
-                            project: plan.project.clone(),
-                            step_id: step_id.clone(),
-                            agent_type,
-                            error,
-                        });
-                    }
-                    StepOutcome::Cancelled => {
-                        cancel.store(true, Ordering::SeqCst);
-                        self.emit(PlanEvent::StepCancelled {
-                            plan_id,
-                            project: plan.project.clone(),
-                            step_id: step_id.clone(),
-                            agent_type,
-                        });
-                    }
-                    StepOutcome::Completed { output } => {
-                        self.emit(PlanEvent::StepCompleted {
-                            plan_id,
-                            project: plan.project.clone(),
-                            step_id: step_id.clone(),
-                            agent_type,
-                            output,
-                        });
-                    }
-                    // Refused outcomes never reach this loop: a denied step
-                    // is settled inline in the spawn loop above and is not
-                    // pushed into `handles`.
-                    StepOutcome::Refused { .. } => {
-                        debug_assert!(false, "Refused outcome should never reach the join loop");
-                    }
-                }
-            }
-
-            // Persist incremental state after every layer so `status()` calls
-            // observe progress in real time.
+            // Persist incremental state after every layer so `status()`
+            // calls observe progress in real time.
             self.with_plan_mut(plan_id, |runtime| {
                 runtime.plan.steps.clone_from(&plan.steps);
             })?;
             self.persist_snapshot(plan_id).await?;
-            // Allow other tasks (and tests) to observe state between DAG layers.
+            // Allow other tasks (and tests) to observe state between layers.
             tokio::task::yield_now().await;
 
-            if overall_failed {
-                break 'outer;
+            if outcome.failed {
+                overall_failed = true;
+                break;
             }
         }
 
-        // ---- Finalise ----
-        let final_status = if cancel.load(Ordering::SeqCst) {
-            PlanStatus::Cancelled
-        } else if overall_failed {
-            PlanStatus::Failed
-        } else {
-            PlanStatus::Completed
-        };
-
-        self.with_plan_mut(plan_id, |runtime| {
-            runtime.plan.status = final_status;
-            runtime.plan.completed_at = Some(Utc::now());
-            runtime.plan.steps.clone_from(&plan.steps);
-            runtime.in_flight.clear();
-        })?;
-        self.persist_snapshot(plan_id).await?;
-
-        self.emit(PlanEvent::Finished {
-            plan_id,
-            project: plan.project.clone(),
-            status: final_status,
-        });
-
-        Ok(())
+        self.finalize_execution(plan_id, &plan, &cancel, overall_failed)
+            .await
     }
 
     async fn status(&self, plan_id: Uuid) -> Result<Plan> {
@@ -570,7 +459,11 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
 }
 
 /// Outcome of a single step's execution attempt.
-enum StepOutcome {
+///
+/// `pub(super)` so the sibling [`super::layer_runner`] module that drives
+/// per-layer fan-out can construct and pattern-match on it.
+#[derive(Debug)]
+pub(super) enum StepOutcome {
     Completed {
         output: String,
     },
@@ -588,7 +481,7 @@ enum StepOutcome {
 /// Execute one step, honouring its retry / timeout configuration. Runs inside
 /// a `tokio::spawn`'d task, so panics surface as `JoinError::is_panic()` to
 /// the caller.
-async fn run_step<S: AgentSpawner + ?Sized>(
+pub(super) async fn run_step<S: AgentSpawner + ?Sized>(
     spawner: &S,
     step: PlanStep,
     cancel: Arc<AtomicBool>,
@@ -624,7 +517,7 @@ async fn run_step<S: AgentSpawner + ?Sized>(
     }
 }
 
-fn apply_outcome(plan: &mut Plan, step_id: &str, outcome: &StepOutcome) {
+pub(super) fn apply_outcome(plan: &mut Plan, step_id: &str, outcome: &StepOutcome) {
     let Some(step) = plan.steps.iter_mut().find(|s| s.id == step_id) else {
         return;
     };

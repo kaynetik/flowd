@@ -67,6 +67,14 @@ impl FlowdPaths {
         self.home.join("models")
     }
 
+    /// Path the running daemon writes the plan-event observer health
+    /// snapshot to (HL-40). Read by `flowd status` out-of-band; absent
+    /// when the daemon was never started or is currently stopped.
+    #[must_use]
+    pub fn plan_event_health_file(&self) -> PathBuf {
+        self.home.join("plan-event-observer.health")
+    }
+
     /// Create the home dir (and parents) if missing. Idempotent.
     ///
     /// # Errors

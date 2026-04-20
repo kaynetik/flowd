@@ -1,10 +1,10 @@
 //! Plan-lifecycle observer hook.
 //!
-//! Today, a plan run leaves no trail in flowd's memory unless the agent
-//! itself chooses to call `memory_store`. This module gives the executor a
-//! thin observation surface so an external adapter (e.g.
-//! `MemoryPlanObserver` in `flowd-mcp`) can durably record what the
-//! orchestrator actually did, on every transition.
+//! Plan-lifecycle events are first-class telemetry: the executor calls
+//! [`PlanObserver::on_event`] at every well-defined transition, and an
+//! external adapter (e.g. `flowd_mcp::PlanEventObserver`) durably persists
+//! them into the dedicated `plan_events` table (HL-39). Memory is for
+//! semantic recall; this surface is for operational audit trails.
 //!
 //! ## Design choices
 //!

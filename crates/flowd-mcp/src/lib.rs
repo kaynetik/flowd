@@ -23,7 +23,10 @@ pub mod summarizer;
 pub mod tools;
 
 pub use handlers::{FlowdHandlers, McpHandlers};
-pub use observer::{MemoryPlanObserver, session_for_plan};
+pub use observer::{
+    DEFAULT_CAPACITY as PLAN_EVENT_DEFAULT_CAPACITY, ObserverHealth, PlanEventObserver,
+    PlanEventObserverConfig, ShutdownReport,
+};
 pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use server::{McpServer, McpServerConfig, dispatch};
 pub use summarizer::NoopSummarizer;

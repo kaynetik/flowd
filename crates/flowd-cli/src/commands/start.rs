@@ -26,6 +26,7 @@
 //! observation is immediately visible to the next `memory_context` call.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::signal::unix::{SignalKind, signal};
@@ -38,8 +39,9 @@ use flowd_core::orchestration::executor::InMemoryPlanExecutor;
 use flowd_core::orchestration::gate::RuleGate;
 use flowd_core::orchestration::observer::PlanObserver;
 use flowd_core::rules::{InMemoryRuleEvaluator, RuleEvaluator};
+use flowd_mcp::observer::{DEFAULT_HEALTH_INTERVAL, PlanEventObserver, PlanEventObserverConfig};
 use flowd_mcp::summarizer::NoopSummarizer;
-use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig, MemoryPlanObserver};
+use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig};
 use flowd_onnx::provider::OnnxEmbedder;
 use flowd_storage::sqlite::SqliteBackend;
 use flowd_vector::qdrant::{QdrantConfig, QdrantIndex};
@@ -49,7 +51,12 @@ use crate::output::Style;
 use crate::paths::FlowdPaths;
 use crate::spawner::BoxedSpawner;
 
-pub async fn run(paths: &FlowdPaths, style: Style, qdrant_url: Option<String>) -> Result<()> {
+pub async fn run(
+    paths: &FlowdPaths,
+    style: Style,
+    qdrant_url: Option<String>,
+    plan_event_buffer: usize,
+) -> Result<()> {
     paths.ensure_home()?;
 
     // Acquire the PID file before we start any I/O so concurrent starts
@@ -81,6 +88,10 @@ pub async fn run(paths: &FlowdPaths, style: Style, qdrant_url: Option<String>) -
         spawner.description()
     );
     let plan_store = backends.sqlite.plan_store();
+    // Plan-lifecycle event log shares the same SQLite connection as plan
+    // persistence so a single transaction-coherent file backs every
+    // orchestration write (HL-39).
+    let plan_event_store = Arc::new(backends.sqlite.plan_event_store());
 
     // Build the rules evaluator once and share it between the MCP handlers
     // (`rules_check` / `rules_list` tools) and the executor's step-boundary
@@ -89,12 +100,12 @@ pub async fn run(paths: &FlowdPaths, style: Style, qdrant_url: Option<String>) -
     let rules = Arc::new(compose_rules(paths, style)?);
     let rule_gate: Arc<dyn RuleGate> = Arc::clone(&rules) as Arc<dyn RuleGate>;
 
-    // The plan observer mirrors every executor lifecycle event into flowd's
-    // memory under a deterministic per-plan session, so `flowd history` and
-    // semantic search both surface what the executor actually did -- no
-    // longer dependent on the agent voluntarily calling `memory_store`.
-    let plan_observer: Arc<dyn PlanObserver> =
-        Arc::new(MemoryPlanObserver::new(Arc::clone(&memory_service)));
+    // The plan observer fans every executor lifecycle event into the
+    // dedicated `plan_events` table. `flowd plan events <id>` reads it
+    // back without booting the daemon (WAL-safe).
+    let plan_event_observer =
+        spawn_plan_event_observer(paths, style, plan_event_store, plan_event_buffer);
+    let plan_observer: Arc<dyn PlanObserver> = Arc::clone(&plan_event_observer) as _;
 
     let executor = Arc::new(
         InMemoryPlanExecutor::from_shared_with_store(spawner, plan_store)
@@ -134,6 +145,8 @@ pub async fn run(paths: &FlowdPaths, style: Style, qdrant_url: Option<String>) -
         }
     }
 
+    shutdown_plan_event_observer(paths, style, &plan_event_observer).await;
+
     // Stop the compactor *before* dropping the PID file so any in-flight
     // compaction completes (or aborts cleanly) while the daemon is still
     // marked alive. `stop` is idempotent and short-circuits on Drop.
@@ -142,6 +155,71 @@ pub async fn run(paths: &FlowdPaths, style: Style, qdrant_url: Option<String>) -
     drop(pid); // explicit for clarity; would run anyway at scope exit
     eprintln!("{} daemon stopped", style.green("done"));
     Ok(())
+}
+
+/// Build the bounded-queue plan-event observer (HL-40).
+///
+/// `capacity == 0` is rejected by [`PlanEventObserver::new`]; we
+/// translate it to the documented default here so a typo on the CLI
+/// just emits a warning rather than crashing the daemon.
+fn spawn_plan_event_observer(
+    paths: &FlowdPaths,
+    style: Style,
+    store: Arc<flowd_storage::plan_event_store::SqlitePlanEventStore>,
+    requested_capacity: usize,
+) -> Arc<PlanEventObserver> {
+    let capacity = if requested_capacity == 0 {
+        eprintln!(
+            "{} --plan-event-buffer 0 is invalid; falling back to default 1024",
+            style.yellow("warning")
+        );
+        1024
+    } else {
+        requested_capacity
+    };
+    let observer = PlanEventObserver::new(
+        store,
+        PlanEventObserverConfig {
+            capacity,
+            health_file: Some(paths.plan_event_health_file()),
+            health_interval: DEFAULT_HEALTH_INTERVAL,
+        },
+    );
+    eprintln!(
+        "{} plan-event observer (capacity: {}, health: {})",
+        style.cyan("spawned"),
+        capacity,
+        paths.plan_event_health_file().display()
+    );
+    Arc::new(observer)
+}
+
+/// Flush buffered events to the store, log the drop count, and remove
+/// the stale health snapshot. 5s deadline matches systemd's default
+/// `TimeoutStopSec`.
+async fn shutdown_plan_event_observer(
+    paths: &FlowdPaths,
+    style: Style,
+    observer: &PlanEventObserver,
+) {
+    let report = observer.shutdown(Duration::from_secs(5)).await;
+    if report.dropped > 0 {
+        eprintln!(
+            "{} plan-event observer dropped {} event(s) over the lifetime of this daemon (channel saturated)",
+            style.yellow("note"),
+            report.dropped
+        );
+    }
+    if report.timed_out {
+        eprintln!(
+            "{} plan-event observer drain timed out; some buffered events may be lost",
+            style.yellow("warning")
+        );
+    }
+    let health_path = paths.plan_event_health_file();
+    if health_path.exists() {
+        let _ = std::fs::remove_file(&health_path);
+    }
 }
 
 /// Backends needed by both the live request path and the background
