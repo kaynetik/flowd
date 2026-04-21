@@ -23,7 +23,7 @@ pub mod server;
 pub mod summarizer;
 pub mod tools;
 
-pub use compiler::RejectingPlanCompiler;
+pub use compiler::{LlmCallback, LlmPlanCompiler, RejectingPlanCompiler, StubPlanCompiler};
 pub use handlers::{FlowdHandlers, McpHandlers};
 pub use observer::{
     DEFAULT_CAPACITY as PLAN_EVENT_DEFAULT_CAPACITY, ObserverHealth, PlanEventObserver,

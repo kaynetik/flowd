@@ -41,7 +41,7 @@ use flowd_core::orchestration::observer::PlanObserver;
 use flowd_core::rules::{InMemoryRuleEvaluator, RuleEvaluator};
 use flowd_mcp::observer::{DEFAULT_HEALTH_INTERVAL, PlanEventObserver, PlanEventObserverConfig};
 use flowd_mcp::summarizer::NoopSummarizer;
-use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig, RejectingPlanCompiler};
+use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig, StubPlanCompiler};
 use flowd_onnx::provider::OnnxEmbedder;
 use flowd_storage::sqlite::SqliteBackend;
 use flowd_vector::qdrant::{QdrantConfig, QdrantIndex};
@@ -117,12 +117,16 @@ pub async fn run(
         .await
         .map_err(|e| anyhow::anyhow!("rehydrate orchestration plans: {e}"))?;
 
-    // Prose-first plan creation (HL-44) ships its real LLM-backed
-    // compiler in a follow-up PR; until then the daemon installs a
-    // [`RejectingPlanCompiler`] so `plan_create` with `prose` returns
-    // a clear "not enabled in this build" error while the DAG-first
-    // path keeps working unchanged.
-    let plan_compiler = Arc::new(RejectingPlanCompiler::new());
+    // Prose-first plan creation (HL-44). The daemon ships with the
+    // [`StubPlanCompiler`]: a deterministic, dependency-free parser that
+    // accepts already-structured markdown prose
+    // (`## <id> [agent: <type>] depends_on: [...]\n<prompt>`) and turns
+    // it into a `PlanDefinition`. When the prose is freeform, the stub
+    // surfaces a single open question asking for restructured input so
+    // the loop is closeable without an LLM. The LLM-backed compiler
+    // (`LlmPlanCompiler`) is shipped as a skeleton today; its real
+    // implementation lands in a follow-up PR and replaces this binding.
+    let plan_compiler = Arc::new(StubPlanCompiler::new());
 
     let handlers = Arc::new(
         FlowdHandlers::new(memory_service, executor, plan_compiler, rules)

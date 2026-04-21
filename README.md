@@ -95,20 +95,68 @@ Both clients spawn `flowd start` as a stdio subprocess. You do not run the daemo
 
 ### 3. Use the agent
 
-The agent now has eight MCP tools. Inside a Claude Code or Cursor session:
+The agent now has twelve MCP tools. Inside a Claude Code or Cursor session:
 
-| Tool             | When the agent calls it                                           |
-| ---------------- | ----------------------------------------------------------------- |
-| `memory_store`   | To persist a decision, design note, or tool result.               |
-| `memory_search`  | To recall prior observations by keyword or semantic similarity.   |
-| `memory_context` | Auto-injection at file or session scope (skips cold tier).        |
-| `plan_create`    | To submit a DAG plan of sub-agent steps.                          |
-| `plan_confirm`   | To advance a plan from draft to running after human review.       |
-| `plan_status`    | To poll execution progress.                                       |
-| `rules_check`    | Pre-flight gate before a risky tool invocation.                   |
-| `rules_list`     | To enumerate rules active for the current project or file scope.  |
+| Tool             | When the agent calls it                                                                |
+| ---------------- | -------------------------------------------------------------------------------------- |
+| `memory_store`   | To persist a decision, design note, or tool result.                                    |
+| `memory_search`  | To recall prior observations by keyword or semantic similarity.                        |
+| `memory_context` | Auto-injection at file or session scope (skips cold tier).                             |
+| `plan_create`    | To submit a plan, either as a structured DAG (`definition`) or as `prose`.             |
+| `plan_answer`    | To resolve open clarification questions emitted by the prose-first compiler.           |
+| `plan_refine`    | To apply freeform feedback to a draft plan and re-compile.                             |
+| `plan_confirm`   | To advance a plan from draft to running after human review.                            |
+| `plan_cancel`    | To abandon a draft, confirmed, or running plan.                                        |
+| `plan_status`    | To poll execution progress.                                                            |
+| `plan_resume`    | To reset failed steps on a stalled plan and re-execute from the failure boundary.      |
+| `rules_check`    | Pre-flight gate before a risky tool invocation.                                        |
+| `rules_list`     | To enumerate rules active for the current project or file scope.                       |
 
 Rules are YAML files under `~/.flowd/rules/` (global) and `<repo>/.flowd/rules/` (project). See `flowd-core/src/rules/loader.rs` for the schema.
+
+#### Prose-first planning
+
+`plan_create` accepts either a structured `definition` (the legacy DAG-first path) or a `prose` description. Prose plans are passed to the configured `PlanCompiler`, which can either compile them straight to a DAG or surface a list of `OpenQuestion`s the agent must resolve before the plan can run. The clarification loop is:
+
+```text
+plan_create(prose)
+   |
+   v
++---------+    open questions?    +-------------+
+|  Draft  +----------------------->  plan_answer  | <-+
++---+-----+                        +------+------+   |
+    |                                     |          | overwrite
+    | no questions left                   v          | answer
+    |                              +-------------+   |
+    |                              |  re-compile +---+
+    |                              +------+------+
+    |                                     |
+    |    plan_refine(feedback)            |
+    +<-----------------------------+      |
+    |                              |      |
+    v                              |      |
+plan_confirm  --> Running --> plan_status (poll) --> Completed / Failed
+    |
+    v
+plan_cancel  (Draft / Confirmed / Running)
+```
+
+The daemon ships with [`StubPlanCompiler`], a deterministic, no-LLM compiler that parses already-structured markdown:
+
+```text
+# refactor-auth
+
+## extract-jwt [agent: rust-engineer]
+Pull the JWT helpers out of `auth/mod.rs`.
+
+## migrate-callers [agent: rust-engineer] depends_on: [extract-jwt]
+Update every call site to use the new module.
+
+## smoke-test [agent: tester] depends_on: [migrate-callers]
+Run the integration tests and capture failures.
+```
+
+Each `## <step-id> [agent: <type>]` heading defines a step; the body until the next `## ` (or end of file) is the prompt. `depends_on: [a, b]` is optional. When the prose is freeform, the stub surfaces a single `stub.structure_required` open question and waits for the agent to either restructure via `plan_refine` or paste a structured version through `Answer::ExplainMore`. An LLM-backed compiler (`LlmPlanCompiler`) is shipped as a skeleton today; a follow-up release wires it to the connected MCP client.
 
 ### 4. Observe out-of-band
 
