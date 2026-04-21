@@ -4,7 +4,13 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004];
+const MIGRATIONS: &[&str] = &[
+    MIGRATION_001,
+    MIGRATION_002,
+    MIGRATION_003,
+    MIGRATION_004,
+    MIGRATION_005,
+];
 
 const MIGRATION_001: &str = r"
 CREATE TABLE IF NOT EXISTS migrations (
@@ -153,6 +159,28 @@ CREATE INDEX IF NOT EXISTS idx_plan_events_project
     ON plan_events(project, created_at);
 CREATE INDEX IF NOT EXISTS idx_plan_events_kind
     ON plan_events(kind);
+";
+
+// First-class storage for the prose-first plan front door (HL-44).
+//
+// Promotes the four clarification fields out of the catch-all `definition`
+// JSON blob so we can:
+//   * Surface "draft plans with N unresolved questions" in `plan_list`
+//     without parsing every blob.
+//   * Diff prose changes across rounds via a single column read.
+//   * Set defaults that load cleanly even on rows written by older
+//     binaries that never knew about these columns.
+//
+// Defaults (`NULL`, `'[]'`, `'[]'`, `0`) are chosen to round-trip back into
+// the [`flowd_core::orchestration::Plan`] defaults (None, empty Vec, empty
+// Vec, false). The plan_store read path reads these columns first and only
+// falls back to `definition` JSON when both sources disagree -- the column
+// wins because it's the canonical home going forward.
+const MIGRATION_005: &str = r"
+ALTER TABLE plans ADD COLUMN source_doc TEXT;
+ALTER TABLE plans ADD COLUMN open_questions_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE plans ADD COLUMN decisions_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE plans ADD COLUMN definition_dirty INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Run all pending migrations.

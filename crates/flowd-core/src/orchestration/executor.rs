@@ -46,7 +46,7 @@ use crate::error::{FlowdError, Result};
 
 use super::{
     NoOpPlanStore, Plan, PlanExecutor, PlanPreview, PlanStatus, PlanStep, PlanStore, StepStatus,
-    build_preview, validate_plan,
+    build_preview, compiler::CompileOutput, validate_plan, validate_plan_pending,
 };
 
 /// Output captured from an agent invocation.
@@ -317,7 +317,10 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
     }
 
     async fn submit(&self, plan: Plan) -> Result<Uuid> {
-        validate_plan(&plan)?;
+        // Use the pending-friendly variant: prose-first plans legitimately
+        // have no compiled steps until clarification finishes. Strict
+        // validation fires later, at confirm time.
+        validate_plan_pending(&plan)?;
         let id = plan.id;
         let name = plan.name.clone();
         let project = plan.project.clone();
@@ -417,16 +420,58 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
     }
 
     async fn cancel(&self, plan_id: Uuid) -> Result<()> {
-        let handles = self.with_plan_mut(plan_id, |runtime| {
-            runtime.cancel.store(true, Ordering::SeqCst);
-            // Abort everything currently in flight; new layers won't start
-            // because `cancel` is now `true`.
-            std::mem::take(&mut runtime.in_flight)
-        })?;
-        for h in handles {
-            h.abort();
+        // Three execution paths depending on where the plan is in its
+        // lifecycle:
+        //   * Terminal -> idempotent no-op.
+        //   * Draft / Confirmed (no execute() task in flight) -> directly
+        //     transition to Cancelled, persist, emit Finished.
+        //   * Running -> set the latch + abort handles; the executing
+        //     task's finalize_execution will see the latch and settle
+        //     the plan as Cancelled (preserving the historic ordering
+        //     guarantees).
+        enum Action {
+            Noop,
+            DirectTransition { project: String },
+            LatchAndAbort { handles: Vec<AbortHandle> },
         }
-        Ok(())
+
+        let action = self.with_plan_mut(plan_id, |runtime| match runtime.plan.status {
+            PlanStatus::Completed | PlanStatus::Failed | PlanStatus::Cancelled => Action::Noop,
+            PlanStatus::Draft | PlanStatus::Confirmed => {
+                runtime.cancel.store(true, Ordering::SeqCst);
+                runtime.plan.status = PlanStatus::Cancelled;
+                runtime.plan.completed_at = Some(Utc::now());
+                runtime.in_flight.clear();
+                Action::DirectTransition {
+                    project: runtime.plan.project.clone(),
+                }
+            }
+            PlanStatus::Running => {
+                runtime.cancel.store(true, Ordering::SeqCst);
+                Action::LatchAndAbort {
+                    handles: std::mem::take(&mut runtime.in_flight),
+                }
+            }
+        })?;
+
+        match action {
+            Action::Noop => Ok(()),
+            Action::DirectTransition { project } => {
+                self.persist_snapshot(plan_id).await?;
+                self.emit(PlanEvent::Finished {
+                    plan_id,
+                    project,
+                    status: PlanStatus::Cancelled,
+                });
+                Ok(())
+            }
+            Action::LatchAndAbort { handles } => {
+                for h in handles {
+                    h.abort();
+                }
+                Ok(())
+            }
+        }
     }
 
     async fn resume_plan(&self, plan_id: Uuid) -> Result<()> {
@@ -455,6 +500,34 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             Ok(())
         })??;
         self.persist_snapshot(plan_id).await
+    }
+
+    async fn apply_compile_output(&self, plan_id: Uuid, output: CompileOutput) -> Result<()> {
+        self.with_plan_mut(plan_id, |runtime| {
+            if runtime.plan.status != PlanStatus::Draft {
+                return Err(FlowdError::PlanExecution(format!(
+                    "plan `{plan_id}` is not in Draft state (currently {:?}); compile outputs only apply during clarification",
+                    runtime.plan.status
+                )));
+            }
+            runtime.plan.apply_compile_output(output);
+            Ok(())
+        })??;
+        self.persist_snapshot(plan_id).await
+    }
+
+    async fn invalidate_decision(&self, plan_id: Uuid, question_id: String) -> Result<Vec<String>> {
+        let removed = self.with_plan_mut(plan_id, |runtime| {
+            if runtime.plan.status != PlanStatus::Draft {
+                return Err(FlowdError::PlanExecution(format!(
+                    "plan `{plan_id}` is not in Draft state (currently {:?}); cannot invalidate decisions",
+                    runtime.plan.status
+                )));
+            }
+            Ok(runtime.plan.invalidate_decision(&question_id))
+        })??;
+        self.persist_snapshot(plan_id).await?;
+        Ok(removed)
     }
 }
 
@@ -1049,6 +1122,205 @@ mod tests {
             let done = exec.status(id).await.unwrap();
             assert_eq!(done.status, PlanStatus::Completed);
             assert!(done.steps.iter().all(|s| s.status == StepStatus::Completed));
+        });
+    }
+
+    // ---------- prose-first / clarification lifecycle (Phase 3) ----------
+
+    use crate::orchestration::clarification::{DecisionRecord, OpenQuestion, QuestionOption};
+    use crate::orchestration::compiler::CompileOutput;
+    use crate::orchestration::loader::{PlanDefinition, StepDefinition};
+
+    fn open_question(id: &str, deps: &[&str]) -> OpenQuestion {
+        OpenQuestion {
+            id: id.into(),
+            prompt: format!("pick for {id}"),
+            rationale: "test".into(),
+            options: vec![QuestionOption {
+                id: "x".into(),
+                label: "X".into(),
+                rationale: "any".into(),
+            }],
+            allow_explain_more: false,
+            allow_none: false,
+            depends_on_decisions: deps.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn def_with_step(id: &str) -> PlanDefinition {
+        PlanDefinition {
+            name: "p".into(),
+            project: Some("proj".into()),
+            steps: vec![StepDefinition {
+                id: id.into(),
+                agent_type: "echo".into(),
+                prompt: "hi".into(),
+                depends_on: vec![],
+                timeout_secs: None,
+                retry_count: 0,
+            }],
+        }
+    }
+
+    /// A prose-first plan with open questions and no compiled steps must
+    /// still pass `submit` (which uses the pending-friendly validator).
+    /// The strict check fires only at confirm.
+    #[test]
+    fn submit_accepts_draft_with_open_questions_and_no_steps() {
+        let exec = InMemoryPlanExecutor::new(EchoSpawner {
+            invocations: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let mut plan = Plan::new("p", "proj", vec![]);
+        plan.open_questions.push(open_question("q1", &[]));
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            let snap = exec.status(id).await.unwrap();
+            assert_eq!(snap.status, PlanStatus::Draft);
+            assert_eq!(snap.open_questions.len(), 1);
+            assert!(snap.steps.is_empty());
+
+            // ...but confirming must reject with the inline-id message.
+            let err = exec.confirm(id).await.unwrap_err();
+            let msg = match err {
+                FlowdError::PlanValidation(m) => m,
+                other => panic!("unexpected: {other:?}"),
+            };
+            assert!(msg.contains("unresolved"), "msg: {msg}");
+            assert!(msg.contains("q1"), "msg: {msg}");
+        });
+    }
+
+    /// The full prose-first happy path: submit a draft with questions,
+    /// drain them through `apply_compile_output`, then confirm.
+    #[test]
+    fn apply_compile_output_drains_questions_and_enables_confirm() {
+        let store = MapPlanStore::default();
+        let exec = InMemoryPlanExecutor::with_plan_store(
+            EchoSpawner {
+                invocations: Arc::new(AtomicUsize::new(0)),
+            },
+            store.clone(),
+        );
+
+        let mut plan = Plan::new("p", "proj", vec![]);
+        plan.open_questions.push(open_question("q1", &[]));
+        plan.source_doc = Some("# initial prose".into());
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+
+            // Round 1: compiler returns the resolved DAG.
+            exec.apply_compile_output(
+                id,
+                CompileOutput::ready("# resolved", def_with_step("step-a")),
+            )
+            .await
+            .unwrap();
+
+            let after = exec.status(id).await.unwrap();
+            assert!(after.open_questions.is_empty());
+            assert!(!after.definition_dirty);
+            assert_eq!(after.steps.len(), 1);
+            assert_eq!(after.source_doc.as_deref(), Some("# resolved"));
+
+            // confirm now succeeds because there are real, valid steps.
+            let preview = exec.confirm(id).await.unwrap();
+            assert_eq!(preview.total_steps, 1);
+        });
+    }
+
+    #[test]
+    fn apply_compile_output_rejects_non_draft_plan() {
+        let exec = InMemoryPlanExecutor::new(EchoSpawner {
+            invocations: Arc::new(AtomicUsize::new(0)),
+        });
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            // Now plan is Confirmed, not Draft -- compile output rejected.
+            let err = exec
+                .apply_compile_output(id, CompileOutput::ready("# late", def_with_step("step-a")))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, FlowdError::PlanExecution(m) if m.contains("Draft")));
+        });
+    }
+
+    #[test]
+    fn invalidate_decision_executor_walks_dependents() {
+        let exec = InMemoryPlanExecutor::new(EchoSpawner {
+            invocations: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let mut plan = Plan::new("p", "proj", vec![]);
+        plan.open_questions.push(open_question("seed", &[])); // keep in Draft after submit
+        plan.decisions.extend([
+            DecisionRecord::new_user("q1", "x", vec![]),
+            DecisionRecord::new_user("q2", "x", vec!["q1".into()]),
+            DecisionRecord::new_user("q3", "x", vec!["q2".into()]),
+        ]);
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            let removed = exec.invalidate_decision(id, "q1".into()).await.unwrap();
+            assert_eq!(removed, vec!["q1", "q2", "q3"]);
+
+            let snap = exec.status(id).await.unwrap();
+            assert!(snap.decisions.is_empty());
+            assert!(snap.definition_dirty);
+        });
+    }
+
+    /// `cancel(plan_id)` on a `Draft` (never executed) plan must transition
+    /// it directly to `Cancelled` and persist; previously cancel only set a
+    /// latch which a never-running plan never observed.
+    #[test]
+    fn cancel_from_draft_transitions_to_cancelled_and_persists() {
+        let store = MapPlanStore::default();
+        let exec = InMemoryPlanExecutor::with_plan_store(
+            EchoSpawner {
+                invocations: Arc::new(AtomicUsize::new(0)),
+            },
+            store.clone(),
+        );
+
+        let mut plan = Plan::new("p", "proj", vec![]);
+        plan.open_questions.push(open_question("q1", &[]));
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.cancel(id).await.unwrap();
+
+            let snap = exec.status(id).await.unwrap();
+            assert_eq!(snap.status, PlanStatus::Cancelled);
+            assert!(snap.completed_at.is_some());
+
+            // Cancellation is idempotent -- re-calling on a terminal plan
+            // is a no-op rather than an error.
+            exec.cancel(id).await.unwrap();
+
+            let persisted = store.0.lock().unwrap().get(&id).unwrap().clone();
+            assert_eq!(persisted.status, PlanStatus::Cancelled);
+        });
+    }
+
+    #[test]
+    fn cancel_from_confirmed_transitions_directly_when_no_executor_running() {
+        let exec = InMemoryPlanExecutor::new(EchoSpawner {
+            invocations: Arc::new(AtomicUsize::new(0)),
+        });
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            exec.cancel(id).await.unwrap();
+            let snap = exec.status(id).await.unwrap();
+            assert_eq!(snap.status, PlanStatus::Cancelled);
         });
     }
 }

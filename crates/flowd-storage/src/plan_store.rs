@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use flowd_core::error::{FlowdError, Result};
-use flowd_core::orchestration::{Plan, PlanStatus, PlanStore, PlanSummary, StepStatus};
+use flowd_core::orchestration::{
+    DecisionRecord, OpenQuestion, Plan, PlanStatus, PlanStore, PlanSummary, StepStatus,
+};
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
@@ -54,8 +56,23 @@ impl PlanStore for SqlitePlanStore {
                 let mut conn = conn
                     .lock()
                     .map_err(|e| FlowdError::Storage(e.to_string()))?;
+                // The `definition` blob remains the catch-all for any
+                // future Plan field we haven't promoted yet; the four
+                // clarification fields below now also live in dedicated
+                // columns so they're queryable / indexable. On read we
+                // trust the columns over the blob (see [`load_plan`]).
                 let definition = serde_json::to_string(&plan).map_err(|e| {
                     FlowdError::Serialization(format!("persist plan {}: {e}", plan.id))
+                })?;
+                let open_questions_json =
+                    serde_json::to_string(&plan.open_questions).map_err(|e| {
+                        FlowdError::Serialization(format!(
+                            "persist plan {} open_questions: {e}",
+                            plan.id
+                        ))
+                    })?;
+                let decisions_json = serde_json::to_string(&plan.decisions).map_err(|e| {
+                    FlowdError::Serialization(format!("persist plan {} decisions: {e}", plan.id))
                 })?;
 
                 let tx = conn.transaction().map_err(storage_err)?;
@@ -66,8 +83,10 @@ impl PlanStore for SqlitePlanStore {
                 )
                 .map_err(storage_err)?;
                 tx.execute(
-                    "INSERT OR REPLACE INTO plans (id, name, status, definition, created_at, started_at, completed_at, project)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT OR REPLACE INTO plans (
+                        id, name, status, definition, created_at, started_at, completed_at, project,
+                        source_doc, open_questions_json, decisions_json, definition_dirty
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         &id,
                         &plan.name,
@@ -77,6 +96,10 @@ impl PlanStore for SqlitePlanStore {
                         plan.started_at.map(|t| t.to_rfc3339()),
                         plan.completed_at.map(|t| t.to_rfc3339()),
                         &plan.project,
+                        plan.source_doc.as_deref(),
+                        &open_questions_json,
+                        &decisions_json,
+                        i64::from(plan.definition_dirty),
                     ],
                 )
                 .map_err(storage_err)?;
@@ -124,17 +147,46 @@ impl PlanStore for SqlitePlanStore {
                     .lock()
                     .map_err(|e| FlowdError::Storage(e.to_string()))?;
                 let mut stmt = conn
-                    .prepare("SELECT definition FROM plans WHERE id = ?1")
+                    .prepare(
+                        "SELECT definition, source_doc, open_questions_json, decisions_json, definition_dirty
+                         FROM plans WHERE id = ?1",
+                    )
                     .map_err(storage_err)?;
-                let row: Option<String> = stmt
-                    .query_row([&id_str], |row| row.get(0))
+                // Tuple per column (positional, no alias to keep the
+                // statement-vs-item ordering quiet for clippy). Legacy
+                // DBs (post-migration but pre-Phase-4 binary writes)
+                // still load because the columns have SQL defaults so
+                // every read is well-typed.
+                let row: Option<(String, Option<String>, String, String, i64)> = stmt
+                    .query_row([&id_str], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    })
                     .optional()
                     .map_err(storage_err)?;
-                let Some(json) = row else {
+                let Some((json, source_doc, open_questions_json, decisions_json, dirty)) = row
+                else {
                     return Ok(None);
                 };
-                let plan: Plan = serde_json::from_str(&json)
+
+                // Base from the JSON blob (gives us steps, status,
+                // timestamps, project, etc.). The four clarification
+                // fields are then overlaid from their dedicated columns
+                // so the columns are the canonical source of truth even
+                // when the blob is stale (e.g. written by an older
+                // binary).
+                let mut plan: Plan = serde_json::from_str(&json)
                     .map_err(|e| FlowdError::Serialization(e.to_string()))?;
+                plan.source_doc = source_doc;
+                plan.open_questions = parse_open_questions(&open_questions_json, plan.id)?;
+                plan.decisions = parse_decisions(&decisions_json, plan.id)?;
+                plan.definition_dirty = dirty != 0;
+
                 Ok(Some(plan))
             })
             .await
@@ -258,5 +310,191 @@ fn step_status_str(s: StepStatus) -> &'static str {
         StepStatus::Failed => "failed",
         StepStatus::Skipped => "skipped",
         StepStatus::Cancelled => "cancelled",
+    }
+}
+
+fn parse_open_questions(json: &str, plan_id: Uuid) -> Result<Vec<OpenQuestion>> {
+    serde_json::from_str(json)
+        .map_err(|e| FlowdError::Serialization(format!("plan {plan_id} open_questions_json: {e}")))
+}
+
+fn parse_decisions(json: &str, plan_id: Uuid) -> Result<Vec<DecisionRecord>> {
+    serde_json::from_str(json)
+        .map_err(|e| FlowdError::Serialization(format!("plan {plan_id} decisions_json: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowd_core::orchestration::{Plan, PlanStep, QuestionOption, StepStatus};
+    use rusqlite::Connection;
+
+    fn store() -> SqlitePlanStore {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        crate::migrations::run_migrations(&conn).expect("migrations");
+        SqlitePlanStore::from_connection(Arc::new(Mutex::new(conn)))
+    }
+
+    fn step(id: &str) -> PlanStep {
+        PlanStep {
+            id: id.into(),
+            agent_type: "echo".into(),
+            prompt: "hi".into(),
+            depends_on: vec![],
+            timeout_secs: None,
+            retry_count: 0,
+            status: StepStatus::Pending,
+            output: None,
+            error: None,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    fn open_question(id: &str) -> OpenQuestion {
+        OpenQuestion {
+            id: id.into(),
+            prompt: "pick".into(),
+            rationale: "test".into(),
+            options: vec![QuestionOption {
+                id: "x".into(),
+                label: "X".into(),
+                rationale: "any".into(),
+            }],
+            allow_explain_more: false,
+            allow_none: false,
+            depends_on_decisions: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn save_and_load_round_trip_preserves_clarification_fields() {
+        let store = store();
+        let mut plan = Plan::new("p", "proj", vec![step("a")]);
+        plan.source_doc = Some("# prose".into());
+        plan.open_questions.push(open_question("q1"));
+        plan.decisions
+            .push(DecisionRecord::new_user("q0", "yes", vec![]));
+        plan.definition_dirty = true;
+
+        let id = plan.id;
+        store.save_plan(&plan).await.unwrap();
+        let loaded = store.load_plan(id).await.unwrap().expect("load");
+
+        assert_eq!(loaded.source_doc.as_deref(), Some("# prose"));
+        assert_eq!(loaded.open_questions.len(), 1);
+        assert_eq!(loaded.open_questions[0].id, "q1");
+        assert_eq!(loaded.decisions.len(), 1);
+        assert_eq!(loaded.decisions[0].chosen_option_id, "yes");
+        assert!(loaded.definition_dirty);
+        assert_eq!(loaded.steps.len(), 1);
+        assert_eq!(loaded.project, "proj");
+    }
+
+    /// Empty defaults must round-trip cleanly through both columns and
+    /// JSON blob. Catches the "we forgot to write `[]` and end up with a
+    /// NOT NULL violation" regression.
+    #[tokio::test]
+    async fn save_and_load_round_trip_with_empty_clarification_fields() {
+        let store = store();
+        let plan = Plan::new("p", "proj", vec![step("a")]);
+        let id = plan.id;
+        store.save_plan(&plan).await.unwrap();
+        let loaded = store.load_plan(id).await.unwrap().expect("load");
+
+        assert!(loaded.source_doc.is_none());
+        assert!(loaded.open_questions.is_empty());
+        assert!(loaded.decisions.is_empty());
+        assert!(!loaded.definition_dirty);
+    }
+
+    /// Simulate a row written by a pre-Phase-4 binary: the `definition`
+    /// blob has no clarification fields, but the schema columns are
+    /// present (with their `MIGRATION_005` defaults). Loading must succeed
+    /// and surface the column defaults rather than failing.
+    #[tokio::test]
+    async fn load_falls_back_to_column_defaults_for_legacy_blob() {
+        let store = store();
+        let plan = Plan::new("p", "proj", vec![step("a")]);
+        let id = plan.id;
+
+        // Hand-craft a "legacy" definition blob without the clarification
+        // fields, then write directly through SQL so we don't rely on the
+        // current Plan serializer.
+        let mut json = serde_json::to_value(&plan).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("source_doc");
+        obj.remove("open_questions");
+        obj.remove("decisions");
+        obj.remove("definition_dirty");
+        let legacy_blob = serde_json::to_string(&json).unwrap();
+
+        // Insert with column defaults so the row mirrors a real
+        // post-migration / pre-write upgrade.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO plans (id, name, status, definition, created_at, project)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    &id.to_string(),
+                    &plan.name,
+                    plan_status_str(plan.status),
+                    &legacy_blob,
+                    plan.created_at.to_rfc3339(),
+                    &plan.project,
+                ],
+            )
+            .unwrap();
+
+        let loaded = store.load_plan(id).await.unwrap().expect("load");
+        assert!(loaded.source_doc.is_none());
+        assert!(loaded.open_questions.is_empty());
+        assert!(loaded.decisions.is_empty());
+        assert!(!loaded.definition_dirty);
+    }
+
+    /// When the dedicated columns and the JSON blob disagree (because an
+    /// older binary wrote both, then a newer binary updated only the
+    /// columns), the columns win.
+    #[tokio::test]
+    async fn columns_take_precedence_over_blob_when_they_disagree() {
+        let store = store();
+        let mut plan = Plan::new("p", "proj", vec![step("a")]);
+        plan.source_doc = Some("# from blob".into());
+        plan.open_questions.push(open_question("blob-q"));
+        let id = plan.id;
+        store.save_plan(&plan).await.unwrap();
+
+        // Mutate columns without touching the blob.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE plans
+                 SET source_doc = ?1,
+                     open_questions_json = ?2,
+                     decisions_json = ?3,
+                     definition_dirty = 1
+                 WHERE id = ?4",
+                rusqlite::params![
+                    "# from columns",
+                    "[]",
+                    serde_json::to_string(&[DecisionRecord::new_user("col-q", "x", vec![])])
+                        .unwrap(),
+                    &id.to_string(),
+                ],
+            )
+            .unwrap();
+
+        let loaded = store.load_plan(id).await.unwrap().expect("load");
+        assert_eq!(loaded.source_doc.as_deref(), Some("# from columns"));
+        assert!(loaded.open_questions.is_empty());
+        assert_eq!(loaded.decisions.len(), 1);
+        assert_eq!(loaded.decisions[0].question_id, "col-q");
+        assert!(loaded.definition_dirty);
     }
 }
