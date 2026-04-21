@@ -1001,6 +1001,9 @@ mod tests {
                 PlanEvent::StepRefused { .. } => "step_refused",
                 PlanEvent::StepCancelled { .. } => "step_cancelled",
                 PlanEvent::Finished { .. } => "finished",
+                PlanEvent::ClarificationOpened { .. } => "clarification_opened",
+                PlanEvent::ClarificationResolved { .. } => "clarification_resolved",
+                PlanEvent::RefinementApplied { .. } => "refinement_applied",
             })
             .collect();
         assert_eq!(

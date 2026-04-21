@@ -48,6 +48,9 @@ pub mod kind {
     pub const STEP_REFUSED: &str = "step_refused";
     pub const STEP_CANCELLED: &str = "step_cancelled";
     pub const FINISHED: &str = "finished";
+    pub const CLARIFICATION_OPENED: &str = "clarification_opened";
+    pub const CLARIFICATION_RESOLVED: &str = "clarification_resolved";
+    pub const REFINEMENT_APPLIED: &str = "refinement_applied";
 }
 
 /// Map a [`PlanEvent`] variant to its persisted `kind` string.
@@ -61,6 +64,9 @@ pub fn event_kind(event: &PlanEvent) -> &'static str {
         PlanEvent::StepRefused { .. } => kind::STEP_REFUSED,
         PlanEvent::StepCancelled { .. } => kind::STEP_CANCELLED,
         PlanEvent::Finished { .. } => kind::FINISHED,
+        PlanEvent::ClarificationOpened { .. } => kind::CLARIFICATION_OPENED,
+        PlanEvent::ClarificationResolved { .. } => kind::CLARIFICATION_RESOLVED,
+        PlanEvent::RefinementApplied { .. } => kind::REFINEMENT_APPLIED,
     }
 }
 
@@ -74,9 +80,12 @@ pub fn event_step_id(event: &PlanEvent) -> Option<&str> {
         | PlanEvent::StepFailed { step_id, .. }
         | PlanEvent::StepRefused { step_id, .. }
         | PlanEvent::StepCancelled { step_id, .. } => Some(step_id.as_str()),
-        PlanEvent::Submitted { .. } | PlanEvent::Started { .. } | PlanEvent::Finished { .. } => {
-            None
-        }
+        PlanEvent::Submitted { .. }
+        | PlanEvent::Started { .. }
+        | PlanEvent::Finished { .. }
+        | PlanEvent::ClarificationOpened { .. }
+        | PlanEvent::ClarificationResolved { .. }
+        | PlanEvent::RefinementApplied { .. } => None,
     }
 }
 
@@ -88,9 +97,12 @@ pub fn event_agent_type(event: &PlanEvent) -> Option<&str> {
         | PlanEvent::StepFailed { agent_type, .. }
         | PlanEvent::StepRefused { agent_type, .. }
         | PlanEvent::StepCancelled { agent_type, .. } => Some(agent_type.as_str()),
-        PlanEvent::Submitted { .. } | PlanEvent::Started { .. } | PlanEvent::Finished { .. } => {
-            None
-        }
+        PlanEvent::Submitted { .. }
+        | PlanEvent::Started { .. }
+        | PlanEvent::Finished { .. }
+        | PlanEvent::ClarificationOpened { .. }
+        | PlanEvent::ClarificationResolved { .. }
+        | PlanEvent::RefinementApplied { .. } => None,
     }
 }
 
@@ -110,6 +122,15 @@ pub fn event_payload(event: &PlanEvent) -> JsonValue {
         PlanEvent::Finished { status, .. } => {
             json!({ "status": format!("{status:?}").to_lowercase() })
         }
+        PlanEvent::ClarificationOpened { question_ids, .. } => {
+            json!({ "question_ids": question_ids })
+        }
+        PlanEvent::ClarificationResolved { decision_ids, .. } => {
+            json!({ "decision_ids": decision_ids })
+        }
+        PlanEvent::RefinementApplied {
+            feedback_summary, ..
+        } => json!({ "feedback_summary": feedback_summary }),
     }
 }
 
@@ -291,5 +312,39 @@ mod tests {
             output: "hello".into(),
         };
         assert_eq!(event_payload(&evt)["output"], "hello");
+    }
+
+    #[test]
+    fn clarification_and_refinement_events_have_kinds_and_payloads() {
+        let opened = PlanEvent::ClarificationOpened {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            question_ids: vec!["q1".into(), "q2".into()],
+        };
+        assert_eq!(event_kind(&opened), kind::CLARIFICATION_OPENED);
+        assert!(event_step_id(&opened).is_none());
+        assert!(event_agent_type(&opened).is_none());
+        let payload = event_payload(&opened);
+        assert_eq!(payload["question_ids"][0], "q1");
+        assert_eq!(payload["question_ids"][1], "q2");
+
+        let resolved = PlanEvent::ClarificationResolved {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            decision_ids: vec!["d1".into()],
+        };
+        assert_eq!(event_kind(&resolved), kind::CLARIFICATION_RESOLVED);
+        assert_eq!(event_payload(&resolved)["decision_ids"][0], "d1");
+
+        let refined = PlanEvent::RefinementApplied {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            feedback_summary: "less yak shaving".into(),
+        };
+        assert_eq!(event_kind(&refined), kind::REFINEMENT_APPLIED);
+        assert_eq!(
+            event_payload(&refined)["feedback_summary"],
+            "less yak shaving"
+        );
     }
 }

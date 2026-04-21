@@ -41,7 +41,7 @@ use flowd_core::orchestration::observer::PlanObserver;
 use flowd_core::rules::{InMemoryRuleEvaluator, RuleEvaluator};
 use flowd_mcp::observer::{DEFAULT_HEALTH_INTERVAL, PlanEventObserver, PlanEventObserverConfig};
 use flowd_mcp::summarizer::NoopSummarizer;
-use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig};
+use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig, RejectingPlanCompiler};
 use flowd_onnx::provider::OnnxEmbedder;
 use flowd_storage::sqlite::SqliteBackend;
 use flowd_vector::qdrant::{QdrantConfig, QdrantIndex};
@@ -110,15 +110,27 @@ pub async fn run(
     let executor = Arc::new(
         InMemoryPlanExecutor::from_shared_with_store(spawner, plan_store)
             .with_rule_gate(rule_gate)
-            .with_observer(plan_observer),
+            .with_observer(Arc::clone(&plan_observer)),
     );
     executor
         .rehydrate()
         .await
         .map_err(|e| anyhow::anyhow!("rehydrate orchestration plans: {e}"))?;
 
+    // Prose-first plan creation (HL-44) ships its real LLM-backed
+    // compiler in a follow-up PR; until then the daemon installs a
+    // [`RejectingPlanCompiler`] so `plan_create` with `prose` returns
+    // a clear "not enabled in this build" error while the DAG-first
+    // path keeps working unchanged.
+    let plan_compiler = Arc::new(RejectingPlanCompiler::new());
+
     let handlers = Arc::new(
-        FlowdHandlers::new(memory_service, executor, rules).with_activity_monitor(monitor),
+        FlowdHandlers::new(memory_service, executor, plan_compiler, rules)
+            .with_activity_monitor(monitor)
+            // Share the plan-event sink with the executor so clarification
+            // and refinement transitions land in the same audit log as
+            // step-level events.
+            .with_observer(plan_observer),
     );
     let server = McpServer::new(handlers, McpServerConfig::default());
 

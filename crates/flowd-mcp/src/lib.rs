@@ -15,6 +15,7 @@
 //! Most callers only need to `use flowd_mcp::{McpServer, McpServerConfig,
 //! FlowdHandlers}` and hand the server their composed backends.
 
+pub mod compiler;
 pub mod handlers;
 pub mod observer;
 pub mod protocol;
@@ -22,6 +23,7 @@ pub mod server;
 pub mod summarizer;
 pub mod tools;
 
+pub use compiler::RejectingPlanCompiler;
 pub use handlers::{FlowdHandlers, McpHandlers};
 pub use observer::{
     DEFAULT_CAPACITY as PLAN_EVENT_DEFAULT_CAPACITY, ObserverHealth, PlanEventObserver,

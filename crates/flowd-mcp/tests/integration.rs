@@ -10,8 +10,9 @@ use std::sync::Arc;
 use flowd_core::error::Result;
 use flowd_mcp::protocol::{JSON_RPC_VERSION, JsonRpcResponse};
 use flowd_mcp::tools::{
-    MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanConfirmParams,
-    PlanCreateParams, PlanResumeParams, PlanStatusParams, RulesCheckParams, RulesListParams,
+    MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanAnswerParams, PlanCancelParams,
+    PlanConfirmParams, PlanCreateParams, PlanRefineParams, PlanResumeParams, PlanStatusParams,
+    RulesCheckParams, RulesListParams,
 };
 use flowd_mcp::{McpHandlers, McpServer, McpServerConfig};
 use serde_json::{Value, json};
@@ -33,8 +34,17 @@ impl McpHandlers for EchoHandlers {
     async fn plan_create(&self, _: PlanCreateParams) -> Result<Value> {
         Ok(json!({"ok": "plan_create"}))
     }
+    async fn plan_answer(&self, _: PlanAnswerParams) -> Result<Value> {
+        Ok(json!({"ok": "plan_answer"}))
+    }
+    async fn plan_refine(&self, _: PlanRefineParams) -> Result<Value> {
+        Ok(json!({"ok": "plan_refine"}))
+    }
     async fn plan_confirm(&self, _: PlanConfirmParams) -> Result<Value> {
         Ok(json!({"ok": "plan_confirm"}))
+    }
+    async fn plan_cancel(&self, _: PlanCancelParams) -> Result<Value> {
+        Ok(json!({"ok": "plan_cancel"}))
     }
     async fn plan_status(&self, _: PlanStatusParams) -> Result<Value> {
         Ok(json!({"ok": "plan_status"}))
@@ -105,11 +115,11 @@ async fn full_mcp_session_roundtrip() {
             .is_some()
     );
 
-    // tools/list has 9 tools
+    // tools/list has 12 tools (memory_*, plan_create/answer/refine/confirm/cancel/status/resume, rules_*).
     let tools = responses[1].result.as_ref().unwrap()["tools"]
         .as_array()
         .unwrap();
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 12);
 
     // tools/call rules_check -> success envelope
     let ok_result = responses[2].result.as_ref().unwrap();

@@ -20,9 +20,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::handlers::McpHandlers;
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::tools::{
-    MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanConfirmParams,
-    PlanCreateParams, PlanResumeParams, PlanStatusParams, RulesCheckParams, RulesListParams,
-    ToolResult, all_tool_schemas,
+    MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanAnswerParams, PlanCancelParams,
+    PlanConfirmParams, PlanCreateParams, PlanRefineParams, PlanResumeParams, PlanStatusParams,
+    RulesCheckParams, RulesListParams, ToolResult, all_tool_schemas,
 };
 
 /// MCP server configuration.
@@ -189,8 +189,20 @@ async fn dispatch_tool_call<H: McpHandlers>(
             Ok(p) => handlers.plan_create(p).await,
             Err(e) => return Err(e),
         },
+        "plan_answer" => match parse_params::<PlanAnswerParams>(arguments) {
+            Ok(p) => handlers.plan_answer(p).await,
+            Err(e) => return Err(e),
+        },
+        "plan_refine" => match parse_params::<PlanRefineParams>(arguments) {
+            Ok(p) => handlers.plan_refine(p).await,
+            Err(e) => return Err(e),
+        },
         "plan_confirm" => match parse_params::<PlanConfirmParams>(arguments) {
             Ok(p) => handlers.plan_confirm(p).await,
+            Err(e) => return Err(e),
+        },
+        "plan_cancel" => match parse_params::<PlanCancelParams>(arguments) {
+            Ok(p) => handlers.plan_cancel(p).await,
             Err(e) => return Err(e),
         },
         "plan_status" => match parse_params::<PlanStatusParams>(arguments) {
@@ -267,11 +279,29 @@ mod tests {
         ) -> flowd_core::error::Result<Value> {
             Err(flowd_core::error::FlowdError::PlanValidation("stub".into()))
         }
+        async fn plan_answer(
+            &self,
+            _: crate::tools::PlanAnswerParams,
+        ) -> flowd_core::error::Result<Value> {
+            Ok(json!({"status": "draft", "open_questions": []}))
+        }
+        async fn plan_refine(
+            &self,
+            _: crate::tools::PlanRefineParams,
+        ) -> flowd_core::error::Result<Value> {
+            Ok(json!({"status": "draft", "open_questions": []}))
+        }
         async fn plan_confirm(
             &self,
             _: crate::tools::PlanConfirmParams,
         ) -> flowd_core::error::Result<Value> {
             Ok(json!({"status": "running"}))
+        }
+        async fn plan_cancel(
+            &self,
+            _: crate::tools::PlanCancelParams,
+        ) -> flowd_core::error::Result<Value> {
+            Ok(json!({"status": "cancelled"}))
         }
         async fn plan_status(
             &self,
@@ -329,7 +359,7 @@ mod tests {
         .await
         .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 12);
     }
 
     #[tokio::test]

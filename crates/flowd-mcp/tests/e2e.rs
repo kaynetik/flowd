@@ -31,7 +31,7 @@ use flowd_core::orchestration::{AgentOutput, AgentSpawner, InMemoryPlanExecutor,
 use flowd_core::rules::{InMemoryRuleEvaluator, Rule, RuleEvaluator};
 use flowd_core::types::Embedding;
 use flowd_mcp::protocol::JsonRpcResponse;
-use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig};
+use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig, RejectingPlanCompiler};
 use flowd_storage::plan_store::SqlitePlanStore;
 use flowd_storage::sqlite::SqliteBackend;
 
@@ -42,6 +42,7 @@ type Handlers = FlowdHandlers<
     MemVectors,
     HashEmbedder,
     InMemoryPlanExecutor<EchoSpawner, SqlitePlanStore>,
+    RejectingPlanCompiler,
     InMemoryRuleEvaluator,
 >;
 
@@ -156,7 +157,12 @@ fn build_harness() -> Harness {
         .expect("register rule");
     let rules = Arc::new(rules);
 
-    let handlers = Arc::new(FlowdHandlers::new(memory, executor, rules));
+    let handlers = Arc::new(FlowdHandlers::new(
+        memory,
+        executor,
+        Arc::new(RejectingPlanCompiler::new()),
+        rules,
+    ));
     let server = McpServer::new(handlers, McpServerConfig::default());
 
     Harness {
@@ -259,7 +265,7 @@ async fn full_composed_session_roundtrip() {
     let tools = responses[1].result.as_ref().unwrap()["tools"]
         .as_array()
         .unwrap();
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 12);
 
     // memory_store: returns the new UUID
     let stored = tool_payload(&responses[2]);

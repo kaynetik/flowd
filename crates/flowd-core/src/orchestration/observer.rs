@@ -80,6 +80,36 @@ pub enum PlanEvent {
         project: String,
         status: PlanStatus,
     },
+    /// The compiler surfaced one or more new clarification questions on a
+    /// `Draft` plan. Emitted from the prose-first plan-creation MCP path
+    /// every time a `compile_prose` / `apply_answers` / `refine` call
+    /// returns a non-empty `open_questions` set.
+    ///
+    /// The `question_ids` list is deterministic and matches the order the
+    /// compiler emitted, so audit consumers can reconstruct the
+    /// clarification timeline without diffing snapshots.
+    ClarificationOpened {
+        plan_id: Uuid,
+        project: String,
+        question_ids: Vec<String>,
+    },
+    /// One or more clarification questions crystallised into
+    /// [`super::DecisionRecord`]s. Emitted whenever `apply_answers` or
+    /// `compile_prose` returns a non-empty `new_decisions` set.
+    ClarificationResolved {
+        plan_id: Uuid,
+        project: String,
+        decision_ids: Vec<String>,
+    },
+    /// The user submitted a freeform refinement and the compiler accepted
+    /// it. The truncated `feedback_summary` lets operators correlate plan
+    /// shape changes with the prompt that triggered them without bloating
+    /// the event log.
+    RefinementApplied {
+        plan_id: Uuid,
+        project: String,
+        feedback_summary: String,
+    },
 }
 
 impl PlanEvent {
@@ -93,7 +123,10 @@ impl PlanEvent {
             | Self::StepFailed { plan_id, .. }
             | Self::StepRefused { plan_id, .. }
             | Self::StepCancelled { plan_id, .. }
-            | Self::Finished { plan_id, .. } => *plan_id,
+            | Self::Finished { plan_id, .. }
+            | Self::ClarificationOpened { plan_id, .. }
+            | Self::ClarificationResolved { plan_id, .. }
+            | Self::RefinementApplied { plan_id, .. } => *plan_id,
         }
     }
 
@@ -107,7 +140,10 @@ impl PlanEvent {
             | Self::StepFailed { project, .. }
             | Self::StepRefused { project, .. }
             | Self::StepCancelled { project, .. }
-            | Self::Finished { project, .. } => project.as_str(),
+            | Self::Finished { project, .. }
+            | Self::ClarificationOpened { project, .. }
+            | Self::ClarificationResolved { project, .. }
+            | Self::RefinementApplied { project, .. } => project.as_str(),
         }
     }
 }

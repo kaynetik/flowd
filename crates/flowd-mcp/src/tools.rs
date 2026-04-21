@@ -43,20 +43,89 @@ pub struct MemoryContextParams {
     pub limit: Option<usize>,
 }
 
+/// Parameters for the polymorphic `plan_create` MCP tool.
+///
+/// Two mutually exclusive ways to author a plan:
+///
+/// * `definition` -- the legacy DAG-first path. The caller supplies a
+///   fully-formed [`flowd_core::orchestration::PlanDefinition`] and the
+///   handler submits it as-is.
+/// * `prose` -- the prose-first path introduced in HL-44. The caller
+///   supplies a freeform description; the handler invokes the configured
+///   [`flowd_core::orchestration::PlanCompiler`] to surface clarifications
+///   and (eventually) compile a DAG.
+///
+/// Exactly one of the two must be set. The handler enforces this; the
+/// JSON-Schema also encodes it via `oneOf` so MCP clients see the
+/// constraint up front. The fields are kept as separate `Option`s rather
+/// than a serde-tagged enum so `tools/call` `arguments` payloads stay flat
+/// and easy for MCP clients to construct dynamically.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PlanCreateParams {
     /// Project namespace this plan belongs to. Required: every Plan in
     /// flowd is project-scoped (see HL-38). Overrides any `project` field
     /// embedded in `definition`.
     pub project: String,
-    /// Plan definition matching [`flowd_core::orchestration::PlanDefinition`].
-    /// May omit the `project` field; the top-level `project` parameter
-    /// is authoritative.
-    pub definition: Value,
+    /// DAG-first authored plan. Mutually exclusive with `prose`.
+    #[serde(default)]
+    pub definition: Option<Value>,
+    /// Prose-first authored plan. Mutually exclusive with `definition`.
+    /// The handler calls the configured compiler and returns any open
+    /// clarifications alongside the new plan id.
+    #[serde(default)]
+    pub prose: Option<String>,
+}
+
+/// Parameters for `plan_answer`: the user submits answers to one or more
+/// outstanding [`flowd_core::orchestration::OpenQuestion`]s on a `Draft`
+/// plan, optionally instructing the compiler to fill in any remaining
+/// questions on a best-effort basis.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlanAnswerParams {
+    pub plan_id: String,
+    /// Map of question id -> [`flowd_core::orchestration::Answer`]. At
+    /// least one entry must be present unless `defer_remaining` is true.
+    pub answers: Vec<PlanAnswerEntry>,
+    /// When true the compiler is asked to invent best-effort answers for
+    /// any still-open questions and emit them as auto-decisions. Useful
+    /// when the user wants to converge fast and trusts the compiler's
+    /// defaults.
+    #[serde(default)]
+    pub defer_remaining: bool,
+}
+
+/// Single (`question_id`, answer) pair from the `plan_answer` payload. The
+/// inner `answer` is the serde-flattened
+/// [`flowd_core::orchestration::Answer`] so the wire shape stays
+/// `{"question_id": "...", "kind": "choose", "option_id": "..."}`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlanAnswerEntry {
+    pub question_id: String,
+    #[serde(flatten)]
+    pub answer: flowd_core::orchestration::Answer,
+}
+
+/// Parameters for `plan_refine`: the user submits a freeform refinement
+/// instruction (e.g. "make step c idempotent and add a rollback") and the
+/// compiler returns an updated draft.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlanRefineParams {
+    pub plan_id: String,
+    pub feedback: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PlanConfirmParams {
+    pub plan_id: String,
+}
+
+/// Parameters for `plan_cancel`: idempotently abandon a plan in any
+/// non-terminal state. Distinguished from `plan_resume` because the
+/// prose-first front door needs a way to discard half-clarified Draft
+/// plans that the user no longer wants to pursue (the executor already
+/// supports this; HL-44 just wires it through MCP).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlanCancelParams {
     pub plan_id: String,
 }
 
@@ -203,12 +272,15 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "plan_create".into(),
-            description: "Register a new orchestration plan from its definition. \
-                          Returns the plan id plus a preview of execution order and parallelism."
+            description: "Register a new orchestration plan. Supply EITHER `definition` (DAG-first) \
+                          OR `prose` (prose-first; routed through the configured plan compiler, \
+                          may surface clarification questions before a DAG can be compiled). \
+                          Returns the plan id plus -- for DAG-first plans -- a preview of execution \
+                          order and parallelism."
                 .into(),
             input_schema: json!({
                 "type": "object",
-                "required": ["project", "definition"],
+                "required": ["project"],
                 "properties": {
                     "project": {
                         "type": "string",
@@ -216,14 +288,93 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
                     },
                     "definition": {
                         "type": "object",
-                        "description": "PlanDefinition as defined by flowd-core"
+                        "description": "PlanDefinition as defined by flowd-core. Mutually exclusive with `prose`."
+                    },
+                    "prose": {
+                        "type": "string",
+                        "description": "Freeform plan description. Routed through the plan compiler; \
+                                        may return open clarification questions in the response. \
+                                        Mutually exclusive with `definition`."
+                    }
+                },
+                "oneOf": [
+                    { "required": ["definition"] },
+                    { "required": ["prose"] }
+                ]
+            }),
+        },
+        ToolSchema {
+            name: "plan_answer".into(),
+            description: "Submit answers to outstanding clarification questions on a Draft plan. \
+                          The plan compiler is re-invoked with the merged decisions and either \
+                          returns more questions, returns a fully compiled DAG, or both. \
+                          Set `defer_remaining=true` to ask the compiler to auto-fill any \
+                          questions left unanswered in this batch."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["plan_id", "answers"],
+                "properties": {
+                    "plan_id": { "type": "string" },
+                    "answers": {
+                        "type": "array",
+                        "description": "Each entry pairs a question_id with one of three Answer kinds.",
+                        "items": {
+                            "type": "object",
+                            "required": ["question_id", "kind"],
+                            "properties": {
+                                "question_id": { "type": "string" },
+                                "kind": { "type": "string", "enum": ["choose", "explain_more", "none_of_these"] },
+                                "option_id": { "type": "string", "description": "Required when kind=choose." },
+                                "note": { "type": "string", "description": "Optional context when kind=explain_more." }
+                            }
+                        }
+                    },
+                    "defer_remaining": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Ask the compiler to auto-answer any still-open questions."
+                    }
+                }
+            }),
+        },
+        ToolSchema {
+            name: "plan_refine".into(),
+            description: "Apply a freeform refinement instruction to a Draft plan. The compiler may \
+                          return new clarifications if the change introduces new architectural \
+                          decisions; otherwise it returns an updated draft (or a fully compiled DAG)."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["plan_id", "feedback"],
+                "properties": {
+                    "plan_id": { "type": "string" },
+                    "feedback": {
+                        "type": "string",
+                        "description": "Natural-language instruction. The compiler echoes a truncated form into the audit log."
                     }
                 }
             }),
         },
         ToolSchema {
             name: "plan_confirm".into(),
-            description: "Approve a Draft plan and begin execution asynchronously.".into(),
+            description: "Approve a Draft plan and begin execution asynchronously. Refuses plans \
+                          that still have open clarification questions; the error payload includes \
+                          the outstanding question list so the caller can route them back through \
+                          `plan_answer`."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["plan_id"],
+                "properties": { "plan_id": { "type": "string" } }
+            }),
+        },
+        ToolSchema {
+            name: "plan_cancel".into(),
+            description: "Idempotently cancel a plan. Draft and Confirmed plans transition \
+                          directly to Cancelled; Running plans set the cancellation latch and \
+                          abort in-flight steps. Terminal plans are no-ops."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "required": ["plan_id"],
@@ -290,7 +441,32 @@ mod tests {
             assert!(!s.description.trim().is_empty());
             assert_eq!(s.input_schema["type"], "object");
         }
-        assert_eq!(schemas.len(), 9);
+        assert_eq!(schemas.len(), 12);
+    }
+
+    #[test]
+    fn plan_create_schema_enforces_exactly_one_of_definition_or_prose() {
+        let schema = all_tool_schemas()
+            .into_iter()
+            .find(|s| s.name == "plan_create")
+            .expect("plan_create schema");
+        let one_of = schema.input_schema["oneOf"]
+            .as_array()
+            .expect("oneOf array");
+        assert_eq!(one_of.len(), 2);
+        let required: Vec<&str> = one_of
+            .iter()
+            .filter_map(|v| v["required"][0].as_str())
+            .collect();
+        assert!(required.contains(&"definition"));
+        assert!(required.contains(&"prose"));
+    }
+
+    #[test]
+    fn new_clarification_tools_are_registered() {
+        let names: Vec<String> = all_tool_schemas().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"plan_answer".to_owned()));
+        assert!(names.contains(&"plan_refine".to_owned()));
     }
 
     #[test]
