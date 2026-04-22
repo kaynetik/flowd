@@ -17,6 +17,7 @@
 
 pub mod compiler;
 pub mod handlers;
+pub mod llm;
 pub mod observer;
 pub mod protocol;
 pub mod server;
@@ -25,6 +26,9 @@ pub mod tools;
 
 pub use compiler::{LlmCallback, LlmPlanCompiler, RejectingPlanCompiler, StubPlanCompiler};
 pub use handlers::{FlowdHandlers, McpHandlers};
+pub use llm::{
+    ClaudeCliCallback, ClaudeCliConfig, OpenAiCompatibleCallback, OpenAiCompatibleConfig,
+};
 pub use observer::{
     DEFAULT_CAPACITY as PLAN_EVENT_DEFAULT_CAPACITY, ObserverHealth, PlanEventObserver,
     PlanEventObserverConfig, ShutdownReport,

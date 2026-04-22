@@ -519,8 +519,23 @@ where
             (None, None) => Err(FlowdError::PlanValidation(
                 "plan_create: must include either `definition` or `prose`".into(),
             )),
-            (Some(definition), None) => self.plan_create_definition(p.project, definition).await,
-            (None, Some(prose)) => self.plan_create_prose(p.project, prose).await,
+            (Some(definition), None) => {
+                if p.compiler_override.is_some() {
+                    // Refuse silently-ignoring the override on the DAG-first
+                    // path; if the caller bothered to set it they almost
+                    // certainly meant to use prose.
+                    return Err(FlowdError::PlanValidation(
+                        "plan_create: `compiler_override` only applies when `prose` is set; \
+                         drop it or switch to the prose-first path"
+                            .into(),
+                    ));
+                }
+                self.plan_create_definition(p.project, definition).await
+            }
+            (None, Some(prose)) => {
+                self.plan_create_prose(p.project, prose, p.compiler_override)
+                    .await
+            }
         }
     }
 
@@ -801,14 +816,28 @@ where
     /// Prose-first path: route `prose` through the configured compiler,
     /// submit a Draft plan with whatever the first round produced, emit
     /// clarification events, and return the unified prose-plan payload.
-    async fn plan_create_prose(&self, project: String, prose: String) -> Result<Value> {
+    ///
+    /// `compiler_override` is forwarded to
+    /// [`PlanCompiler::compile_prose_with_override`]; the trait's default
+    /// impl ignores the override (single-backend compilers have no choice
+    /// to make) so this is effectively a no-op for the Stub / Rejecting
+    /// / Mock compilers and a routing hint for `DaemonPlanCompiler`.
+    async fn plan_create_prose(
+        &self,
+        project: String,
+        prose: String,
+        compiler_override: Option<String>,
+    ) -> Result<Value> {
         if prose.trim().is_empty() {
             return Err(FlowdError::PlanValidation(
                 "plan_create: `prose` must be a non-empty string".into(),
             ));
         }
         let derived_name = derive_plan_name(&prose);
-        let output = self.compiler.compile_prose(prose, project.clone()).await?;
+        let output = self
+            .compiler
+            .compile_prose_with_override(prose, project.clone(), compiler_override)
+            .await?;
 
         // Build a Plan around whatever the compiler returned. If the
         // compiler resolved everything in one shot we still go through

@@ -74,6 +74,16 @@ pub struct PlanCreateParams {
     /// clarifications alongside the new plan id.
     #[serde(default)]
     pub prose: Option<String>,
+    /// Optional override for the LLM compiler backend used on the
+    /// *initial* `compile_prose` call. Accepts the stable provider
+    /// wire names ("claude-cli", "mlx", "claude-http"). Ignored when
+    /// `definition` is supplied (DAG-first), or when the daemon's
+    /// active compiler is not the LLM compiler. Subsequent
+    /// `plan_answer` / `plan_refine` calls always route through the
+    /// daemon's configured primary / refine tiers, so a Draft plan
+    /// has a stable compiler identity for its whole lifetime.
+    #[serde(default)]
+    pub compiler_override: Option<String>,
 }
 
 /// Parameters for `plan_answer`: the user submits answers to one or more
@@ -295,6 +305,16 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
                         "description": "Freeform plan description. Routed through the plan compiler; \
                                         may return open clarification questions in the response. \
                                         Mutually exclusive with `definition`."
+                    },
+                    "compiler_override": {
+                        "type": "string",
+                        "enum": ["claude-cli", "mlx", "claude-http"],
+                        "description": "Optional one-shot override for the LLM compiler backend on \
+                                        the initial compile call. Only meaningful with `prose` and \
+                                        when the daemon's active compiler is the LLM compiler; the \
+                                        named provider must also be configured in flowd.toml. Follow-up \
+                                        plan_answer / plan_refine calls ignore this field and use the \
+                                        daemon's configured primary / refine tiers."
                     }
                 },
                 "oneOf": [
@@ -460,6 +480,54 @@ mod tests {
             .collect();
         assert!(required.contains(&"definition"));
         assert!(required.contains(&"prose"));
+    }
+
+    #[test]
+    fn plan_create_schema_advertises_compiler_override_enum() {
+        let schema = all_tool_schemas()
+            .into_iter()
+            .find(|s| s.name == "plan_create")
+            .expect("plan_create schema");
+        // The override is a plain optional string property -- not part
+        // of `oneOf` or `required` -- but it should advertise the same
+        // wire-name set the daemon's parser accepts so MCP clients can
+        // surface a typed dropdown.
+        let prop = &schema.input_schema["properties"]["compiler_override"];
+        assert_eq!(prop["type"], "string", "field shape");
+        let allowed: Vec<&str> = prop["enum"]
+            .as_array()
+            .expect("enum array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(allowed.contains(&"claude-cli"), "{allowed:?}");
+        assert!(allowed.contains(&"mlx"), "{allowed:?}");
+        assert!(allowed.contains(&"claude-http"), "{allowed:?}");
+    }
+
+    #[test]
+    fn plan_create_params_compiler_override_defaults_to_none_on_deserialize() {
+        // Older MCP clients that pre-date `compiler_override` MUST keep
+        // working without setting the field. `#[serde(default)]` makes
+        // that load-bearing; this test pins the contract.
+        let raw = json!({
+            "project": "rnd",
+            "prose": "do a thing"
+        });
+        let p: PlanCreateParams = serde_json::from_value(raw).unwrap();
+        assert!(p.compiler_override.is_none());
+        assert_eq!(p.prose.as_deref(), Some("do a thing"));
+    }
+
+    #[test]
+    fn plan_create_params_compiler_override_round_trips() {
+        let raw = json!({
+            "project": "rnd",
+            "prose": "do",
+            "compiler_override": "claude-cli"
+        });
+        let p: PlanCreateParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(p.compiler_override.as_deref(), Some("claude-cli"));
     }
 
     #[test]

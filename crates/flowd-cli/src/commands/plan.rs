@@ -416,7 +416,7 @@ impl OfflinePlanRunner {
         let cfg_path = FlowdConfig::default_path(&paths.home);
         let config = FlowdConfig::load(&cfg_path)
             .with_context(|| format!("load flowd config from {}", cfg_path.display()))?;
-        let compiler = DaemonPlanCompiler::from_selection(config.plan.compiler)
+        let compiler = DaemonPlanCompiler::from_selection(config.plan.compiler, &config.plan.llm)
             .map_err(|e| anyhow!("instantiate plan compiler: {e}"))?;
 
         Ok(Self {

@@ -156,7 +156,55 @@ Update every call site to use the new module.
 Run the integration tests and capture failures.
 ```
 
-Each `## <step-id> [agent: <type>]` heading defines a step; the body until the next `## ` (or end of file) is the prompt. `depends_on: [a, b]` is optional. When the prose is freeform, the stub surfaces a single `stub.structure_required` open question and waits for the agent to either restructure via `plan_refine` or paste a structured version through `Answer::ExplainMore`. An LLM-backed compiler (`LlmPlanCompiler`) is shipped as a skeleton today; a follow-up release wires it to the connected MCP client.
+Each `## <step-id> [agent: <type>]` heading defines a step; the body until the next `## ` (or end of file) is the prompt. `depends_on: [a, b]` is optional. When the prose is freeform, the stub surfaces a single `stub.structure_required` open question and waits for the agent to either restructure via `plan_refine` or paste a structured version through `Answer::ExplainMore`.
+
+#### LLM-backed compiler
+
+For freeform prose -- where the input doesn't fit the structured-markdown convention above -- swap `[plan].compiler` to `"llm"`. `LlmPlanCompiler` then routes the prompt through one of three transports, selected by `[plan.llm].provider`:
+
+| Provider     | Wire name      | When to use                                                         |
+| ------------ | -------------- | ------------------------------------------------------------------- |
+| Claude CLI   | `claude-cli`   | Default. Shells out to the local `claude` binary; no API key in `flowd`. |
+| MLX (local)  | `mlx`          | Offline / air-gapped. Talks OpenAI-compatible HTTP to `mlx_lm.server`.  |
+| Claude HTTP  | `claude-http`  | Reserved for a follow-up. Direct Anthropic Messages API; needs `ANTHROPIC_API_KEY`. |
+
+A typical `~/.flowd/flowd.toml` for the default Claude-CLI path:
+
+```toml
+[plan]
+compiler      = "llm"
+max_questions = 3
+
+[plan.llm]
+provider = "claude-cli"
+
+[plan.llm.claude_cli]
+binary       = "claude"          # bare name resolved via $PATH at startup
+model        = "claude-opus-4-7" # forwarded as `claude -p --model <model>`
+timeout_secs = 120
+
+[plan.llm.mlx]                    # used when provider = "mlx" or as a refine override
+base_url     = "http://localhost:8080/v1"
+model        = "qwen3-coder:30b"  # documented default; pin whatever your server hosts
+timeout_secs = 90
+max_tokens   = 4096
+temperature  = 0.2
+```
+
+Optional **two-tier escalation** -- first compile and answer-merging stay on the primary, but `plan_refine` jumps to a stronger (or just different) backend:
+
+```toml
+[plan.llm.refine]
+provider = "claude-cli"
+[plan.llm.refine.claude_cli]
+model        = "claude-opus-4-7"
+binary       = "claude"
+timeout_secs = 180
+```
+
+**Per-request override.** `plan_create` accepts an optional `compiler_override` field on the prose-first path so a caller can target a specific configured backend without restarting the daemon. Accepted values match the wire names above (`"claude-cli"`, `"mlx"`, `"claude-http"`); pairing the field with `definition` is rejected, since the override only applies to compilation. Subsequent `plan_answer` / `plan_refine` calls always go back through the configured tiers.
+
+**Startup probe asymmetry.** If `claude-cli` is the primary or refine provider, the daemon resolves the binary on `$PATH` and refuses to start when it's missing -- the operator sees the failure before the first request. MLX and (future) Claude-HTTP errors surface lazily, since their backing servers are commonly started after `flowd`.
 
 ### 4. Observe out-of-band
 

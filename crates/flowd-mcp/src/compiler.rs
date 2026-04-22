@@ -6,7 +6,8 @@
 //! | Type                       | When to use                                                                 |
 //! |----------------------------|-----------------------------------------------------------------------------|
 //! | [`StubPlanCompiler`]       | Default. No LLM, no network. Parses structured-markdown prose into a DAG.   |
-//! | [`LlmPlanCompiler`]        | Future LLM-backed compiler. Stubbed in this PR; real wiring lands next.     |
+//! | [`LlmPlanCompiler`]        | Real LLM-backed compiler. Generic over [`LlmCallback`]; the daemon wires    |
+//! |                            | [`crate::llm::OpenAiCompatibleCallback`] for local `mlx_lm.server` traffic. |
 //! | [`RejectingPlanCompiler`]  | Test double / "prose-first disabled" build flag. Always errors.             |
 //!
 //! ## Trait contract recap
@@ -54,14 +55,16 @@
 //! `Answer::ExplainMore`.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::Arc;
 
 use flowd_core::error::{FlowdError, Result};
 use flowd_core::orchestration::{
-    Answer, CompileOutput, OpenQuestion, PlanCompiler, PlanDefinition, PlanDraftSnapshot,
-    StepDefinition,
+    Answer, CompileOutput, DecisionRecord, OpenQuestion, PlanCompiler, PlanDefinition,
+    PlanDraftSnapshot, QuestionOption, StepDefinition,
 };
+use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // RejectingPlanCompiler
@@ -416,20 +419,28 @@ fn parse_step_header(line: &str) -> Option<StepHeader> {
 }
 
 // ---------------------------------------------------------------------------
-// LlmPlanCompiler -- placeholder until the real LLM wiring lands
+// LlmPlanCompiler
 // ---------------------------------------------------------------------------
 
-/// Callback shape the future [`LlmPlanCompiler`] will invoke to talk to a
-/// model. Modelled after [`flowd_core::memory::Summarizer`] so that the
-/// MCP layer can plug in a `sampling/createMessage` adapter (or any other
-/// transport) without changing the compiler's public surface.
-///
-/// Today the trait is unused at runtime: every [`LlmPlanCompiler`] method
-/// returns `FlowdError::Internal("not yet wired")` instead of calling
-/// the callback. The trait is shipped now so downstream code (and tests)
-/// can compile against the final shape.
+/// Question id surfaced when the LLM repeatedly fails to produce a valid
+/// JSON response. Stable across rounds so the executor can match on it
+/// for invalidation, and deliberately distinct from
+/// [`STRUCTURE_QUESTION_ID`] so callers can tell which compiler bailed.
+const LLM_STRUCTURE_QUESTION_ID: &str = "llm.structure_required";
+
+/// Callback shape the [`LlmPlanCompiler`] invokes to talk to a model.
+/// Modelled after [`flowd_core::memory::Summarizer`] so that the MCP
+/// layer can plug in any transport (HTTP via
+/// [`crate::llm::OpenAiCompatibleCallback`], stdio CLI shellouts,
+/// `sampling/createMessage` adapter) without changing the compiler's
+/// public surface.
 pub trait LlmCallback: Send + Sync {
     /// Send `prompt` to the underlying model and return the completion.
+    ///
+    /// The prompt is the full assistant input including any system /
+    /// schema instructions; the callback is expected to be a pure
+    /// "string in, string out" transport with no awareness of plan
+    /// semantics.
     ///
     /// # Errors
     /// Implementations should return `FlowdError::Internal` for transport
@@ -438,14 +449,23 @@ pub trait LlmCallback: Send + Sync {
     fn complete(&self, prompt: String) -> impl Future<Output = Result<String>> + Send;
 }
 
-/// LLM-backed [`PlanCompiler`] -- skeleton only.
+/// LLM-backed [`PlanCompiler`].
 ///
-/// All three trait methods currently return
-/// `FlowdError::Internal("LlmPlanCompiler::<method> is not yet wired ...")`.
-/// The real implementation (prompt assembly, response parsing, JSON-schema
-/// validation) lands in the follow-up PR. The type is generic over an
-/// [`LlmCallback`] so the wiring story is settled now and the daemon's
-/// composition code can be migrated in one focused diff later.
+/// Drives the prose-first loop by sending tightly scoped prompts to a
+/// model behind an [`LlmCallback`] and parsing the responses into
+/// [`CompileOutput`]s. The compiler enforces a strict JSON output shape
+/// (see the `LlmCompileResponse` wire type), retries once with a
+/// corrective prompt when the first response fails to parse, and falls
+/// back to a structured `llm.structure_required` open question rather
+/// than bubbling raw model errors to the user.
+///
+/// ## Determinism
+///
+/// The compiler is deterministic given a deterministic callback. Tests
+/// can therefore use a hand-rolled mock implementing [`LlmCallback`]
+/// instead of calling out to the real model. The `--ignored` end-to-end
+/// test in `tests/llm_e2e.rs` exercises a live `mlx_lm.server` once
+/// per release.
 #[derive(Debug, Clone)]
 pub struct LlmPlanCompiler<C: LlmCallback> {
     callback: Arc<C>,
@@ -458,44 +478,717 @@ impl<C: LlmCallback> LlmPlanCompiler<C> {
         Self { callback }
     }
 
-    /// Borrow the callback. Exposed so the future implementation (and any
-    /// integration tests) can verify wiring; today it is the only way to
-    /// observe the field given that no method invokes the callback yet.
+    /// Borrow the callback. Exposed so tests and the daemon's startup
+    /// banner can observe wiring without taking ownership.
     #[must_use]
     pub fn callback(&self) -> &Arc<C> {
         &self.callback
     }
 
-    fn not_yet_wired(method: &'static str) -> FlowdError {
-        FlowdError::Internal(format!(
-            "LlmPlanCompiler::{method} is not yet wired; \
-             a follow-up PR will implement the LLM-driven prose-first compiler. \
-             Use StubPlanCompiler in the meantime."
-        ))
+    /// Run a prompt through the callback with at most one corrective
+    /// retry on parse failure, then fall back to a structure-required
+    /// open question. The fallback path is what keeps the user out of
+    /// the "model just answered with prose" deadlock.
+    ///
+    /// Transport errors are propagated as-is (the user can't recover by
+    /// rephrasing prose if MLX is down); only *parse* failures trigger
+    /// the retry/fallback path.
+    async fn invoke(&self, prompt: String, source_doc: &str) -> Result<CompileOutput> {
+        let raw = self.callback.complete(prompt.clone()).await?;
+        match parse_llm_response(&raw) {
+            Ok(out) => Ok(out.into_compile_output(source_doc)),
+            Err(parse_err) => {
+                tracing::warn!(
+                    error = %parse_err,
+                    raw_preview = %preview(&raw, 256),
+                    "LlmPlanCompiler: first response did not parse; retrying with corrective prompt"
+                );
+                let corrective = corrective_prompt(&prompt, &raw, &parse_err);
+                let retry_raw = self.callback.complete(corrective).await?;
+                match parse_llm_response(&retry_raw) {
+                    Ok(out) => Ok(out.into_compile_output(source_doc)),
+                    Err(retry_err) => {
+                        tracing::warn!(
+                            error = %retry_err,
+                            raw_preview = %preview(&retry_raw, 256),
+                            "LlmPlanCompiler: corrective retry still did not parse; falling back to structure-required question"
+                        );
+                        Ok(structure_required_fallback(
+                            source_doc, &parse_err, &retry_err,
+                        ))
+                    }
+                }
+            }
+        }
     }
 }
 
 impl<C: LlmCallback + 'static> PlanCompiler for LlmPlanCompiler<C> {
-    async fn compile_prose(&self, _prose: String, _project: String) -> Result<CompileOutput> {
-        Err(Self::not_yet_wired("compile_prose"))
+    async fn compile_prose(&self, prose: String, project: String) -> Result<CompileOutput> {
+        let prompt = build_compile_prose_prompt(&prose, &project);
+        self.invoke(prompt, &prose).await
     }
 
     async fn apply_answers(
         &self,
-        _snapshot: PlanDraftSnapshot,
-        _answers: Vec<(String, Answer)>,
-        _defer_remaining: bool,
+        snapshot: PlanDraftSnapshot,
+        answers: Vec<(String, Answer)>,
+        defer_remaining: bool,
     ) -> Result<CompileOutput> {
-        Err(Self::not_yet_wired("apply_answers"))
+        let source_doc = snapshot.source_doc.clone().unwrap_or_default();
+        let prompt = build_apply_answers_prompt(&snapshot, &answers, defer_remaining);
+        self.invoke(prompt, &source_doc).await
     }
 
-    async fn refine(
-        &self,
-        _snapshot: PlanDraftSnapshot,
-        _feedback: String,
-    ) -> Result<CompileOutput> {
-        Err(Self::not_yet_wired("refine"))
+    async fn refine(&self, snapshot: PlanDraftSnapshot, feedback: String) -> Result<CompileOutput> {
+        let source_doc = snapshot.source_doc.clone().unwrap_or_default();
+        let prompt = build_refine_prompt(&snapshot, &feedback);
+        self.invoke(prompt, &source_doc).await
     }
+}
+
+// ---------------------------------------------------------------------------
+// LLM JSON wire types
+// ---------------------------------------------------------------------------
+
+/// JSON shape we ask the model to produce. Mirrors [`CompileOutput`] but
+/// wire-friendlier:
+///
+/// * `definition` is `null` when questions remain.
+/// * `decisions` (auto-fills) and `open_questions` are always present
+///   as empty arrays rather than omitted, so the parser can validate
+///   without a `serde(default)` per field.
+///
+/// The schema is documented inline in [`json_schema_string`] -- that
+/// constant is what the prompts hand the model so the wire shape and
+/// the parser stay in lockstep.
+#[derive(Debug, Deserialize)]
+struct LlmCompileResponse {
+    #[serde(default)]
+    plan_name: Option<String>,
+    #[serde(default)]
+    open_questions: Vec<LlmOpenQuestion>,
+    #[serde(default)]
+    decisions: Vec<LlmDecision>,
+    #[serde(default)]
+    definition: Option<LlmDefinition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmOpenQuestion {
+    id: String,
+    prompt: String,
+    #[serde(default)]
+    rationale: String,
+    #[serde(default)]
+    options: Vec<LlmOption>,
+    #[serde(default)]
+    allow_explain_more: bool,
+    #[serde(default)]
+    allow_none: bool,
+    #[serde(default)]
+    depends_on_decisions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmOption {
+    id: String,
+    label: String,
+    #[serde(default)]
+    rationale: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmDecision {
+    question_id: String,
+    chosen_option_id: String,
+    #[serde(default)]
+    depends_on_decisions: Vec<String>,
+    /// Defaults to true on the wire because every decision the LLM
+    /// emits is by definition a compiler-driven fill (the user-driven
+    /// decisions are recorded by the handler before invocation). We
+    /// still allow the model to explicitly mark `auto = false` for a
+    /// caller who wants to record an "I would have picked this even if
+    /// you'd asked" rationale; the executor doesn't currently
+    /// distinguish, but the audit trail does.
+    #[serde(default = "default_auto")]
+    auto: bool,
+}
+
+const fn default_auto() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmDefinition {
+    #[serde(default)]
+    name: Option<String>,
+    steps: Vec<LlmStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmStep {
+    id: String,
+    #[serde(alias = "agent")]
+    agent_type: String,
+    prompt: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    retry_count: u32,
+}
+
+impl LlmCompileResponse {
+    /// Project the wire shape into a [`CompileOutput`] using
+    /// `source_doc` for the source-of-truth prose. Validates the
+    /// definition / question invariants of [`PlanCompiler`].
+    ///
+    /// We deliberately only run *local* invariants here -- full DAG
+    /// validation (`validate_plan`) runs later in the executor when the
+    /// definition is materialised, so we don't duplicate that logic.
+    fn into_compile_output(self, source_doc: &str) -> CompileOutput {
+        // Hard contract per `PlanCompiler`: definition.is_some() iff
+        // open_questions.is_empty(). If the model produced both, the
+        // open_questions win -- the user has more clarifications to do
+        // and the partial definition can't be trusted.
+        let drop_definition = !self.open_questions.is_empty();
+        let definition = if drop_definition {
+            None
+        } else {
+            self.definition.map(|d| d.into_definition(self.plan_name))
+        };
+
+        CompileOutput {
+            source_doc: source_doc.to_string(),
+            open_questions: self
+                .open_questions
+                .into_iter()
+                .map(LlmOpenQuestion::into_open_question)
+                .collect(),
+            new_decisions: self
+                .decisions
+                .into_iter()
+                .map(LlmDecision::into_decision_record)
+                .collect(),
+            definition,
+        }
+    }
+}
+
+impl LlmOpenQuestion {
+    fn into_open_question(self) -> OpenQuestion {
+        OpenQuestion {
+            id: self.id,
+            prompt: self.prompt,
+            rationale: self.rationale,
+            options: self
+                .options
+                .into_iter()
+                .map(|o| QuestionOption {
+                    id: o.id,
+                    label: o.label,
+                    rationale: o.rationale,
+                })
+                .collect(),
+            allow_explain_more: self.allow_explain_more,
+            allow_none: self.allow_none,
+            depends_on_decisions: self.depends_on_decisions,
+        }
+    }
+}
+
+impl LlmDecision {
+    fn into_decision_record(self) -> DecisionRecord {
+        // We use `now()` for the timestamp because the wire shape doesn't
+        // carry one -- the model can't possibly produce a meaningful
+        // `decided_at`, and the handler/executor isn't in a position to
+        // override it. This means the audit trail records the "compile
+        // round when this auto-fill happened", which is exactly what a
+        // human reviewer wants.
+        DecisionRecord {
+            question_id: self.question_id,
+            chosen_option_id: self.chosen_option_id,
+            depends_on_decisions: self.depends_on_decisions,
+            auto: self.auto,
+            decided_at: chrono::Utc::now(),
+        }
+    }
+}
+
+impl LlmDefinition {
+    fn into_definition(self, top_level_name: Option<String>) -> PlanDefinition {
+        PlanDefinition {
+            name: self
+                .name
+                .or(top_level_name)
+                .unwrap_or_else(|| "prose-plan".to_string()),
+            project: None,
+            steps: self
+                .steps
+                .into_iter()
+                .map(|s| StepDefinition {
+                    id: s.id,
+                    agent_type: s.agent_type,
+                    prompt: s.prompt,
+                    depends_on: s.depends_on,
+                    timeout_secs: s.timeout_secs,
+                    retry_count: s.retry_count,
+                })
+                .collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt assembly
+// ---------------------------------------------------------------------------
+
+/// Wire-shape JSON the model must emit. Embedded into every prompt.
+///
+/// We deliberately use a hand-rolled "shape doc" string rather than a
+/// machine-readable JSON Schema:
+///
+/// 1. JSON Schema enforcement isn't available across all backends we
+///    plan to target (`mlx_lm.server` in particular).
+/// 2. A tightly scoped natural-language schema with a worked example
+///    has empirically been the most reliable way to get small/mid
+///    models to produce parseable JSON on the first try.
+///
+/// Keep this string and the `LlmCompileResponse` wire types in lockstep
+/// -- the parse-error diagnostics here are the sole runtime check.
+fn json_schema_string() -> &'static str {
+    r#"You must reply with a single JSON object matching this exact shape:
+
+{
+  "plan_name": "string | null   // optional human label, falls back to 'prose-plan'",
+  "open_questions": [             // empty array when the plan is ready to compile
+    {
+      "id": "stable-snake_case-id, used as the invalidation handle across rounds",
+      "prompt": "the question text shown to the user",
+      "rationale": "why this question matters; 1-3 sentences",
+      "options": [
+        { "id": "snake_case", "label": "short label", "rationale": "trade-off, 1-2 sentences" }
+      ],
+      "allow_explain_more": false,
+      "allow_none": false,
+      "depends_on_decisions": ["question_id_of_a_resolved_dependency"]
+    }
+  ],
+  "decisions": [                  // empty array unless you are auto-filling answers
+    {
+      "question_id": "matches one of the questions you would have asked",
+      "chosen_option_id": "matches that question's option id",
+      "depends_on_decisions": [],
+      "auto": true
+    }
+  ],
+  "definition": null              // OR an object when open_questions is empty:
+  // {
+  //   "name": "optional, overrides plan_name",
+  //   "steps": [
+  //     {
+  //       "id": "snake_case-step-id",
+  //       "agent_type": "rust-engineer | tester | reviewer | ...",
+  //       "prompt": "what this agent should do",
+  //       "depends_on": ["other_step_id"],
+  //       "timeout_secs": null,
+  //       "retry_count": 0
+  //     }
+  //   ]
+  // }
+}
+
+Strict rules:
+- Output ONE JSON object, no leading/trailing prose, no markdown fences.
+- "definition" must be null whenever "open_questions" is non-empty.
+- "definition" must be a valid object whenever "open_questions" is empty.
+- Reuse question ids across rounds when refining the same concern.
+- Never refer to a step or decision id you didn't declare in this same response.
+- Prefer snake_case for ids (`my_step`, `lib_choice`); kebab-case (`my-step`)
+  is normalised to snake_case server-side for backwards compatibility with
+  earlier rounds, so do not mix the two within one response."#
+}
+
+fn build_compile_prose_prompt(prose: &str, project: &str) -> String {
+    format!(
+        "{schema}\n\n\
+         You are compiling a fresh prose plan into either an executable DAG \
+         or a list of clarification questions.\n\n\
+         Project: {project}\n\n\
+         Prose plan to compile:\n```\n{prose}\n```\n\n\
+         If the prose is unambiguous, emit a `definition` with no questions. \
+         If material decisions are missing (library choice, architectural fork, \
+         scope ambiguity), emit `open_questions` instead. Cap at 5 questions per \
+         round; surface the highest-impact ones first.",
+        schema = json_schema_string(),
+    )
+}
+
+fn build_apply_answers_prompt(
+    snapshot: &PlanDraftSnapshot,
+    answers: &[(String, Answer)],
+    defer_remaining: bool,
+) -> String {
+    let source_doc = snapshot.source_doc.as_deref().unwrap_or("");
+    let answers_block = render_answers_block(answers);
+    let still_open_block = render_open_questions_block(&snapshot.open_questions);
+    let prior_decisions_block = render_decisions_block(&snapshot.decisions);
+
+    let defer_clause = if defer_remaining {
+        "The user has asked you to FILL IN best-effort answers for any still-open \
+         questions rather than asking another round. For every still-open question \
+         that you do not surface again, append a `decisions` entry with `auto: true` \
+         and your best-guess option. Avoid emitting open_questions in this mode \
+         unless a question raises a brand-new concern that the user must see."
+    } else {
+        "Surface only follow-up questions that are still material after applying \
+         these answers. Drop any prior question whose answer is now implied."
+    };
+
+    format!(
+        "{schema}\n\n\
+         You are advancing an in-flight plan after the user submitted answers.\n\n\
+         Project: {project}\n\
+         Plan name: {plan_name}\n\n\
+         Original prose:\n```\n{source_doc}\n```\n\n\
+         Prior decisions (already recorded; do not re-emit):\n{prior_decisions}\n\n\
+         Still-open questions before this round:\n{still_open}\n\n\
+         User-submitted answers this round:\n{answers}\n\n\
+         {defer_clause}",
+        schema = json_schema_string(),
+        project = snapshot.project,
+        plan_name = snapshot.plan_name,
+        prior_decisions = prior_decisions_block,
+        still_open = still_open_block,
+        answers = answers_block,
+    )
+}
+
+fn build_refine_prompt(snapshot: &PlanDraftSnapshot, feedback: &str) -> String {
+    let source_doc = snapshot.source_doc.as_deref().unwrap_or("");
+    let still_open_block = render_open_questions_block(&snapshot.open_questions);
+    let prior_decisions_block = render_decisions_block(&snapshot.decisions);
+
+    format!(
+        "{schema}\n\n\
+         You are applying a freeform refinement instruction to an in-flight plan.\n\n\
+         Project: {project}\n\
+         Plan name: {plan_name}\n\n\
+         Original prose:\n```\n{source_doc}\n```\n\n\
+         Prior decisions:\n{prior_decisions}\n\n\
+         Still-open questions:\n{still_open}\n\n\
+         Refinement instruction:\n```\n{feedback}\n```\n\n\
+         If the refinement raises new architectural concerns, you may RE-OPEN \
+         questions (including ones whose decisions are now stale -- include a \
+         `decisions` entry referring to the same question_id only if you are \
+         keeping the prior choice). Otherwise, emit a fresh `definition` \
+         reflecting the refined intent.",
+        schema = json_schema_string(),
+        project = snapshot.project,
+        plan_name = snapshot.plan_name,
+        prior_decisions = prior_decisions_block,
+        still_open = still_open_block,
+    )
+}
+
+fn render_answers_block(answers: &[(String, Answer)]) -> String {
+    if answers.is_empty() {
+        return "(none -- the user passed an empty answer list)".into();
+    }
+    let mut out = String::new();
+    for (qid, a) in answers {
+        // `writeln!` into a String never fails; the `let _ =` discards
+        // the impossible Err arm without dragging in `unwrap()`.
+        match a {
+            Answer::Choose { option_id } => {
+                let _ = writeln!(out, "- {qid}: choose `{option_id}`");
+            }
+            Answer::ExplainMore { note } => {
+                let _ = writeln!(out, "- {qid}: explain_more (user note: {note:?})");
+            }
+            Answer::NoneOfThese => {
+                let _ = writeln!(out, "- {qid}: none_of_these (propose new options)");
+            }
+        }
+    }
+    out
+}
+
+fn render_open_questions_block(qs: &[OpenQuestion]) -> String {
+    if qs.is_empty() {
+        return "(none)".into();
+    }
+    let mut out = String::new();
+    for q in qs {
+        let _ = writeln!(out, "- {} ({}): {}", q.id, q.prompt, q.rationale);
+        for opt in &q.options {
+            let _ = writeln!(out, "    * {} -- {} ({})", opt.id, opt.label, opt.rationale);
+        }
+    }
+    out
+}
+
+fn render_decisions_block(ds: &[DecisionRecord]) -> String {
+    if ds.is_empty() {
+        return "(none)".into();
+    }
+    let mut out = String::new();
+    for d in ds {
+        let tag = if d.auto { " [auto]" } else { "" };
+        let _ = writeln!(
+            out,
+            "- {}: chose `{}`{tag}",
+            d.question_id, d.chosen_option_id
+        );
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Response parsing + corrective retry
+// ---------------------------------------------------------------------------
+
+/// Try hard to parse `raw` as one of our wire shapes.
+///
+/// Strategy:
+///   1. Strip leading/trailing whitespace.
+///   2. Strip markdown code fences (```json ... ``` and ``` ... ```).
+///   3. Best-effort: locate the first `{` and the matching `}` and try
+///      that substring as JSON. This handles the "model added a polite
+///      sentence before the JSON" failure mode.
+///
+/// Returns a structured `LlmCompileResponse` on success, or a
+/// human-readable diagnostic string on failure (which the caller embeds
+/// in the corrective prompt).
+fn parse_llm_response(raw: &str) -> std::result::Result<LlmCompileResponse, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("response was empty".into());
+    }
+
+    let candidate = strip_code_fences(trimmed);
+    let json_blob = locate_json_object(candidate).unwrap_or(candidate);
+
+    let mut parsed: LlmCompileResponse = serde_json::from_str(json_blob)
+        .map_err(|e| format!("response is not valid JSON for the schema: {e}"))?;
+
+    // Normalise every id in the response to snake_case before we run
+    // local invariants. Models in the wild (notably Qwen3.6:35b) emit
+    // a mix of `kebab-case` and `snake_case` ids within the same
+    // response, which the executor accepts but which produces an
+    // inconsistent audit trail and breaks ad-hoc string matching by
+    // callers. Doing the normalisation here keeps the canonical wire
+    // shape consistent with what the prompt asks for and means the
+    // invariant checks below see ids that the executor will also see.
+    normalize_response_ids(&mut parsed);
+
+    // Local invariants -- the things we can check without dragging in
+    // the executor's `validate_plan`. Anything caught here is something
+    // the corrective prompt can teach the model to fix.
+    if parsed.open_questions.is_empty() && parsed.definition.is_none() {
+        return Err(
+            "either `open_questions` must be non-empty OR `definition` must be present (got neither)".into(),
+        );
+    }
+    if !parsed.open_questions.is_empty() && parsed.definition.is_some() {
+        // Not technically a parse error -- `into_compile_output` drops
+        // the definition in this case -- but flagging it during the
+        // first pass nudges the model toward cleaner output on retry.
+        return Err("set `definition` to null whenever `open_questions` is non-empty".into());
+    }
+    if let Some(def) = parsed.definition.as_ref() {
+        if def.steps.is_empty() {
+            return Err("`definition.steps` must be non-empty".into());
+        }
+        for s in &def.steps {
+            if s.id.trim().is_empty() {
+                return Err("every step needs a non-empty `id`".into());
+            }
+            if s.agent_type.trim().is_empty() {
+                return Err(format!("step `{}` has empty `agent_type`", s.id));
+            }
+            if s.prompt.trim().is_empty() {
+                return Err(format!("step `{}` has empty `prompt`", s.id));
+            }
+        }
+        // Local uniqueness check on step ids -- cheap and catches a
+        // common LLM failure mode (collision via lazy renaming).
+        let mut seen: HashSet<&str> = HashSet::new();
+        for s in &def.steps {
+            if !seen.insert(&s.id) {
+                return Err(format!("duplicate step id `{}` in definition", s.id));
+            }
+        }
+    }
+    for q in &parsed.open_questions {
+        if q.id.trim().is_empty() {
+            return Err("every open_question needs a non-empty `id`".into());
+        }
+        if q.prompt.trim().is_empty() {
+            return Err(format!("question `{}` has empty `prompt`", q.id));
+        }
+    }
+
+    Ok(parsed)
+}
+
+/// Strip a single `````` ... `````` (optionally `json`-tagged) wrapper
+/// if the model added one. Idempotent on un-fenced input.
+fn strip_code_fences(s: &str) -> &str {
+    let stripped = s.trim();
+    let Some(after_open) = stripped.strip_prefix("```") else {
+        return stripped;
+    };
+    // Drop optional language tag on the same line.
+    let after_lang = after_open
+        .find('\n')
+        .map_or(after_open, |i| &after_open[i + 1..]);
+    after_lang.strip_suffix("```").unwrap_or(after_lang).trim()
+}
+
+/// Locate the first balanced top-level `{...}` block. Naive but
+/// sufficient for our usecase since we control the schema and don't
+/// expect deeply nested escaped braces in prose. Walks in O(n) and
+/// honours JSON string boundaries so a `}` inside a string literal
+/// doesn't terminate early.
+fn locate_json_object(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let start = s.find('{')?;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Convert kebab-case identifiers to `snake_case` in place across every
+/// id-bearing field of [`LlmCompileResponse`].
+///
+/// We only flip `-` to `_`; anything else is left alone (`camelCase`,
+/// dotted ids like `auth.jwt`, etc.) so the change is conservative.
+/// The reference fields (`depends_on*`, `chosen_option_id`,
+/// `question_id`) are normalised the same way so an answer to a
+/// kebab-case question still resolves correctly when the user (or the
+/// executor) talks in `snake_case`.
+fn normalize_response_ids(resp: &mut LlmCompileResponse) {
+    for q in &mut resp.open_questions {
+        normalize_id_in_place(&mut q.id);
+        for opt in &mut q.options {
+            normalize_id_in_place(&mut opt.id);
+        }
+        for dep in &mut q.depends_on_decisions {
+            normalize_id_in_place(dep);
+        }
+    }
+    for d in &mut resp.decisions {
+        normalize_id_in_place(&mut d.question_id);
+        normalize_id_in_place(&mut d.chosen_option_id);
+        for dep in &mut d.depends_on_decisions {
+            normalize_id_in_place(dep);
+        }
+    }
+    if let Some(def) = resp.definition.as_mut() {
+        for s in &mut def.steps {
+            normalize_id_in_place(&mut s.id);
+            for dep in &mut s.depends_on {
+                normalize_id_in_place(dep);
+            }
+        }
+    }
+}
+
+/// Replace every `-` in `s` with `_`. No-op when `s` contains no
+/// hyphens, so callers can apply it unconditionally without paying for
+/// an allocation in the common case.
+fn normalize_id_in_place(s: &mut String) {
+    if s.contains('-') {
+        *s = s.replace('-', "_");
+    }
+}
+
+/// Build a corrective prompt that re-shows the schema, surfaces the
+/// previous response (truncated to keep the prompt bounded), and tells
+/// the model exactly what was wrong.
+fn corrective_prompt(original: &str, prior_raw: &str, parse_err: &str) -> String {
+    format!(
+        "{original}\n\n\
+         ---\n\
+         Your previous response could not be parsed:\n\
+         > {parse_err}\n\n\
+         The first 512 characters of that response were:\n```\n{preview}\n```\n\n\
+         Reply again with a SINGLE JSON object matching the schema above. \
+         No prose, no markdown fences, no commentary outside the object.",
+        preview = preview(prior_raw, 512),
+    )
+}
+
+/// Build a fallback [`CompileOutput`] when even the corrective retry
+/// fails to parse. Produces an open question keyed on
+/// [`LLM_STRUCTURE_QUESTION_ID`] with the diagnostics inlined so the
+/// caller (and any audit log reader) can see what went wrong.
+fn structure_required_fallback(
+    source_doc: &str,
+    first_err: &str,
+    retry_err: &str,
+) -> CompileOutput {
+    CompileOutput::pending(
+        source_doc,
+        vec![OpenQuestion {
+            id: LLM_STRUCTURE_QUESTION_ID.to_string(),
+            prompt: format!(
+                "The LLM compiler could not produce a parseable JSON plan after one corrective retry.\n\
+                 First-pass diagnostic: {first_err}\n\
+                 Retry diagnostic:      {retry_err}\n\n\
+                 Restructure your prose (for example, list each step as `## <id> [agent: <type>]` \
+                 followed by the prompt body) and resubmit via plan_refine, or paste a structured \
+                 version through Answer::ExplainMore."
+            ),
+            rationale: "LLM responses must conform to flowd's plan-compiler JSON schema; \
+                        when they don't, the daemon would otherwise loop on bad output."
+                .to_string(),
+            options: Vec::new(),
+            allow_explain_more: true,
+            allow_none: false,
+            depends_on_decisions: Vec::new(),
+        }],
+    )
+}
+
+/// UTF-8-safe truncation used for embedding raw model output into
+/// prompts and tracing messages.
+fn preview(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let end = s
+        .char_indices()
+        .nth(max_chars)
+        .map_or(s.len(), |(idx, _)| idx);
+    format!("{}…", &s[..end])
 }
 
 // ---------------------------------------------------------------------------
@@ -745,62 +1438,401 @@ Run the auth integration tests and capture failures.
     }
 
     // -----------------------------------------------------------------
-    // LlmPlanCompiler -- skeleton
+    // LlmPlanCompiler -- pure unit tests with a hand-rolled mock
+    // callback. End-to-end live-server tests live in tests/llm_e2e.rs.
     // -----------------------------------------------------------------
 
-    /// Test callback that panics if invoked. Proves the
-    /// `LlmPlanCompiler` skeleton never reaches the callback today.
-    struct PanickingCallback;
+    use std::sync::Mutex;
 
-    impl LlmCallback for PanickingCallback {
-        async fn complete(&self, _prompt: String) -> Result<String> {
-            panic!("LlmPlanCompiler must not invoke its callback in this PR");
+    /// Hand-rolled mock callback that pops scripted responses in FIFO
+    /// order and records every prompt it received. Lets us assert both
+    /// "what did the compiler ask" and "how does it react to N
+    /// responses" without spinning up an HTTP server.
+    struct MockCallback {
+        script: Mutex<std::collections::VecDeque<Result<String>>>,
+        recorded: Mutex<Vec<String>>,
+    }
+
+    impl MockCallback {
+        fn new(script: Vec<Result<String>>) -> Self {
+            Self {
+                script: Mutex::new(script.into()),
+                recorded: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.recorded.lock().unwrap().clone()
         }
     }
 
-    fn llm_compiler() -> LlmPlanCompiler<PanickingCallback> {
-        LlmPlanCompiler::new(Arc::new(PanickingCallback))
+    impl LlmCallback for MockCallback {
+        async fn complete(&self, prompt: String) -> Result<String> {
+            self.recorded.lock().unwrap().push(prompt);
+            self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
+                Err(FlowdError::Internal("MockCallback script exhausted".into()))
+            })
+        }
+    }
+
+    fn llm_with(script: Vec<Result<String>>) -> (LlmPlanCompiler<MockCallback>, Arc<MockCallback>) {
+        let cb = Arc::new(MockCallback::new(script));
+        (LlmPlanCompiler::new(cb.clone()), cb)
     }
 
     #[tokio::test]
-    async fn llm_compile_prose_returns_not_yet_wired_internal_error() {
-        let err = llm_compiler()
-            .compile_prose("anything".into(), "proj".into())
+    async fn llm_compile_prose_parses_definition_response_into_compile_output() {
+        let body = r#"{
+            "plan_name": "refactor-auth",
+            "open_questions": [],
+            "decisions": [],
+            "definition": {
+                "name": "refactor-auth",
+                "steps": [
+                    {"id": "extract", "agent_type": "rust-engineer", "prompt": "do extract", "depends_on": []},
+                    {"id": "migrate", "agent_type": "rust-engineer", "prompt": "do migrate", "depends_on": ["extract"]}
+                ]
+            }
+        }"#;
+        let (c, cb) = llm_with(vec![Ok(body.into())]);
+        let out = c
+            .compile_prose("freeform prose".into(), "proj".into())
+            .await
+            .unwrap();
+        let def = out.definition.expect("definition parsed");
+        assert_eq!(def.name, "refactor-auth");
+        assert_eq!(def.steps.len(), 2);
+        assert_eq!(def.steps[1].depends_on, vec!["extract".to_string()]);
+        assert_eq!(out.source_doc, "freeform prose");
+        assert_eq!(cb.calls().len(), 1, "no retry needed for happy path");
+    }
+
+    #[tokio::test]
+    async fn llm_compile_prose_handles_open_questions_response() {
+        let body = r#"{
+            "plan_name": null,
+            "open_questions": [{
+                "id": "lib_choice",
+                "prompt": "Which JWT library?",
+                "rationale": "Affects perf",
+                "options": [
+                    {"id": "jsonwebtoken", "label": "jsonwebtoken", "rationale": "popular"},
+                    {"id": "biscuit", "label": "biscuit", "rationale": "richer"}
+                ],
+                "allow_explain_more": true
+            }],
+            "decisions": [],
+            "definition": null
+        }"#;
+        let (c, _cb) = llm_with(vec![Ok(body.into())]);
+        let out = c.compile_prose("p".into(), "proj".into()).await.unwrap();
+        assert!(out.definition.is_none());
+        assert_eq!(out.open_questions.len(), 1);
+        assert_eq!(out.open_questions[0].id, "lib_choice");
+        assert!(out.open_questions[0].allow_explain_more);
+        assert_eq!(out.open_questions[0].options.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn llm_strips_markdown_fences_around_json() {
+        let body = "```json\n{\"plan_name\":\"p\",\"open_questions\":[],\"decisions\":[],\"definition\":{\"steps\":[{\"id\":\"a\",\"agent_type\":\"echo\",\"prompt\":\"hi\"}]}}\n```";
+        let (c, cb) = llm_with(vec![Ok(body.into())]);
+        let out = c.compile_prose("p".into(), "proj".into()).await.unwrap();
+        assert!(out.definition.is_some());
+        assert_eq!(cb.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn llm_extracts_json_object_from_chatty_prose() {
+        let body = "Sure! Here's the plan:\n\n{\"plan_name\":\"p\",\"open_questions\":[],\"decisions\":[],\"definition\":{\"steps\":[{\"id\":\"a\",\"agent_type\":\"echo\",\"prompt\":\"hi\"}]}}\n\nLet me know if you need changes.";
+        let (c, cb) = llm_with(vec![Ok(body.into())]);
+        let out = c.compile_prose("p".into(), "proj".into()).await.unwrap();
+        assert!(out.definition.is_some());
+        assert_eq!(cb.calls().len(), 1, "no retry needed when json extractable");
+    }
+
+    #[tokio::test]
+    async fn llm_retries_once_on_unparseable_response_and_succeeds() {
+        let bad = "totally not json".to_string();
+        let good = r#"{"plan_name":"p","open_questions":[],"decisions":[],"definition":{"steps":[{"id":"a","agent_type":"echo","prompt":"hi"}]}}"#.to_string();
+        let (c, cb) = llm_with(vec![Ok(bad), Ok(good)]);
+        let out = c.compile_prose("p".into(), "proj".into()).await.unwrap();
+        assert!(out.definition.is_some());
+        let calls = cb.calls();
+        assert_eq!(calls.len(), 2, "should retry once");
+        assert!(
+            calls[1].contains("could not be parsed"),
+            "corrective prompt embedded: {}",
+            preview(&calls[1], 200)
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_falls_back_to_structure_question_when_retry_also_fails() {
+        let (c, cb) = llm_with(vec![Ok("garbage 1".into()), Ok("garbage 2".into())]);
+        let out = c.compile_prose("p".into(), "proj".into()).await.unwrap();
+        assert!(out.definition.is_none());
+        assert_eq!(out.open_questions.len(), 1);
+        assert_eq!(out.open_questions[0].id, LLM_STRUCTURE_QUESTION_ID);
+        assert!(out.open_questions[0].allow_explain_more);
+        assert!(
+            out.open_questions[0]
+                .prompt
+                .contains("could not produce a parseable JSON plan")
+        );
+        assert_eq!(cb.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn llm_propagates_transport_errors_without_retry() {
+        let (c, cb) = llm_with(vec![Err(FlowdError::Internal("MLX down".into()))]);
+        let err = c
+            .compile_prose("p".into(), "proj".into())
             .await
             .unwrap_err();
         match err {
-            FlowdError::Internal(m) => {
-                assert!(m.contains("LlmPlanCompiler::compile_prose"));
-                assert!(m.contains("not yet wired"));
-            }
+            FlowdError::Internal(m) => assert!(m.contains("MLX down"), "{m}"),
             other => panic!("expected Internal, got {other:?}"),
         }
+        assert_eq!(cb.calls().len(), 1, "transport errors must not retry");
     }
 
     #[tokio::test]
-    async fn llm_apply_answers_returns_not_yet_wired_internal_error() {
-        assert!(matches!(
-            llm_compiler()
-                .apply_answers(snapshot(None), vec![], false)
-                .await,
-            Err(FlowdError::Internal(m)) if m.contains("apply_answers")
-        ));
+    async fn llm_drops_definition_when_questions_present() {
+        // Defends the PlanCompiler invariant: definition.is_some() iff
+        // open_questions.is_empty(). If the model emits both, the
+        // compiler keeps the questions and discards the definition.
+        let body = r#"{
+            "plan_name": "p",
+            "open_questions": [{"id":"q","prompt":"?","rationale":"because"}],
+            "decisions": [],
+            "definition": {"steps":[{"id":"a","agent_type":"echo","prompt":"hi"}]}
+        }"#;
+        // This response will trip the `set definition to null` parse
+        // diagnostic on the first pass; the second response keeps only
+        // the question.
+        let retry = r#"{
+            "plan_name": "p",
+            "open_questions": [{"id":"q","prompt":"?","rationale":"because"}],
+            "decisions": [],
+            "definition": null
+        }"#;
+        let (c, _) = llm_with(vec![Ok(body.into()), Ok(retry.into())]);
+        let out = c.compile_prose("p".into(), "proj".into()).await.unwrap();
+        assert!(out.definition.is_none());
+        assert_eq!(out.open_questions.len(), 1);
     }
 
     #[tokio::test]
-    async fn llm_refine_returns_not_yet_wired_internal_error() {
-        assert!(matches!(
-            llm_compiler()
-                .refine(snapshot(None), "tweak".into())
-                .await,
-            Err(FlowdError::Internal(m)) if m.contains("refine")
-        ));
+    async fn llm_apply_answers_includes_answers_block_in_prompt() {
+        let body = r#"{"plan_name":"p","open_questions":[],"decisions":[],"definition":{"steps":[{"id":"a","agent_type":"echo","prompt":"hi"}]}}"#;
+        let (c, cb) = llm_with(vec![Ok(body.into())]);
+        let snap = snapshot(Some("# my prose".into()));
+        let answers = vec![
+            (
+                "lib".into(),
+                Answer::Choose {
+                    option_id: "jsonwebtoken".into(),
+                },
+            ),
+            ("scope".into(), Answer::NoneOfThese),
+        ];
+        let _ = c
+            .apply_answers(snap, answers, /* defer */ true)
+            .await
+            .unwrap();
+        let prompt = &cb.calls()[0];
+        assert!(prompt.contains("lib: choose `jsonwebtoken`"), "{prompt}");
+        assert!(prompt.contains("scope: none_of_these"), "{prompt}");
+        assert!(prompt.contains("FILL IN"), "defer clause present");
+    }
+
+    #[tokio::test]
+    async fn llm_refine_includes_feedback_block_in_prompt() {
+        let body = r#"{"plan_name":"p","open_questions":[],"decisions":[],"definition":{"steps":[{"id":"a","agent_type":"echo","prompt":"hi"}]}}"#;
+        let (c, cb) = llm_with(vec![Ok(body.into())]);
+        let snap = snapshot(Some("# original".into()));
+        let _ = c
+            .refine(snap, "drop the smoke test step".into())
+            .await
+            .unwrap();
+        let prompt = &cb.calls()[0];
+        assert!(prompt.contains("drop the smoke test step"));
+        assert!(prompt.contains("Refinement instruction"));
+    }
+
+    #[tokio::test]
+    async fn llm_apply_answers_carries_decisions_through_to_compile_output() {
+        let body = r#"{
+            "plan_name":"p",
+            "open_questions":[],
+            "decisions":[{"question_id":"lib","chosen_option_id":"jsonwebtoken","auto":true}],
+            "definition":{"steps":[{"id":"a","agent_type":"echo","prompt":"hi"}]}
+        }"#;
+        let (c, _) = llm_with(vec![Ok(body.into())]);
+        let snap = snapshot(Some("# original".into()));
+        let out = c.apply_answers(snap, vec![], true).await.unwrap();
+        assert_eq!(out.new_decisions.len(), 1);
+        assert_eq!(out.new_decisions[0].question_id, "lib");
+        assert!(out.new_decisions[0].auto);
+    }
+
+    // -----------------------------------------------------------------
+    // Pure-function tests for the parser / prompt helpers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_rejects_empty_response() {
+        let err = parse_llm_response("").unwrap_err();
+        assert!(err.contains("empty"));
     }
 
     #[test]
-    fn llm_callback_accessor_exposes_arc_for_future_wiring() {
-        let c = llm_compiler();
-        assert_eq!(Arc::strong_count(c.callback()), 1);
+    fn parse_rejects_response_with_neither_questions_nor_definition() {
+        let err = parse_llm_response(r#"{"open_questions":[],"decisions":[],"definition":null}"#)
+            .unwrap_err();
+        assert!(err.contains("either"));
+    }
+
+    #[test]
+    fn parse_rejects_definition_with_empty_steps() {
+        let err =
+            parse_llm_response(r#"{"open_questions":[],"decisions":[],"definition":{"steps":[]}}"#)
+                .unwrap_err();
+        assert!(err.contains("non-empty"));
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_step_ids() {
+        let err = parse_llm_response(
+            r#"{"open_questions":[],"decisions":[],"definition":{"steps":[{"id":"a","agent_type":"e","prompt":"p"},{"id":"a","agent_type":"e","prompt":"p"}]}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn parse_normalizes_kebab_case_ids_to_snake_case_across_every_field() {
+        // Mixed kebab + snake input the model might produce. After
+        // parse, every id should have been canonicalised so neither the
+        // executor nor downstream callers have to tolerate the mix.
+        let body = r#"{
+            "plan_name": "p",
+            "open_questions": [{
+                "id": "lib-choice",
+                "prompt": "?",
+                "rationale": "r",
+                "options": [{"id": "json-webtoken", "label": "x", "rationale": "y"}],
+                "depends_on_decisions": ["scope-decision"]
+            }],
+            "decisions": [{
+                "question_id": "scope-decision",
+                "chosen_option_id": "narrow-scope",
+                "depends_on_decisions": ["upstream-dep"]
+            }],
+            "definition": null
+        }"#;
+        let parsed = parse_llm_response(body).unwrap();
+        let q = &parsed.open_questions[0];
+        assert_eq!(q.id, "lib_choice");
+        assert_eq!(q.options[0].id, "json_webtoken");
+        assert_eq!(q.depends_on_decisions[0], "scope_decision");
+        let d = &parsed.decisions[0];
+        assert_eq!(d.question_id, "scope_decision");
+        assert_eq!(d.chosen_option_id, "narrow_scope");
+        assert_eq!(d.depends_on_decisions[0], "upstream_dep");
+    }
+
+    #[test]
+    fn parse_normalizes_step_ids_and_dependencies() {
+        let body = r#"{
+            "plan_name": "p",
+            "open_questions": [],
+            "decisions": [],
+            "definition": {
+                "steps": [
+                    {"id": "extract-jwt", "agent_type": "rust-engineer", "prompt": "do x", "depends_on": []},
+                    {"id": "migrate-callers", "agent_type": "rust-engineer", "prompt": "do y", "depends_on": ["extract-jwt"]}
+                ]
+            }
+        }"#;
+        let parsed = parse_llm_response(body).unwrap();
+        let def = parsed.definition.unwrap();
+        assert_eq!(def.steps[0].id, "extract_jwt");
+        assert_eq!(def.steps[1].id, "migrate_callers");
+        assert_eq!(def.steps[1].depends_on, vec!["extract_jwt".to_string()]);
+        // Note: `agent_type` is intentionally NOT normalised; agent types
+        // are caller-defined identifiers (e.g. "rust-engineer") and the
+        // executor matches them verbatim against its spawner registry.
+        assert_eq!(def.steps[0].agent_type, "rust-engineer");
+    }
+
+    #[test]
+    fn normalize_id_in_place_is_noop_for_already_snake_case() {
+        let mut s = String::from("already_snake_case");
+        normalize_id_in_place(&mut s);
+        assert_eq!(s, "already_snake_case");
+    }
+
+    #[test]
+    fn normalize_id_in_place_only_touches_hyphens() {
+        let mut s = String::from("my-step.with.dots");
+        normalize_id_in_place(&mut s);
+        assert_eq!(s, "my_step.with.dots", "dots and other chars preserved");
+    }
+
+    #[test]
+    fn locate_json_object_handles_braces_inside_string_literals() {
+        let input = r#"prefix {"k":"v with } inside"} suffix"#;
+        let extracted = locate_json_object(input).unwrap();
+        assert_eq!(extracted, r#"{"k":"v with } inside"}"#);
+    }
+
+    #[test]
+    fn strip_code_fences_removes_json_tagged_block() {
+        let input = "```json\n{\"a\":1}\n```";
+        assert_eq!(strip_code_fences(input), "{\"a\":1}");
+    }
+
+    #[test]
+    fn strip_code_fences_is_noop_on_plain_input() {
+        assert_eq!(strip_code_fences("{\"a\":1}"), "{\"a\":1}");
+    }
+
+    #[test]
+    fn corrective_prompt_includes_diagnostic_and_truncated_preview() {
+        let original = "ORIGINAL PROMPT";
+        let raw = "x".repeat(2000);
+        let p = corrective_prompt(original, &raw, "missing field foo");
+        assert!(p.contains("ORIGINAL PROMPT"));
+        assert!(p.contains("missing field foo"));
+        // Truncated to 512 chars + ellipsis
+        assert!(p.contains("…"));
+    }
+
+    #[test]
+    fn fallback_question_records_both_diagnostics() {
+        let out = structure_required_fallback("# prose", "first bad", "retry bad");
+        assert_eq!(out.open_questions.len(), 1);
+        let q = &out.open_questions[0];
+        assert_eq!(q.id, LLM_STRUCTURE_QUESTION_ID);
+        assert!(q.prompt.contains("first bad"));
+        assert!(q.prompt.contains("retry bad"));
+        assert_eq!(out.source_doc, "# prose");
+    }
+
+    #[test]
+    fn preview_respects_utf8_boundaries() {
+        let s = "αβγδε";
+        assert_eq!(preview(s, 3), "αβγ…");
+        assert_eq!(preview(s, 10), s);
+    }
+
+    #[test]
+    fn render_helpers_handle_empty_inputs() {
+        assert!(render_answers_block(&[]).contains("none"));
+        assert_eq!(render_open_questions_block(&[]), "(none)");
+        assert_eq!(render_decisions_block(&[]), "(none)");
     }
 
     // -----------------------------------------------------------------

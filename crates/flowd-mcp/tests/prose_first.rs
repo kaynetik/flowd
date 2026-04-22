@@ -219,6 +219,7 @@ async fn plan_create_with_definition_keeps_legacy_behaviour() {
                 "steps": [{ "id": "a", "agent_type": "echo", "prompt": "do a" }]
             })),
             prose: None,
+            compiler_override: None,
         })
         .await
         .expect("plan_create with definition succeeds");
@@ -235,10 +236,57 @@ async fn plan_create_rejects_both_definition_and_prose() {
             project: "rnd".into(),
             definition: Some(json!({"name": "x", "steps": []})),
             prose: Some("do a thing".into()),
+            compiler_override: None,
         })
         .await
         .unwrap_err();
     assert!(format!("{err}").contains("exactly one"));
+}
+
+#[tokio::test]
+async fn plan_create_rejects_compiler_override_on_definition_path() {
+    // `compiler_override` only applies to the prose-first path. Pairing
+    // it with `definition` is almost always a copy/paste mistake; the
+    // handler refuses loudly so the caller fixes the request rather than
+    // having the field silently ignored.
+    let h = build_harness(vec![]);
+    let err = h
+        .handlers
+        .plan_create(PlanCreateParams {
+            project: "rnd".into(),
+            definition: Some(json!({
+                "name": "legacy",
+                "steps": [{ "id": "a", "agent_type": "echo", "prompt": "do a" }]
+            })),
+            prose: None,
+            compiler_override: Some("claude-cli".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("compiler_override"));
+}
+
+#[tokio::test]
+async fn plan_create_with_compiler_override_on_prose_routes_through_default_compiler() {
+    // The mock compiler doesn't override `compile_prose_with_override`
+    // so the trait default applies: the override is ignored and
+    // `compile_prose` runs normally. This test pins that behaviour --
+    // single-backend compilers MUST be transparent to the override
+    // field, otherwise we'd break every caller that wires in a custom
+    // PlanCompiler outside the daemon's `DaemonPlanCompiler`.
+    let h = build_harness(vec![CompileOutput::ready("# title", echo_def("compiled"))]);
+    let payload = h
+        .handlers
+        .plan_create(PlanCreateParams {
+            project: "rnd".into(),
+            definition: None,
+            prose: Some("# Title".into()),
+            compiler_override: Some("mlx".into()),
+        })
+        .await
+        .expect("override is no-op for single-backend compilers");
+    assert_eq!(payload["status"], "draft");
+    assert!(payload.get("preview").is_some());
 }
 
 #[tokio::test]
@@ -250,6 +298,7 @@ async fn plan_create_rejects_when_neither_definition_nor_prose_provided() {
             project: "rnd".into(),
             definition: None,
             prose: None,
+            compiler_override: None,
         })
         .await
         .unwrap_err();
@@ -283,6 +332,7 @@ async fn prose_loop_runs_create_answer_confirm_and_emits_events() {
             project: "rnd".into(),
             definition: None,
             prose: Some("# Refactor auth\nMake it secure.".into()),
+            compiler_override: None,
         })
         .await
         .expect("plan_create(prose)");
@@ -382,6 +432,7 @@ async fn plan_refine_emits_refinement_applied_and_clarification_deltas() {
             project: "rnd".into(),
             definition: None,
             prose: Some("seed".into()),
+            compiler_override: None,
         })
         .await
         .unwrap();
@@ -455,6 +506,7 @@ async fn plan_answer_overwriting_a_decision_invalidates_dependent_chain() {
             project: "rnd".into(),
             definition: None,
             prose: Some("# Title".into()),
+            compiler_override: None,
         })
         .await
         .unwrap();
@@ -516,6 +568,7 @@ async fn plan_cancel_terminates_a_draft_plan_idempotently() {
             project: "rnd".into(),
             definition: None,
             prose: Some("anything".into()),
+            compiler_override: None,
         })
         .await
         .unwrap();
@@ -555,6 +608,7 @@ async fn plan_refine_sets_clarification_reopened_flag_when_introducing_questions
             project: "rnd".into(),
             definition: None,
             prose: Some("seed".into()),
+            compiler_override: None,
         })
         .await
         .unwrap();
@@ -587,6 +641,7 @@ async fn plan_refine_clarification_reopened_is_false_when_dag_compiled_cleanly()
             project: "rnd".into(),
             definition: None,
             prose: Some("seed".into()),
+            compiler_override: None,
         })
         .await
         .unwrap();
@@ -640,6 +695,7 @@ async fn plan_answer_emits_budget_exceeded_warning_when_load_overflows() {
             project: "rnd".into(),
             definition: None,
             prose: Some("anything".into()),
+            compiler_override: None,
         })
         .await
         .unwrap();
@@ -708,6 +764,7 @@ async fn no_warnings_emitted_when_budget_is_unset() {
             project: "rnd".into(),
             definition: None,
             prose: Some("anything".into()),
+            compiler_override: None,
         })
         .await
         .unwrap();

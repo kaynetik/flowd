@@ -60,6 +60,15 @@ glob = "0.3"
 regex = "1"
 tempfile = "3"
 
+# HTTP (used by flowd-mcp::OpenAiCompatibleCallback to talk to mlx_lm.server
+# and any other OpenAI-compatible endpoint). reqwest is already pulled in
+# transitively by qdrant-client; declaring it explicitly keeps version drift
+# under workspace control.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Mock HTTP server for integration tests against OpenAI-compatible endpoints.
+wiremock = "0.6"
+
 [workspace.lints.rust]
 unsafe_code = "warn"
 

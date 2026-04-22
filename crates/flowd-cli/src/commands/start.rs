@@ -46,12 +46,14 @@ use flowd_onnx::provider::OnnxEmbedder;
 use flowd_storage::sqlite::SqliteBackend;
 use flowd_vector::qdrant::{QdrantConfig, QdrantIndex};
 
-use crate::config::FlowdConfig;
+use crate::config::{FlowdConfig, LlmConfig, LlmProvider};
 use crate::daemon::PidFile;
 use crate::output::Style;
 use crate::paths::FlowdPaths;
 use crate::plan_compiler::DaemonPlanCompiler;
 use crate::spawner::BoxedSpawner;
+use flowd_mcp::ClaudeCliCallback;
+use flowd_mcp::ClaudeCliConfig as McpClaudeCliConfig;
 
 pub async fn run(
     paths: &FlowdPaths,
@@ -82,6 +84,9 @@ pub async fn run(
         config.plan.compiler.wire_name(),
         config.plan.max_questions,
     );
+    if matches!(config.plan.compiler, crate::config::CompilerSelection::Llm) {
+        log_llm_startup(style, &config.plan.llm)?;
+    }
 
     // ---- Memory backends (shared between live handlers & compactor) ----
     let backends = compose_backends(paths, qdrant_url.as_deref()).await?;
@@ -136,15 +141,20 @@ pub async fn run(
     // startup from `flowd.toml`'s `[plan].compiler` key; a sum-type
     // wrapper ([`DaemonPlanCompiler`]) keeps `FlowdHandlers` statically
     // dispatched while still letting the operator switch implementations
-    // without recompiling. Today this picks between the deterministic
-    // [`StubPlanCompiler`] (markdown parser, default) and
-    // [`RejectingPlanCompiler`] (every prose-first call errors -- use
-    // this to disable the feature at the deployment level). The
-    // upcoming `LlmPlanCompiler` lands as a third variant.
+    // without recompiling. Three variants today:
+    //   * `stub`      -- deterministic markdown parser (default).
+    //   * `rejecting` -- prose-first disabled at deployment time.
+    //   * `llm`       -- `LlmPlanCompiler` over the `[plan.llm]`
+    //                    backend (currently OpenAI-compatible MLX over
+    //                    HTTP). Construction can fail (HTTP client
+    //                    init, unsupported provider); the daemon
+    //                    refuses to start in that case so the operator
+    //                    notices before requests pile up.
     let plan_compiler = Arc::new(
-        DaemonPlanCompiler::from_selection(config.plan.compiler)
+        DaemonPlanCompiler::from_selection(config.plan.compiler, &config.plan.llm)
             .map_err(|e| anyhow::anyhow!("instantiate plan compiler: {e}"))?,
     );
+    log_llm_router(style, &plan_compiler);
 
     let handlers = Arc::new(
         FlowdHandlers::new(memory_service, executor, plan_compiler, rules)
@@ -323,6 +333,132 @@ fn spawn_compactor(
         policy.warm_max_age().to_std().unwrap_or_default(),
     );
     compactor.spawn()
+}
+
+/// Print the LLM compiler banner and probe any provider that requires
+/// an out-of-process dependency (today: the `claude` CLI binary).
+///
+/// The probe is asymmetric on purpose:
+///
+/// * `claude-cli` is fail-fast -- if the binary is missing, the daemon
+///   refuses to start so the operator sees a clear error before the
+///   first `plan_create` call. We probe both the primary tier *and*
+///   the optional refine tier, since either can be invoked during a
+///   single plan's lifetime.
+/// * `mlx` is lazy -- the local OpenAI-compatible server may legally
+///   not be running yet (the daemon and `mlx_lm.server` are typically
+///   started in either order). The first compile attempt surfaces a
+///   clean transport error if the server never comes up.
+/// * `claude-http` is currently rejected at compiler-construction time
+///   (the transport is unimplemented), so no startup probe is needed.
+fn log_llm_startup(style: Style, cfg: &LlmConfig) -> Result<()> {
+    log_provider_line(style, "primary", cfg.provider, cfg);
+    if let Some(refine) = cfg.refine.as_ref() {
+        // Reuse the same banner shape but flag this as the refine tier
+        // so an operator scanning the log sees both lines distinctly.
+        eprintln!(
+            "{} llm refine tier configured ({} model={})",
+            style.cyan("loaded"),
+            refine.provider.wire_name(),
+            describe_provider_model(refine.provider, &refine_as_llm_view(refine, cfg)),
+        );
+    } else {
+        eprintln!(
+            "{} llm refine tier not configured (refine() falls back to primary)",
+            style.dim("note"),
+        );
+    }
+
+    // Fail-fast probe for the `claude` CLI binary. We only probe the
+    // tiers that actually use it; an MLX-only deployment skips this
+    // entirely.
+    if needs_claude_cli_probe(cfg) {
+        let cli_cfg = McpClaudeCliConfig {
+            binary: cfg.claude_cli.binary.clone(),
+            model: cfg.claude_cli.model.clone(),
+            timeout: Duration::from_secs(cfg.claude_cli.timeout_secs),
+        };
+        let resolved = ClaudeCliCallback::probe_binary(&cli_cfg).with_context(
+            || "probe claude CLI binary at startup (set provider = \"mlx\" to skip the probe)",
+        )?;
+        eprintln!(
+            "{} claude CLI at {}",
+            style.cyan("found"),
+            resolved.display()
+        );
+    }
+    Ok(())
+}
+
+/// Print the per-tier "loaded llm backend" line. Keeps formatting
+/// consistent across the primary and refine tiers.
+fn log_provider_line(style: Style, label: &str, provider: LlmProvider, cfg: &LlmConfig) {
+    eprintln!(
+        "{} llm {} backend ({} model={})",
+        style.cyan("loaded"),
+        label,
+        provider.wire_name(),
+        describe_provider_model(provider, cfg),
+    );
+}
+
+/// Render the model identifier for a provider, plus whatever
+/// supplementary detail makes sense for that transport. Kept here
+/// rather than on `LlmProvider` because the format is banner-policy,
+/// not data.
+fn describe_provider_model(provider: LlmProvider, cfg: &LlmConfig) -> String {
+    match provider {
+        LlmProvider::ClaudeCli => format!(
+            "{} binary={}",
+            cfg.claude_cli.model,
+            cfg.claude_cli.binary.display()
+        ),
+        LlmProvider::Mlx => format!("{} url={}", cfg.mlx.model, cfg.mlx.base_url),
+        LlmProvider::ClaudeHttp => format!(
+            "{} url={} (transport not yet implemented)",
+            cfg.claude_http.model, cfg.claude_http.base_url
+        ),
+    }
+}
+
+/// Build a synthetic `LlmConfig` view that swaps the per-provider
+/// subsections in for the refine tier's overrides. Lets us reuse
+/// `describe_provider_model` for both tiers without duplicating the
+/// formatting strings.
+fn refine_as_llm_view(refine: &crate::config::RefineConfig, _base: &LlmConfig) -> LlmConfig {
+    LlmConfig {
+        provider: refine.provider,
+        claude_cli: refine.claude_cli.clone(),
+        mlx: refine.mlx.clone(),
+        claude_http: refine.claude_http.clone(),
+        refine: None,
+    }
+}
+
+/// Print the runtime LLM router shape so an operator can verify which
+/// providers a `compiler_override` request can target. Pulled out of
+/// `run` to keep that function under the pedantic-clippy line ceiling.
+fn log_llm_router(style: Style, plan_compiler: &DaemonPlanCompiler) {
+    let Some(router) = plan_compiler.llm_router() else {
+        return;
+    };
+    let primary = router.primary_provider().wire_name();
+    let refine = router
+        .refine_provider()
+        .map_or("(falls back to primary)", LlmProvider::wire_name);
+    eprintln!(
+        "{} llm router: primary={primary} refine={refine} overrides=[{}]",
+        style.dim("note"),
+        router.configured_overrides().join(", "),
+    );
+}
+
+fn needs_claude_cli_probe(cfg: &LlmConfig) -> bool {
+    cfg.provider == LlmProvider::ClaudeCli
+        || cfg
+            .refine
+            .as_ref()
+            .is_some_and(|r| r.provider == LlmProvider::ClaudeCli)
 }
 
 fn compose_rules(paths: &FlowdPaths, style: Style) -> Result<InMemoryRuleEvaluator> {

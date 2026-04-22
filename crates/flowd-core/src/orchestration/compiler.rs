@@ -225,6 +225,34 @@ pub trait PlanCompiler: Send + Sync {
         snapshot: PlanDraftSnapshot,
         feedback: String,
     ) -> impl Future<Output = Result<CompileOutput>> + Send;
+
+    /// Variant of [`Self::compile_prose`] that lets the caller name a
+    /// non-default backend by stable wire name (e.g. "claude-cli",
+    /// "mlx", "claude-http"). Implementations that host more than one
+    /// backend (notably the daemon's `DaemonPlanCompiler`) override this
+    /// to route the call through the named backend. Single-backend
+    /// implementations should keep the provided default, which simply
+    /// ignores the override and falls back to [`Self::compile_prose`].
+    ///
+    /// The override only affects the *initial* compile call. Follow-up
+    /// `apply_answers` and `refine` calls on the same plan stay on the
+    /// daemon's configured primary / refine backends so a Draft plan
+    /// has a stable compiler identity for its whole lifetime.
+    ///
+    /// # Errors
+    /// Implementations may return `FlowdError::PlanValidation` when the
+    /// requested backend is not configured at runtime.
+    fn compile_prose_with_override(
+        &self,
+        prose: String,
+        project: String,
+        _compiler_override: Option<String>,
+    ) -> impl Future<Output = Result<CompileOutput>> + Send {
+        // Default ignores the override -- single-backend compilers
+        // (Stub, Rejecting, Mock, the unit-test LlmPlanCompiler) have
+        // exactly one transport so the override is meaningless to them.
+        self.compile_prose(prose, project)
+    }
 }
 
 /// Scripted compiler that returns pre-canned [`CompileOutput`]s in order.

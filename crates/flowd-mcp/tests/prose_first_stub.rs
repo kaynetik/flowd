@@ -177,6 +177,7 @@ Run the integration tests and capture failures.
             project: "rnd".into(),
             definition: None,
             prose: Some(prose.into()),
+            compiler_override: None,
         })
         .await
         .expect("plan_create(prose) succeeds with structured input");
@@ -248,6 +249,7 @@ async fn freeform_prose_loops_through_refine_then_executes() {
                  algorithm without rewriting callers."
                     .into(),
             ),
+            compiler_override: None,
         })
         .await
         .expect("plan_create(prose) returns Draft + question even on freeform input");
