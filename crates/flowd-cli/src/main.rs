@@ -10,9 +10,11 @@ use clap::Parser;
 
 mod cli;
 mod commands;
+mod config;
 mod daemon;
 mod output;
 mod paths;
+mod plan_compiler;
 mod spawner;
 
 use cli::{Cli, Command, PlanAction, RulesAction};
@@ -68,6 +70,17 @@ async fn main() -> Result<()> {
                 limit,
                 kind,
             } => commands::plan::events(&paths, style, plan_id, limit, kind).await,
+            PlanAction::Answer {
+                plan_id,
+                file,
+                defer_remaining,
+            } => commands::plan::answer(&paths, style, plan_id, file, defer_remaining).await,
+            PlanAction::Refine {
+                plan_id,
+                feedback,
+                file,
+            } => commands::plan::refine(&paths, style, plan_id, feedback, file).await,
+            PlanAction::Cancel { plan_id } => commands::plan::cancel(&paths, style, plan_id).await,
         },
         Command::Rules { action } => match action {
             RulesAction::List { project, file } => {

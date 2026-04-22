@@ -70,6 +70,18 @@ const MAX_DERIVED_PLAN_NAME_LEN: usize = 120;
 /// compiler.
 const MAX_REFINEMENT_SUMMARY_LEN: usize = 200;
 
+/// Stable warning code surfaced in the JSON response when the
+/// clarification budget is exceeded. Callers (CLI, agents) match on
+/// this string to decide whether to render a "this plan needs to
+/// converge" hint to the user.
+pub const WARN_BUDGET_EXCEEDED: &str = "BudgetExceeded";
+
+/// Stable warning code surfaced when the handler had to override the
+/// caller's `defer_remaining = false` because the budget was already
+/// exhausted at call time. The compiler is then asked to converge on
+/// best-effort answers instead of opening yet another round.
+pub const WARN_DEFER_COERCED: &str = "DeferRemainingCoerced";
+
 /// Surface exposed by the MCP server. Return values are arbitrary JSON;
 /// errors bubble up via `Result` and are mapped to `isError: true` by the
 /// dispatcher in [`crate::server`].
@@ -145,6 +157,16 @@ where
     /// elapsed time. Optional so test/stub composers don't have to wire
     /// a monitor when they don't run a compactor.
     monitor: Option<ActivityMonitor>,
+    /// Maximum allowed `decisions.len() + open_questions.len()` before
+    /// the handlers start coercing `defer_remaining = true` and
+    /// surfacing `BudgetExceeded` warnings in the response payload.
+    ///
+    /// `None` disables enforcement entirely (the pre-budget
+    /// behaviour). The daemon binds this to the `[plan].max_questions`
+    /// value from `flowd.toml`; in tests it is typically left unset so
+    /// the budget machinery stays inert and existing assertions don't
+    /// have to account for the warnings field.
+    question_budget: Option<usize>,
 }
 
 impl<M, V, E, PE, PC, R> FlowdHandlers<M, V, E, PE, PC, R>
@@ -169,6 +191,7 @@ where
             rules,
             observer: None,
             monitor: None,
+            question_budget: None,
         }
     }
 
@@ -187,6 +210,20 @@ where
     #[must_use]
     pub fn with_observer(mut self, observer: SharedPlanObserver) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    /// Cap the total clarification load (`decisions + open_questions`)
+    /// the prose-first handlers will tolerate before they start
+    /// coercing `defer_remaining = true` on `plan_answer` and surfacing
+    /// `BudgetExceeded` warnings on every prose-first response.
+    ///
+    /// Set to `None` to disable enforcement (the default). The daemon
+    /// passes `Some(flowd.toml plan.max_questions)`; tests typically
+    /// leave it unset so existing fixtures stay focused on the loop.
+    #[must_use]
+    pub fn with_question_budget(mut self, budget: Option<usize>) -> Self {
+        self.question_budget = budget;
         self
     }
 
@@ -283,6 +320,26 @@ fn truncate_summary(feedback: &str) -> String {
     feedback.chars().take(MAX_REFINEMENT_SUMMARY_LEN).collect()
 }
 
+/// One structured warning emitted alongside the prose-plan payload.
+///
+/// Stable shape so clients can match on `code` (see [`WARN_BUDGET_EXCEEDED`]
+/// / [`WARN_DEFER_COERCED`]) and surface a localised message of their
+/// own without parsing the human-readable `message` field.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProsePlanWarning {
+    code: &'static str,
+    message: String,
+    /// Configured budget at the time the warning was emitted. Always
+    /// present today (the only warnings we emit are budget-driven), but
+    /// `Option` so future non-budget warnings can omit it without a
+    /// shape break.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget: Option<usize>,
+    /// Observed `decisions + open_questions` when the warning fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<usize>,
+}
+
 /// Build the response payload returned by every prose-first plan handler.
 ///
 /// Symmetric across `plan_create`, `plan_answer`, and `plan_refine` so MCP
@@ -290,7 +347,19 @@ fn truncate_summary(feedback: &str) -> String {
 /// the result. `preview` is included only when the plan has compiled
 /// (i.e. has steps and no open questions); otherwise it stays absent so
 /// callers don't mistake an empty preview for a successful compile.
-fn prose_plan_payload(plan: &Plan) -> Result<Value> {
+///
+/// Per-tool handlers tack on two optional pieces:
+///
+/// * `warnings` -- structured budget / coercion notices (omitted when empty
+///   so existing test fixtures keep matching).
+/// * `clarification_reopened` -- only emitted by `plan_refine`, signals
+///   that the refine call introduced (or kept) open questions so the
+///   caller has to re-enter the clarification loop. Skipped when `None`.
+fn prose_plan_payload_with(
+    plan: &Plan,
+    warnings: &[ProsePlanWarning],
+    clarification_reopened: Option<bool>,
+) -> Result<Value> {
     let mut payload = json!({
         "plan_id": plan.id.to_string(),
         "status": plan_status_label(plan.status),
@@ -300,14 +369,61 @@ fn prose_plan_payload(plan: &Plan) -> Result<Value> {
         "open_questions": plan.open_questions,
         "decisions": plan.decisions,
     });
+    let map = payload
+        .as_object_mut()
+        .expect("plan_payload is a json object");
     if !plan.has_open_questions() && !plan.steps.is_empty() {
-        let preview = build_preview_value(plan)?;
-        payload
-            .as_object_mut()
-            .expect("plan_payload is a json object")
-            .insert("preview".into(), preview);
+        map.insert("preview".into(), build_preview_value(plan)?);
+    }
+    if !warnings.is_empty() {
+        map.insert(
+            "warnings".into(),
+            serde_json::to_value(warnings).map_err(|e| FlowdError::Serialization(e.to_string()))?,
+        );
+    }
+    if let Some(flag) = clarification_reopened {
+        map.insert("clarification_reopened".into(), Value::Bool(flag));
     }
     Ok(payload)
+}
+
+/// Sum of outstanding questions and recorded decisions on a plan.
+///
+/// This is the metric the question budget caps. Decisions count too
+/// because every `Choose` answer that resolves a question still
+/// represents a question we asked the user; without that, a chatty
+/// compiler that resolves+reopens questions could circumvent the budget.
+fn clarification_load(plan: &Plan) -> usize {
+    plan.open_questions.len() + plan.decisions.len()
+}
+
+/// Build the `BudgetExceeded` warning payload. Centralised so the
+/// message phrasing stays consistent between the pre- and post-compile
+/// emission sites.
+fn budget_exceeded_warning(budget: usize, current: usize) -> ProsePlanWarning {
+    ProsePlanWarning {
+        code: WARN_BUDGET_EXCEEDED,
+        message: format!(
+            "clarification budget exceeded: {current} questions+decisions outstanding (limit {budget}); \
+             the next plan_answer call will coerce defer_remaining=true so the compiler converges"
+        ),
+        budget: Some(budget),
+        current: Some(current),
+    }
+}
+
+/// Build the `DeferRemainingCoerced` warning payload, used when the
+/// pre-flight budget check overrode `defer_remaining=false`.
+fn defer_coerced_warning(budget: usize, current: usize) -> ProsePlanWarning {
+    ProsePlanWarning {
+        code: WARN_DEFER_COERCED,
+        message: format!(
+            "defer_remaining was coerced to true: {current} questions+decisions exceed limit {budget}; \
+             the compiler is now expected to fill remaining questions on a best-effort basis"
+        ),
+        budget: Some(budget),
+        current: Some(current),
+    }
 }
 
 /// Compute a preview for a plan that already passes structural validation.
@@ -451,6 +567,21 @@ where
             plan = self.executor.status(plan_id).await?;
         }
 
+        // Pre-flight budget check. If the load is already at/over the
+        // budget, override `defer_remaining=false`: the compiler should
+        // be asked to converge rather than open another round. We accumulate
+        // the warning now so it lands in the response even if the compiler
+        // hands back a clean payload.
+        let mut warnings: Vec<ProsePlanWarning> = Vec::new();
+        let mut effective_defer = p.defer_remaining;
+        if let Some(budget) = self.question_budget {
+            let load = clarification_load(&plan);
+            if load >= budget && !effective_defer {
+                warnings.push(defer_coerced_warning(budget, load));
+                effective_defer = true;
+            }
+        }
+
         // Step 2: project to a snapshot and call the compiler. The
         // compiler is free to surface new questions in addition to the
         // ones the user just answered.
@@ -462,7 +593,7 @@ where
             .collect();
         let output = self
             .compiler
-            .apply_answers(snapshot, answers, p.defer_remaining)
+            .apply_answers(snapshot, answers, effective_defer)
             .await?;
 
         // Capture deltas before applying so we can emit them once the
@@ -478,7 +609,8 @@ where
         self.executor.apply_compile_output(plan_id, output).await?;
         let updated = self.executor.status(plan_id).await?;
         self.emit_clarification_deltas(&updated, new_question_ids, new_decision_ids);
-        prose_plan_payload(&updated)
+        self.maybe_push_budget_warning(&updated, &mut warnings);
+        prose_plan_payload_with(&updated, &warnings, None)
     }
 
     async fn plan_refine(&self, p: PlanRefineParams) -> Result<Value> {
@@ -497,6 +629,15 @@ where
             )));
         }
 
+        // Track which questions were already on the plan so we can decide
+        // whether the refine introduced *new* clarifications (the
+        // `clarification_reopened = true` case) or merely passed through
+        // pre-existing ones unchanged. The strict "reopened" semantic
+        // matches what callers actually want: "do I need to render a
+        // fresh question to the user as a result of this refine call?".
+        let prior_question_ids: std::collections::HashSet<String> =
+            plan.open_questions.iter().map(|q| q.id.clone()).collect();
+
         let snapshot = PlanDraftSnapshot::from_plan(&plan);
         let summary = truncate_summary(&p.feedback);
         let output = self.compiler.refine(snapshot, p.feedback).await?;
@@ -508,6 +649,10 @@ where
             .iter()
             .map(|d| d.question_id.clone())
             .collect();
+        let reopened = output
+            .open_questions
+            .iter()
+            .any(|q| !prior_question_ids.contains(&q.id));
 
         self.executor.apply_compile_output(plan_id, output).await?;
         let updated = self.executor.status(plan_id).await?;
@@ -520,7 +665,9 @@ where
             feedback_summary: summary,
         });
         self.emit_clarification_deltas(&updated, new_question_ids, new_decision_ids);
-        prose_plan_payload(&updated)
+        let mut warnings: Vec<ProsePlanWarning> = Vec::new();
+        self.maybe_push_budget_warning(&updated, &mut warnings);
+        prose_plan_payload_with(&updated, &warnings, Some(reopened))
     }
 
     async fn plan_confirm(&self, p: PlanConfirmParams) -> Result<Value> {
@@ -685,7 +832,21 @@ where
         // the persisted snapshot).
         let stored = self.executor.status(plan_id).await?;
         self.emit_clarification_deltas(&stored, new_question_ids, new_decision_ids);
-        prose_plan_payload(&stored)
+        let mut warnings: Vec<ProsePlanWarning> = Vec::new();
+        self.maybe_push_budget_warning(&stored, &mut warnings);
+        prose_plan_payload_with(&stored, &warnings, None)
+    }
+
+    /// Append a `BudgetExceeded` warning to `warnings` when the plan's
+    /// current load (questions + decisions) crosses the configured
+    /// budget. Inert when no budget is configured.
+    fn maybe_push_budget_warning(&self, plan: &Plan, warnings: &mut Vec<ProsePlanWarning>) {
+        if let Some(budget) = self.question_budget {
+            let load = clarification_load(plan);
+            if load > budget {
+                warnings.push(budget_exceeded_warning(budget, load));
+            }
+        }
     }
 }
 

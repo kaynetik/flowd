@@ -156,6 +156,53 @@ pub enum PlanAction {
         #[arg(short, long, value_delimiter = ',')]
         kind: Vec<String>,
     },
+
+    /// Submit answers to a Draft plan's open questions (offline mode).
+    ///
+    /// Refuses to run when the daemon is alive; in that case use the
+    /// `plan_answer` MCP tool so you exercise the same wiring as
+    /// every other client. Reads a JSON array of
+    /// `[{"question_id": "...", "kind": "choose", "option_id": "..."}]`
+    /// entries from `--file` (or stdin when `--file -`).
+    Answer {
+        /// Plan UUID.
+        plan_id: String,
+
+        /// JSON file containing the answers array. Pass `-` to read
+        /// from stdin. Optional when `--defer-remaining` is set.
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+
+        /// Ask the compiler to invent best-effort answers for any
+        /// still-open questions (mirrors `plan_answer`'s
+        /// `defer_remaining` flag).
+        #[arg(long)]
+        defer_remaining: bool,
+    },
+
+    /// Submit a freeform refinement instruction to a Draft plan
+    /// (offline mode). Refuses to run when the daemon is alive.
+    Refine {
+        /// Plan UUID.
+        plan_id: String,
+
+        /// Refinement instruction text. Mutually exclusive with
+        /// `--file`.
+        #[arg(short = 'm', long, conflicts_with = "file")]
+        feedback: Option<String>,
+
+        /// Read the refinement instruction from a file (or `-` for
+        /// stdin). Mutually exclusive with `--feedback`.
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+    },
+
+    /// Idempotently abandon a Draft / Confirmed plan (offline mode).
+    /// Refuses to run when the daemon is alive.
+    Cancel {
+        /// Plan UUID.
+        plan_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

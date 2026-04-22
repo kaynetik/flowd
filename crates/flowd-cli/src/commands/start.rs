@@ -41,14 +41,16 @@ use flowd_core::orchestration::observer::PlanObserver;
 use flowd_core::rules::{InMemoryRuleEvaluator, RuleEvaluator};
 use flowd_mcp::observer::{DEFAULT_HEALTH_INTERVAL, PlanEventObserver, PlanEventObserverConfig};
 use flowd_mcp::summarizer::NoopSummarizer;
-use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig, StubPlanCompiler};
+use flowd_mcp::{FlowdHandlers, McpServer, McpServerConfig};
 use flowd_onnx::provider::OnnxEmbedder;
 use flowd_storage::sqlite::SqliteBackend;
 use flowd_vector::qdrant::{QdrantConfig, QdrantIndex};
 
+use crate::config::FlowdConfig;
 use crate::daemon::PidFile;
 use crate::output::Style;
 use crate::paths::FlowdPaths;
+use crate::plan_compiler::DaemonPlanCompiler;
 use crate::spawner::BoxedSpawner;
 
 pub async fn run(
@@ -66,6 +68,19 @@ pub async fn run(
         "{} pid file at {}",
         style.green("started"),
         pid.path().display()
+    );
+
+    // Load `flowd.toml` (or fall back to defaults if absent) before any
+    // other wiring so a malformed file fails fast, before the daemon
+    // burns a Qdrant connection or rehydrates the executor.
+    let config_path = FlowdConfig::default_path(&paths.home);
+    let config = FlowdConfig::load(&config_path)
+        .with_context(|| format!("load flowd config from {}", config_path.display()))?;
+    eprintln!(
+        "{} config (compiler: {}, max_questions: {})",
+        style.cyan("loaded"),
+        config.plan.compiler.wire_name(),
+        config.plan.max_questions,
     );
 
     // ---- Memory backends (shared between live handlers & compactor) ----
@@ -117,19 +132,23 @@ pub async fn run(
         .await
         .map_err(|e| anyhow::anyhow!("rehydrate orchestration plans: {e}"))?;
 
-    // Prose-first plan creation (HL-44). The daemon ships with the
-    // [`StubPlanCompiler`]: a deterministic, dependency-free parser that
-    // accepts already-structured markdown prose
-    // (`## <id> [agent: <type>] depends_on: [...]\n<prompt>`) and turns
-    // it into a `PlanDefinition`. When the prose is freeform, the stub
-    // surfaces a single open question asking for restructured input so
-    // the loop is closeable without an LLM. The LLM-backed compiler
-    // (`LlmPlanCompiler`) is shipped as a skeleton today; its real
-    // implementation lands in a follow-up PR and replaces this binding.
-    let plan_compiler = Arc::new(StubPlanCompiler::new());
+    // Prose-first plan creation (HL-44). The compiler is selected at
+    // startup from `flowd.toml`'s `[plan].compiler` key; a sum-type
+    // wrapper ([`DaemonPlanCompiler`]) keeps `FlowdHandlers` statically
+    // dispatched while still letting the operator switch implementations
+    // without recompiling. Today this picks between the deterministic
+    // [`StubPlanCompiler`] (markdown parser, default) and
+    // [`RejectingPlanCompiler`] (every prose-first call errors -- use
+    // this to disable the feature at the deployment level). The
+    // upcoming `LlmPlanCompiler` lands as a third variant.
+    let plan_compiler = Arc::new(
+        DaemonPlanCompiler::from_selection(config.plan.compiler)
+            .map_err(|e| anyhow::anyhow!("instantiate plan compiler: {e}"))?,
+    );
 
     let handlers = Arc::new(
         FlowdHandlers::new(memory_service, executor, plan_compiler, rules)
+            .with_question_budget(Some(config.plan.max_questions))
             .with_activity_monitor(monitor)
             // Share the plan-event sink with the executor so clarification
             // and refinement transitions land in the same audit log as

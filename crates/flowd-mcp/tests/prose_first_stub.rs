@@ -33,9 +33,7 @@ use flowd_core::memory::{EmbeddingProvider, VectorIndex};
 use flowd_core::orchestration::{AgentOutput, AgentSpawner, InMemoryPlanExecutor, PlanStep};
 use flowd_core::rules::InMemoryRuleEvaluator;
 use flowd_core::types::Embedding;
-use flowd_mcp::tools::{
-    PlanConfirmParams, PlanCreateParams, PlanRefineParams, PlanStatusParams,
-};
+use flowd_mcp::tools::{PlanConfirmParams, PlanCreateParams, PlanRefineParams, PlanStatusParams};
 use flowd_mcp::{FlowdHandlers, McpHandlers, StubPlanCompiler};
 use flowd_storage::plan_store::SqlitePlanStore;
 use flowd_storage::sqlite::SqliteBackend;

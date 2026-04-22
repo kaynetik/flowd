@@ -134,6 +134,10 @@ struct Harness {
 }
 
 fn build_harness(script: Vec<CompileOutput>) -> Harness {
+    build_harness_with_budget(script, None)
+}
+
+fn build_harness_with_budget(script: Vec<CompileOutput>, budget: Option<usize>) -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     let db_path = tmp.path().join("flowd.db");
     let backend = SqliteBackend::open(&db_path).expect("open sqlite");
@@ -152,7 +156,8 @@ fn build_harness(script: Vec<CompileOutput>) -> Harness {
     let observer = Arc::new(RecordingObserver::default());
     let handlers = Arc::new(
         FlowdHandlers::new(memory, executor, compiler, rules)
-            .with_observer(Arc::clone(&observer) as SharedPlanObserver),
+            .with_observer(Arc::clone(&observer) as SharedPlanObserver)
+            .with_question_budget(budget),
     );
     Harness {
         _tmp: tmp,
@@ -532,6 +537,184 @@ async fn plan_cancel_terminates_a_draft_plan_idempotently() {
         .await
         .unwrap();
     assert_eq!(again["status"], "cancelled");
+}
+
+#[tokio::test]
+async fn plan_refine_sets_clarification_reopened_flag_when_introducing_questions() {
+    let h = build_harness(vec![
+        // Round 1: clean compile -> no questions, definition present.
+        CompileOutput::ready("# v0", echo_def("draft-v0")),
+        // Round 2 (refine): compiler decides the change opens a new
+        // architectural question and surfaces it.
+        CompileOutput::pending("# v1", vec![question("q1", vec![opt("a", "A")])]),
+    ]);
+
+    let created = h
+        .handlers
+        .plan_create(PlanCreateParams {
+            project: "rnd".into(),
+            definition: None,
+            prose: Some("seed".into()),
+        })
+        .await
+        .unwrap();
+    let plan_id = created["plan_id"].as_str().unwrap().to_owned();
+
+    let refined = h
+        .handlers
+        .plan_refine(PlanRefineParams {
+            plan_id,
+            feedback: "tighten error handling".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(refined["status"], "draft");
+    assert_eq!(refined["clarification_reopened"], true);
+    assert_eq!(refined["open_questions"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn plan_refine_clarification_reopened_is_false_when_dag_compiled_cleanly() {
+    let h = build_harness(vec![
+        CompileOutput::ready("# v0", echo_def("draft-v0")),
+        // Refine compiles cleanly again -- no questions surfaced.
+        CompileOutput::ready("# v1", echo_def("draft-v1")),
+    ]);
+
+    let created = h
+        .handlers
+        .plan_create(PlanCreateParams {
+            project: "rnd".into(),
+            definition: None,
+            prose: Some("seed".into()),
+        })
+        .await
+        .unwrap();
+    let plan_id = created["plan_id"].as_str().unwrap().to_owned();
+
+    let refined = h
+        .handlers
+        .plan_refine(PlanRefineParams {
+            plan_id,
+            feedback: "rename a step".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(refined["clarification_reopened"], false);
+    assert!(refined.get("preview").is_some());
+}
+
+#[tokio::test]
+async fn plan_answer_emits_budget_exceeded_warning_when_load_overflows() {
+    // Tight budget = 1; the first round surfaces 2 questions on its
+    // own which is already over budget.
+    let h = build_harness_with_budget(
+        vec![
+            CompileOutput::pending(
+                "# r1",
+                vec![
+                    question("q1", vec![opt("a", "A")]),
+                    question("q2", vec![opt("a", "A")]),
+                ],
+            ),
+            // Round 2: q1 answered, q2 still open -> 1 decision + 1 question = 2 (still > 1).
+            CompileOutput {
+                source_doc: "# r2".into(),
+                open_questions: vec![question("q2", vec![opt("a", "A")])],
+                new_decisions: vec![flowd_core::orchestration::DecisionRecord {
+                    question_id: "q1".into(),
+                    chosen_option_id: "a".into(),
+                    depends_on_decisions: vec![],
+                    auto: false,
+                    decided_at: chrono::Utc::now(),
+                }],
+                definition: None,
+            },
+        ],
+        Some(1),
+    );
+
+    let created = h
+        .handlers
+        .plan_create(PlanCreateParams {
+            project: "rnd".into(),
+            definition: None,
+            prose: Some("anything".into()),
+        })
+        .await
+        .unwrap();
+    // First round already over budget -> warning surfaces on plan_create.
+    let warnings = created["warnings"]
+        .as_array()
+        .expect("warnings on plan_create");
+    let codes: Vec<&str> = warnings
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        codes.contains(&"BudgetExceeded"),
+        "got codes: {codes:?} payload: {created:#}"
+    );
+
+    let plan_id = created["plan_id"].as_str().unwrap().to_owned();
+
+    // Second round: pre-flight sees load == 2 (>= 1), so defer is
+    // coerced and a DeferRemainingCoerced warning is emitted *as well
+    // as* the post-compile BudgetExceeded one.
+    let answered = h
+        .handlers
+        .plan_answer(PlanAnswerParams {
+            plan_id,
+            answers: vec![PlanAnswerEntry {
+                question_id: "q1".into(),
+                answer: flowd_core::orchestration::Answer::Choose {
+                    option_id: "a".into(),
+                },
+            }],
+            defer_remaining: false,
+        })
+        .await
+        .unwrap();
+    let codes: Vec<&str> = answered["warnings"]
+        .as_array()
+        .expect("warnings on plan_answer")
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert!(
+        codes.contains(&"DeferRemainingCoerced"),
+        "expected DeferRemainingCoerced in {codes:?}"
+    );
+    assert!(
+        codes.contains(&"BudgetExceeded"),
+        "expected BudgetExceeded in {codes:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_warnings_emitted_when_budget_is_unset() {
+    let h = build_harness(vec![CompileOutput::pending(
+        "# r1",
+        vec![
+            question("q1", vec![opt("a", "A")]),
+            question("q2", vec![opt("a", "A")]),
+            question("q3", vec![opt("a", "A")]),
+        ],
+    )]);
+
+    let created = h
+        .handlers
+        .plan_create(PlanCreateParams {
+            project: "rnd".into(),
+            definition: None,
+            prose: Some("anything".into()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        created.get("warnings").is_none(),
+        "no warnings field when budget unset; got {created:#}"
+    );
 }
 
 // ---------- Helpers -------------------------------------------------------
