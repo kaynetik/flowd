@@ -1,0 +1,53 @@
+# flowd runtime configuration for this repo.
+#
+# Loaded from $FLOWD_HOME/flowd.toml (i.e. ~/.flowd/flowd.toml in the
+# default install). To use *this* file as the active config, either:
+#   * symlink it:  ln -s "$PWD/flowd.toml" ~/.flowd/flowd.toml
+#   * copy it:     cp flowd.toml ~/.flowd/flowd.toml
+#   * point at it: FLOWD_HOME="$PWD" flowd start
+#
+# The defaults shipped by the binary already select the LLM compiler
+# and the local `claude` CLI transport, so this file's only job is to
+# pin the model + effort tier we want for *this* project's plans.
+
+[plan]
+# Use the LLM-backed prose-first compiler (instead of the deterministic
+# stub). Every plan_create / plan_answer / plan_refine round-trips
+# through the configured backend below.
+compiler      = "llm"
+
+# Generous question budget; this repo's refactors tend to surface
+# multi-step clarifications and we'd rather hit a soft warning than
+# truncate the conversation.
+max_questions = 20
+
+[plan.llm]
+provider = "claude-cli"
+
+[plan.llm.claude_cli]
+# Pin Opus 4.7 explicitly (rather than the `"opus"` alias) so plans
+# stay byte-for-byte reproducible across hosts even after Anthropic
+# ships a newer Opus snapshot. Drop back to `"opus"` if you want the
+# alias to auto-resolve to the latest build.
+model        = "claude-opus-4-7"
+binary       = "claude"
+# Opus + high effort is slow; 480s leaves headroom for chunky compile
+# rounds without masking actually-stuck calls.
+timeout_secs = 480
+# Force the strongest reasoning tier the CLI exposes. Overrides
+# whatever `effortLevel` is set in ~/.claude/settings.json, so flowd's
+# plans don't silently degrade when you flip your interactive default.
+effort       = "high"
+
+# Two-tier escalation: plan_refine() routes through this block, while
+# plan_create / plan_answer keep using the primary above. We bump
+# effort to "max" for the refine pass because that's the call where we
+# explicitly asked the model to think harder.
+[plan.llm.refine]
+provider = "claude-cli"
+
+[plan.llm.refine.claude_cli]
+model        = "claude-opus-4-7"
+binary       = "claude"
+timeout_secs = 600
+effort       = "max"

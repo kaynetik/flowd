@@ -362,6 +362,7 @@ fn build_claude_cli(cfg: &ClaudeCliConfig) -> Result<LlmPlanCompiler<DaemonLlmCa
     let cb = ClaudeCliCallback::new(McpClaudeCliConfig {
         binary: cfg.binary.clone(),
         model: cfg.model.clone(),
+        effort: cfg.effort,
         timeout: Duration::from_secs(cfg.timeout_secs),
     });
     Ok(LlmPlanCompiler::new(Arc::new(

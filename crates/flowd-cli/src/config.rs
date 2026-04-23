@@ -48,10 +48,16 @@
 //! # `haiku`) -- which auto-resolve to the current latest build of
 //! # that tier -- and fully-pinned model identifiers (see
 //! # `claude --help`). Operators who need byte-for-byte reproducible
-//! # plans should pin a specific identifier.
-//! model        = "sonnet"
+//! # plans should pin a specific identifier (e.g. `claude-opus-4-7`).
+//! model        = "opus"
 //! binary       = "claude"   # path or executable name resolved on $PATH
-//! timeout_secs = 120
+//! timeout_secs = 240
+//! # Optional reasoning-effort override forwarded as `--effort <level>`.
+//! # Accepts: "low" | "medium" | "high" | "xhigh" | "max". Omit (or
+//! # comment out) to let the CLI's own resolution order win
+//! # (env -> ~/.claude/settings.json -> model default), which is what
+//! # operators who already pin `effortLevel` interactively want.
+//! # effort     = "high"
 //!
 //! # Subsection consumed when provider = "mlx".
 //! #
@@ -105,6 +111,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use flowd_mcp::ClaudeEffort;
 use serde::Deserialize;
 
 /// Default question budget. Matches the value documented in the
@@ -117,15 +124,17 @@ pub const DEFAULT_MAX_QUESTIONS: usize = 12;
 /// Default model id passed to the local `claude` CLI when
 /// `provider = "claude-cli"`.
 ///
-/// The CLI accepts both tier aliases (`sonnet`, `opus`, `haiku`) and
-/// fully-pinned identifiers; we default to the `"sonnet"` alias because
-/// it is the balanced tier (good instruction-following, lower latency
-/// and cost than Opus) and it auto-resolves to the latest Sonnet build
-/// the operator's `claude` install knows about, so the default does
-/// not bit-rot when Anthropic ships a new model. Operators who want a
-/// stronger tier set this to `"opus"`; those who want byte-for-byte
-/// reproducible plans pin a specific identifier from `claude --help`.
-pub const DEFAULT_CLAUDE_CLI_MODEL: &str = "sonnet";
+/// We default to the `"opus"` alias -- plan compilation is
+/// quality-sensitive (a botched plan cascades into wasted tool calls
+/// downstream), and operators on Anthropic's MAX subscription pay for
+/// Opus access whether they use it or not, so spending the latency on
+/// the strongest tier by default is the cheap call. Aliases auto-resolve
+/// to the latest build of that tier so this default does not bit-rot
+/// when Anthropic ships a new Opus snapshot. Operators who want
+/// byte-for-byte reproducible plans pin a specific identifier (e.g.
+/// `claude-opus-4-7`); those who want lower latency / cost set this to
+/// `"sonnet"` or `"haiku"`.
+pub const DEFAULT_CLAUDE_CLI_MODEL: &str = "opus";
 
 /// Default `binary` for the Claude CLI backend. Resolved on `$PATH`
 /// when the value contains no path separator; treated as a literal
@@ -133,10 +142,12 @@ pub const DEFAULT_CLAUDE_CLI_MODEL: &str = "sonnet";
 pub const DEFAULT_CLAUDE_CLI_BINARY: &str = "claude";
 
 /// Default per-request timeout for the Claude CLI shell-out. Latency
-/// varies with prompt size and the model's reasoning depth; 120s
-/// leaves headroom for Opus-tier responses while still failing fast
-/// enough to be useful in an interactive loop.
-pub const DEFAULT_CLAUDE_CLI_TIMEOUT_SECS: u64 = 120;
+/// varies with prompt size and the model's reasoning depth; 240s
+/// leaves headroom for Opus-tier responses (especially with high
+/// `effort`) while still failing fast enough to be useful in an
+/// interactive loop. Operators on Sonnet/Haiku can comfortably halve
+/// this if they want tighter feedback on hung calls.
+pub const DEFAULT_CLAUDE_CLI_TIMEOUT_SECS: u64 = 240;
 
 // -- MLX defaults -----------------------------------------------------------
 //
@@ -295,6 +306,8 @@ struct RawClaudeCliConfig {
     binary: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 /// Resolved `[plan.llm.claude_cli]` block.
@@ -305,6 +318,14 @@ pub struct ClaudeCliConfig {
     /// an absolute / relative path to the binary.
     pub binary: PathBuf,
     pub timeout_secs: u64,
+    /// Optional reasoning-effort override forwarded to `claude -p` as
+    /// `--effort <level>`. `None` (the default, and the value used when
+    /// the operator omits the key) leaves the flag off the command line
+    /// so the CLI's own resolution order applies (env, then
+    /// `~/.claude/settings.json`'s `effortLevel`, then the model's
+    /// built-in default). `Some` pins the tier for every daemon-issued
+    /// request, overriding interactive defaults.
+    pub effort: Option<ClaudeEffort>,
 }
 
 impl Default for ClaudeCliConfig {
@@ -313,6 +334,7 @@ impl Default for ClaudeCliConfig {
             model: DEFAULT_CLAUDE_CLI_MODEL.to_string(),
             binary: PathBuf::from(DEFAULT_CLAUDE_CLI_BINARY),
             timeout_secs: DEFAULT_CLAUDE_CLI_TIMEOUT_SECS,
+            effort: None,
         }
     }
 }
@@ -341,12 +363,31 @@ impl ClaudeCliConfig {
         if timeout_secs == 0 {
             return Err(anyhow!("[plan.llm.claude_cli] timeout_secs must be > 0"));
         }
+        let effort = parse_optional_effort(raw.effort.as_deref(), "[plan.llm.claude_cli]")?;
         Ok(Self {
             model,
             binary,
             timeout_secs,
+            effort,
         })
     }
+}
+
+/// Parse a `[plan.llm.*.claude_cli].effort` value. `None` and the
+/// empty string both resolve to "no override"; anything else must
+/// match a `ClaudeEffort` variant or we error with a section pointer
+/// so the operator knows which block to fix.
+fn parse_optional_effort(raw: Option<&str>, section: &str) -> Result<Option<ClaudeEffort>> {
+    let Some(s) = raw else { return Ok(None) };
+    if s.trim().is_empty() {
+        return Ok(None);
+    }
+    ClaudeEffort::try_from_str(s).map(Some).map_err(|bad| {
+        anyhow!(
+            "{section} effort = \"{bad}\" is not a known reasoning tier; \
+             expected one of: \"low\", \"medium\", \"high\", \"xhigh\", \"max\""
+        )
+    })
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -922,6 +963,71 @@ mod tests {
         let (_d, p) = write_cfg("[plan.llm.claude_cli]\nbinary = \"\"\n");
         let err = FlowdConfig::load(&p).unwrap_err();
         assert!(format!("{err:#}").contains("binary"));
+    }
+
+    #[test]
+    fn claude_cli_default_model_is_opus() {
+        // Belt-and-braces: the default exists for a reason (see the
+        // doc on DEFAULT_CLAUDE_CLI_MODEL), and a silent flip back to
+        // sonnet would change real users' bills, so pin it here.
+        let cfg = FlowdConfig::default();
+        assert_eq!(cfg.plan.llm.claude_cli.model, "opus");
+        assert_eq!(DEFAULT_CLAUDE_CLI_MODEL, "opus");
+    }
+
+    #[test]
+    fn claude_cli_effort_defaults_to_none() {
+        let (_d, p) = write_cfg("[plan.llm.claude_cli]\n");
+        let cfg = FlowdConfig::load(&p).unwrap();
+        assert!(cfg.plan.llm.claude_cli.effort.is_none());
+    }
+
+    #[test]
+    fn claude_cli_effort_canonical_token_resolves() {
+        let (_d, p) = write_cfg("[plan.llm.claude_cli]\neffort = \"high\"\n");
+        let cfg = FlowdConfig::load(&p).unwrap();
+        assert_eq!(cfg.plan.llm.claude_cli.effort, Some(ClaudeEffort::High));
+    }
+
+    #[test]
+    fn claude_cli_effort_alias_token_resolves() {
+        let (_d, p) = write_cfg("[plan.llm.claude_cli]\neffort = \"extra-high\"\n");
+        let cfg = FlowdConfig::load(&p).unwrap();
+        assert_eq!(cfg.plan.llm.claude_cli.effort, Some(ClaudeEffort::Xhigh));
+    }
+
+    #[test]
+    fn claude_cli_effort_unknown_token_is_rejected_with_section_pointer() {
+        let (_d, p) = write_cfg("[plan.llm.claude_cli]\neffort = \"turbo\"\n");
+        let err = FlowdConfig::load(&p).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("[plan.llm.claude_cli]"), "{msg}");
+        assert!(msg.contains("turbo"), "{msg}");
+        assert!(msg.contains("\"high\""), "{msg}");
+    }
+
+    #[test]
+    fn claude_cli_effort_empty_string_resolves_to_none() {
+        // An empty string is what serde produces for `effort = ""` --
+        // we treat it the same as the key being absent so operators
+        // can blank-out a setting without commenting the whole line.
+        let (_d, p) = write_cfg("[plan.llm.claude_cli]\neffort = \"\"\n");
+        let cfg = FlowdConfig::load(&p).unwrap();
+        assert!(cfg.plan.llm.claude_cli.effort.is_none());
+    }
+
+    #[test]
+    fn claude_cli_effort_round_trips_through_refine_block() {
+        let (_d, p) = write_cfg(
+            "[plan.llm.refine]\nprovider = \"claude-cli\"\n\n\
+             [plan.llm.refine.claude_cli]\n\
+             model  = \"claude-opus-4-7\"\n\
+             effort = \"max\"\n",
+        );
+        let cfg = FlowdConfig::load(&p).unwrap();
+        let refine = cfg.plan.llm.refine.unwrap();
+        assert_eq!(refine.claude_cli.model, "claude-opus-4-7");
+        assert_eq!(refine.claude_cli.effort, Some(ClaudeEffort::Max));
     }
 
     // -------- [plan.llm.mlx] -- carries over from the old flat layout ----

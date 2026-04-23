@@ -379,6 +379,7 @@ fn log_llm_startup(style: Style, cfg: &LlmConfig) -> Result<()> {
         let cli_cfg = McpClaudeCliConfig {
             binary: cfg.claude_cli.binary.clone(),
             model: cfg.claude_cli.model.clone(),
+            effort: cfg.claude_cli.effort,
             timeout: Duration::from_secs(cfg.claude_cli.timeout_secs),
         };
         let resolved = ClaudeCliCallback::probe_binary(&cli_cfg).with_context(
@@ -411,11 +412,18 @@ fn log_provider_line(style: Style, label: &str, provider: LlmProvider, cfg: &Llm
 /// not data.
 fn describe_provider_model(provider: LlmProvider, cfg: &LlmConfig) -> String {
     match provider {
-        LlmProvider::ClaudeCli => format!(
-            "{} binary={}",
-            cfg.claude_cli.model,
-            cfg.claude_cli.binary.display()
-        ),
+        LlmProvider::ClaudeCli => {
+            let effort = cfg
+                .claude_cli
+                .effort
+                .map(|l| format!(" effort={}", l.wire_name()))
+                .unwrap_or_default();
+            format!(
+                "{} binary={}{effort}",
+                cfg.claude_cli.model,
+                cfg.claude_cli.binary.display(),
+            )
+        }
         LlmProvider::Mlx => format!("{} url={}", cfg.mlx.model, cfg.mlx.base_url),
         LlmProvider::ClaudeHttp => format!(
             "{} url={} (transport not yet implemented)",

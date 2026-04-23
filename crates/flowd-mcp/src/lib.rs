@@ -27,7 +27,8 @@ pub mod tools;
 pub use compiler::{LlmCallback, LlmPlanCompiler, RejectingPlanCompiler, StubPlanCompiler};
 pub use handlers::{FlowdHandlers, McpHandlers};
 pub use llm::{
-    ClaudeCliCallback, ClaudeCliConfig, OpenAiCompatibleCallback, OpenAiCompatibleConfig,
+    ClaudeCliCallback, ClaudeCliConfig, ClaudeEffort, OpenAiCompatibleCallback,
+    OpenAiCompatibleConfig,
 };
 pub use observer::{
     DEFAULT_CAPACITY as PLAN_EVENT_DEFAULT_CAPACITY, ObserverHealth, PlanEventObserver,

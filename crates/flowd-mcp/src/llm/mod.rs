@@ -22,5 +22,5 @@
 pub mod claude_cli;
 pub mod openai;
 
-pub use claude_cli::{ClaudeCliCallback, ClaudeCliConfig};
+pub use claude_cli::{ClaudeCliCallback, ClaudeCliConfig, ClaudeEffort};
 pub use openai::{OpenAiCompatibleCallback, OpenAiCompatibleConfig};

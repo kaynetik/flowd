@@ -447,8 +447,7 @@ mod tests {
 
     #[test]
     fn load_repo_dot_flowd_rules_flat_layout_regression() {
-        let rules_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.flowd/rules");
+        let rules_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.flowd/rules");
         assert!(
             rules_dir.is_dir(),
             "expected {} (repo .flowd/rules)",

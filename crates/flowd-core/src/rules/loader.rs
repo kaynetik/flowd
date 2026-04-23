@@ -96,12 +96,11 @@ fn collect_rule_yaml_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(dir)
         .map_err(|e| FlowdError::RuleLoad(format!("read dir {}: {e}", dir.display())))?
     {
-        let entry = entry
-            .map_err(|e| FlowdError::RuleLoad(format!("iter dir {}: {e}", dir.display())))?;
+        let entry =
+            entry.map_err(|e| FlowdError::RuleLoad(format!("iter dir {}: {e}", dir.display())))?;
         let path = entry.path();
-        let meta = fs::symlink_metadata(&path).map_err(|e| {
-            FlowdError::RuleLoad(format!("stat {}: {e}", path.display()))
-        })?;
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|e| FlowdError::RuleLoad(format!("stat {}: {e}", path.display())))?;
 
         if meta.file_type().is_symlink() {
             continue;

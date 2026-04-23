@@ -15,7 +15,7 @@
 //! We invoke the binary as
 //!
 //! ```text
-//! <binary> -p --model <model> --output-format text
+//! <binary> -p --model <model> --output-format text [--effort <level>]
 //! ```
 //!
 //! and pipe the prompt to its stdin. Stdin (rather than `--prompt
@@ -29,6 +29,13 @@
 //! callback's caller (the compiler's response parser) sees the model
 //! response verbatim and can apply the same fence-stripping +
 //! `{...}` extraction it already runs on every backend.
+//!
+//! `--effort <level>` is appended only when [`ClaudeCliConfig::effort`]
+//! is `Some`. The CLI accepts `low | medium | high | xhigh | max`; a
+//! `None` here means "let the CLI pick", which matches the semantics of
+//! omitting the flag entirely (the user's `~/.claude/settings.json`
+//! `effortLevel` then takes effect, falling through to the model's own
+//! default when even that is absent).
 //!
 //! ## Errors and timeouts
 //!
@@ -52,6 +59,69 @@ use tokio::process::Command;
 
 use crate::compiler::LlmCallback;
 
+/// Reasoning-effort tier passed to `claude -p` via `--effort`.
+///
+/// Mirrors the values the CLI itself accepts (`claude --help` calls
+/// these out as `low | medium | high | xhigh | max`). Modeled as a
+/// closed enum -- rather than a free-form string -- so the daemon
+/// rejects typos at config-load time instead of at request time when
+/// the CLI would itself reject the flag with a noisier error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClaudeEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ClaudeEffort {
+    /// Stable wire token, matching what `claude -p --effort <level>`
+    /// expects on the command line. Keep this 1:1 with the CLI's
+    /// own help output so a copy-paste from there into `flowd.toml`
+    /// always works.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parse a TOML / config token into an effort tier.
+    ///
+    /// Accepts any case (`HIGH` and `high` both work) so operators are
+    /// not surprised by their own capitalization, and tolerates the
+    /// historical `extra-high` / `extra_high` / `x-high` spellings as
+    /// aliases for [`Self::Xhigh`] -- the CLI's compact `xhigh` token
+    /// reads as a typo to a fresh pair of eyes, so we accept the more
+    /// obvious forms too.
+    ///
+    /// # Errors
+    /// Returns the rejected token (already trimmed and lower-cased)
+    /// inside the `Err` variant so the caller can splice it into a
+    /// section-pointing error message without re-doing the work.
+    //
+    // Fully-qualified `core::result::Result` because this module
+    // imports `flowd_core::error::Result` as the bare `Result` for
+    // every other API; using the std two-variant `Result` here keeps
+    // the parser independent of `FlowdError`.
+    pub fn try_from_str(raw: &str) -> core::result::Result<Self, String> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "low" => Ok(Self::Low),
+            "medium" | "med" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" | "x-high" | "x_high" | "extra-high" | "extra_high" => Ok(Self::Xhigh),
+            "max" => Ok(Self::Max),
+            _ => Err(normalized),
+        }
+    }
+}
+
 /// Configuration for [`ClaudeCliCallback`].
 ///
 /// All fields come straight from `[plan.llm.claude_cli]` in
@@ -71,6 +141,12 @@ pub struct ClaudeCliConfig {
     /// fully-pinned identifiers (e.g. `claude-sonnet-4-5`) reproduce
     /// byte-for-byte across hosts.
     pub model: String,
+    /// Optional reasoning-effort override forwarded as `--effort
+    /// <level>`. `None` omits the flag entirely so the CLI applies its
+    /// own resolution order (env, `~/.claude/settings.json`, model
+    /// default); `Some` pins the tier for every request the daemon
+    /// makes regardless of the operator's interactive defaults.
+    pub effort: Option<ClaudeEffort>,
     /// Per-request timeout. Caps the entire shell-out (start + stdin
     /// write + stdout read + reap), not just the model's first byte.
     pub timeout: Duration,
@@ -169,19 +245,28 @@ impl LlmCallback for ClaudeCliCallback {
     fn complete(&self, prompt: String) -> impl Future<Output = Result<String>> + Send {
         let cfg = self.cfg.clone();
         async move {
-            let mut child = Command::new(&cfg.binary)
+            let mut command = Command::new(&cfg.binary);
+            command
                 .arg("-p")
                 .arg("--model")
                 .arg(&cfg.model)
                 .arg("--output-format")
-                .arg("text")
+                .arg("text");
+            if let Some(level) = cfg.effort {
+                command.arg("--effort").arg(level.wire_name());
+            }
+            let mut child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| {
+                    let effort_hint = cfg
+                        .effort
+                        .map(|l| format!(" --effort {}", l.wire_name()))
+                        .unwrap_or_default();
                     FlowdError::Internal(format!(
-                        "spawn `{} -p --model {}`: {e}; \
+                        "spawn `{} -p --model {}{effort_hint}`: {e}; \
                          is the Claude CLI installed and on $PATH?",
                         cfg.binary.display(),
                         cfg.model
@@ -275,6 +360,7 @@ mod tests {
         ClaudeCliConfig {
             binary,
             model: "sonnet".into(),
+            effort: None,
             timeout: Duration::from_secs(5),
         }
     }
@@ -449,6 +535,7 @@ mod tests {
         let cfg = ClaudeCliConfig {
             binary: path,
             model: "sonnet".into(),
+            effort: None,
             timeout: Duration::from_millis(150),
         };
         let cb = ClaudeCliCallback::new(cfg);
@@ -465,6 +552,101 @@ mod tests {
         let cb = ClaudeCliCallback::new(cfg_for(path));
         let out = cb.complete("hello via stdin".into()).await.unwrap();
         assert_eq!(out, "hello via stdin");
+    }
+
+    /// `effort = None` (the daemon-wide default) must omit `--effort`
+    /// entirely so the CLI can apply its own resolution order
+    /// (env -> `~/.claude/settings.json` -> model default). Verified
+    /// with a fake `claude` that prints its own argv -- if a stray
+    /// `--effort` appears we'd see it in the assertion.
+    #[tokio::test]
+    async fn complete_does_not_emit_effort_flag_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fake_claude(
+            &dir,
+            "claude",
+            "#!/bin/sh\n/bin/cat > /dev/null\nprintf '%s\\n' \"$@\"\n",
+        );
+        let cb = ClaudeCliCallback::new(cfg_for(path));
+        let out = cb.complete("anything".into()).await.unwrap();
+        assert!(!out.contains("--effort"), "{out}");
+    }
+
+    /// When `effort = Some(_)` we expect the CLI invocation to carry
+    /// `--effort <wire>` exactly once, with the wire token matching
+    /// what `claude --help` documents.
+    #[tokio::test]
+    async fn complete_emits_effort_flag_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fake_claude(
+            &dir,
+            "claude",
+            "#!/bin/sh\n/bin/cat > /dev/null\nprintf '%s\\n' \"$@\"\n",
+        );
+        let cfg = ClaudeCliConfig {
+            binary: path,
+            model: "opus".into(),
+            effort: Some(ClaudeEffort::High),
+            timeout: Duration::from_secs(5),
+        };
+        let cb = ClaudeCliCallback::new(cfg);
+        let out = cb.complete("anything".into()).await.unwrap();
+        // The fake prints one arg per line; assert both the flag
+        // and its value land in the argv as adjacent tokens.
+        let lines: Vec<&str> = out.lines().collect();
+        let idx = lines
+            .iter()
+            .position(|l| *l == "--effort")
+            .unwrap_or_else(|| panic!("--effort missing from argv: {out}"));
+        assert_eq!(lines.get(idx + 1).copied(), Some("high"), "{out}");
+    }
+
+    // ---- ClaudeEffort -------------------------------------------------
+
+    #[test]
+    fn effort_wire_names_are_stable() {
+        assert_eq!(ClaudeEffort::Low.wire_name(), "low");
+        assert_eq!(ClaudeEffort::Medium.wire_name(), "medium");
+        assert_eq!(ClaudeEffort::High.wire_name(), "high");
+        assert_eq!(ClaudeEffort::Xhigh.wire_name(), "xhigh");
+        assert_eq!(ClaudeEffort::Max.wire_name(), "max");
+    }
+
+    #[test]
+    fn effort_parser_accepts_canonical_tokens_case_insensitively() {
+        assert_eq!(
+            ClaudeEffort::try_from_str("low").unwrap(),
+            ClaudeEffort::Low
+        );
+        assert_eq!(
+            ClaudeEffort::try_from_str("HIGH").unwrap(),
+            ClaudeEffort::High
+        );
+        assert_eq!(
+            ClaudeEffort::try_from_str("  xhigh ").unwrap(),
+            ClaudeEffort::Xhigh
+        );
+        assert_eq!(
+            ClaudeEffort::try_from_str("max").unwrap(),
+            ClaudeEffort::Max
+        );
+    }
+
+    #[test]
+    fn effort_parser_accepts_xhigh_aliases() {
+        for alias in ["x-high", "x_high", "extra-high", "extra_high"] {
+            assert_eq!(
+                ClaudeEffort::try_from_str(alias).unwrap(),
+                ClaudeEffort::Xhigh,
+                "{alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_parser_rejects_unknown_token_with_normalized_value() {
+        let err = ClaudeEffort::try_from_str(" Turbo ").unwrap_err();
+        assert_eq!(err, "turbo");
     }
 
     // ---- helpers -------------------------------------------------------
