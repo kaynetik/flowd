@@ -18,5 +18,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
