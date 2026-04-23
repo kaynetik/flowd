@@ -2,6 +2,22 @@
 
 Local-first memory, orchestration, and rules engine for AI coding agents. Exposes an MCP server so Claude Code and Cursor can persist context, run multi-step plans, and gate actions against user-defined rules.
 
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Install](#install)
+  - [Qdrant via Podman](#qdrant-via-podman)
+- [Intended usage flow](#intended-usage-flow)
+  - [1. Check status](#1-check-status)
+  - [2. Wire your agent](#2-wire-your-agent)
+  - [3. Use the agent](#3-use-the-agent)
+  - [4. Observe out-of-band](#4-observe-out-of-band)
+  - [5. Inspect](#5-inspect)
+  - [6. Shut down](#6-shut-down)
+- [Recommendations](#recommendations)
+- [Development](#development)
+- [License](#license)
+
 ## Architecture
 
 Five crates, no implicit coupling:
@@ -31,7 +47,7 @@ Build and install:
 cargo install --path crates/flowd-cli
 ```
 
-The binary is named `flowd`. Put it on `$PATH`.
+This writes the `flowd` binary to `~/.cargo/bin`, which should already be on `$PATH` if you installed Rust via `rustup`.
 
 ### Qdrant via Podman
 
@@ -59,6 +75,20 @@ podman stop qdrant
 podman logs -f qdrant
 ```
 
+#### Autostart on Linux (user systemd)
+
+`--restart=unless-stopped` only fires while the user's Podman session is alive, so on a fresh login (or after reboot) the container stays down. To make Qdrant survive both, generate a user systemd unit from the running container and enable lingering so the unit keeps running after logout:
+
+```bash
+mkdir -p ~/.config/systemd/user
+podman generate systemd --new --name qdrant > ~/.config/systemd/user/qdrant.service
+systemctl --user daemon-reload
+systemctl --user enable --now qdrant.service
+sudo loginctl enable-linger "$USER"
+```
+
+`--new` makes the unit recreate the container from the image on each start (rather than depending on a pre-existing container by id), so the unit is portable across reinstalls. `podman generate systemd` is deprecated in Podman 4.4+ in favour of [Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html) (`~/.config/containers/systemd/qdrant.container`), but the generated unit remains supported and is the most direct path from `podman run` to a managed service.
+
 To upgrade, pull the new tag and recreate the container against the same volume:
 
 ```bash
@@ -72,11 +102,12 @@ podman run -d --name qdrant --restart=unless-stopped \
 
 Pin tags explicitly. Floating tags like `v1.17` or `latest` make "it worked yesterday" impossible to reproduce.
 
+> [!NOTE]
 > **macOS:** `podman machine start` must be running for the container to be reachable on `localhost`. `--restart=unless-stopped` only takes effect while the machine is up; the machine itself is not auto-started by Podman Desktop unless you enable it.
 
 ## Intended usage flow
 
-### 1. Inspect state
+### 1. Check status
 
 ```bash
 flowd status
@@ -112,36 +143,30 @@ The agent now has twelve MCP tools. Inside a Claude Code or Cursor session:
 | `rules_check`    | Pre-flight gate before a risky tool invocation.                                        |
 | `rules_list`     | To enumerate rules active for the current project or file scope.                       |
 
-Rules are YAML files under `~/.flowd/rules/` (global) and `<repo>/.flowd/rules/` (project). See `flowd-core/src/rules/loader.rs` for the schema.
+Rules are YAML files under `~/.flowd/rules/` (global) and `<repo>/.flowd/rules/` (project). See `flowd-core/src/rules/loader.rs` for the schema. To inspect what the daemon loaded, run `flowd rules list -p <project>` (or `-f <file>`). Bare `flowd rules list` evaluates against an empty scope and returns no matches even when rules are loaded.
 
 #### Prose-first planning
 
 `plan_create` accepts either a structured `definition` (the legacy DAG-first path) or a `prose` description. Prose plans are passed to the configured `PlanCompiler`, which can either compile them straight to a DAG or surface a list of `OpenQuestion`s the agent must resolve before the plan can run. The clarification loop is:
 
-```text
-plan_create(prose)
-   |
-   v
-+---------+    open questions?    +-------------+
-|  Draft  +----------------------->  plan_answer  | <-+
-+---+-----+                        +------+------+   |
-    |                                     |          | overwrite
-    | no questions left                   v          | answer
-    |                              +-------------+   |
-    |                              |  re-compile +---+
-    |                              +------+------+
-    |                                     |
-    |    plan_refine(feedback)            |
-    +<-----------------------------+      |
-    |                              |      |
-    v                              |      |
-plan_confirm  --> Running --> plan_status (poll) --> Completed / Failed
-    |
-    v
-plan_cancel  (Draft / Confirmed / Running)
+```mermaid
+flowchart TD
+    create["plan_create(prose)"] --> draft["Draft"]
+    draft -->|open questions| answer["plan_answer"]
+    answer --> recompile["re-compile"]
+    recompile -->|questions remain| answer
+    recompile -->|resolved| draft
+    draft -->|plan_refine feedback| recompile
+    draft -->|no questions left| confirm["plan_confirm"]
+    confirm --> running["Running"]
+    running --> status["plan_status (poll)"]
+    status --> done["Completed / Failed"]
+    draft -. plan_cancel .-> cancelled["Cancelled"]
+    confirm -. plan_cancel .-> cancelled
+    running -. plan_cancel .-> cancelled
 ```
 
-The daemon ships with [`StubPlanCompiler`], a deterministic, no-LLM compiler that parses already-structured markdown:
+The daemon ships with [`StubPlanCompiler`](crates/flowd-mcp/src/compiler.rs), a deterministic, no-LLM compiler that parses already-structured markdown:
 
 ```text
 # refactor-auth
@@ -198,7 +223,7 @@ max_tokens   = 4096
 temperature  = 0.2
 ```
 
-Optional **two-tier escalation** -- first compile and answer-merging stay on the primary, but `plan_refine` jumps to a stronger (or just different) backend:
+Optional **two-tier escalation** -- first compile and answer-merging stay on the primary, but `plan_refine` jumps to a stronger (or different) backend:
 
 ```toml
 [plan.llm.refine]
@@ -266,4 +291,4 @@ The MCP layer has two integration test suites:
 
 ## License
 
-MIT.
+[MIT](LICENSE).
