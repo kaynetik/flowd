@@ -1,0 +1,25 @@
+id: karpathy-simplicity-first
+scope: "**"
+level: warn
+description: |
+  ## 2. Simplicity First
+
+  **Minimum code that solves the problem. Nothing speculative.**
+
+  - No features beyond what was asked.
+  - No abstractions for single-use code.
+  - No "flexibility" or "configurability" that wasn't requested.
+  - No error handling for impossible scenarios.
+  - If you write 200 lines and it could be 50, rewrite it.
+
+  Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+  The rules engine cannot inspect shell command arguments
+  (ProposedAction carries no command string), so this rule fires on
+  matching tool invocations as advisory guidance surfaced via
+  `rules_list`. The agent is responsible for honoring the constraint
+  in the actual command it runs. For Write, Edit, and MultiEdit (and
+  equivalently named tools), the engine likewise does not inspect edit
+  bodies; the agent must apply this guideline in the actual edits it
+  makes.
+match: "^(Bash|Write|Edit|MultiEdit|shell|shell_exec|run_command|run_terminal_cmd)$"

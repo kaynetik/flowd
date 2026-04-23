@@ -1,0 +1,23 @@
+id: karpathy-think-before-coding
+scope: "**"
+level: warn
+description: |
+  ## 1. Think Before Coding
+
+  **Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+  Before implementing:
+  - State your assumptions explicitly. If uncertain, ask.
+  - If multiple interpretations exist, present them - don't pick silently.
+  - If a simpler approach exists, say so. Push back when warranted.
+  - If something is unclear, stop. Name what's confusing. Ask.
+
+  The rules engine cannot inspect shell command arguments
+  (ProposedAction carries no command string), so this rule fires on
+  matching tool invocations as advisory guidance surfaced via
+  `rules_list`. The agent is responsible for honoring the constraint
+  in the actual command it runs. For Write, Edit, and MultiEdit (and
+  equivalently named tools), the engine likewise does not inspect edit
+  bodies; the agent must apply this guideline in the actual edits it
+  makes.
+match: "^(Bash|Write|Edit|MultiEdit|shell|shell_exec|run_command|run_terminal_cmd)$"

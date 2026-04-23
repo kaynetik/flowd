@@ -9,7 +9,6 @@
 //! rejected rather than silently overwriting so that operators notice when
 //! project-local and global rule files collide.
 
-use std::fs;
 use std::path::Path;
 
 use glob::Pattern as GlobPattern;
@@ -17,7 +16,7 @@ use regex::Regex;
 
 use crate::error::{FlowdError, Result, RuleLevel};
 
-use super::loader::load_rules_file;
+use super::loader::{list_rule_yaml_files_under, load_rules_file};
 use super::{GateResult, ProposedAction, Rule, RuleEvaluator, RuleViolation};
 
 /// Internal store: the authored rule plus its compiled artifacts.
@@ -106,27 +105,10 @@ impl InMemoryRuleEvaluator {
 
 impl RuleEvaluator for InMemoryRuleEvaluator {
     fn load_rules_from_dir(&mut self, dir: &Path) -> Result<usize> {
-        let entries = fs::read_dir(dir)
-            .map_err(|e| FlowdError::RuleLoad(format!("read dir {}: {e}", dir.display())))?;
+        let paths = list_rule_yaml_files_under(dir)?;
 
         let mut loaded = 0usize;
-        for entry in entries {
-            let entry = entry
-                .map_err(|e| FlowdError::RuleLoad(format!("iter dir {}: {e}", dir.display())))?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let is_yaml = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml")
-                });
-            if !is_yaml {
-                continue;
-            }
-
+        for path in paths {
             let rules = load_rules_file(&path)?;
             for rule in rules {
                 self.register_rule(rule)?;
@@ -195,6 +177,8 @@ impl RuleEvaluator for InMemoryRuleEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
     fn rule(id: &str, scope: &str, level: RuleLevel, match_pattern: &str) -> Rule {
         Rule {
@@ -332,5 +316,155 @@ mod tests {
             .unwrap();
         assert!(ev.remove("r"));
         assert!(!ev.remove("r"));
+    }
+
+    fn temp_rules_dir(prefix: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        );
+        path.push(unique);
+        fs::create_dir_all(&path).expect("temp rules root");
+        path
+    }
+
+    #[test]
+    fn load_rules_nested_yaml_is_loaded() {
+        let root = temp_rules_dir("flowd-rules-nested");
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("c.yaml");
+        fs::write(
+            &file,
+            "id: nested-c\nscope: \"**\"\nlevel: warn\ndescription: d\nmatch: m\n",
+        )
+        .unwrap();
+
+        let mut ev = InMemoryRuleEvaluator::new();
+        let n = ev.load_rules_from_dir(&root).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(ev.get("nested-c").unwrap().id, "nested-c");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_rules_lexicographic_order_across_subdirs() {
+        let root = temp_rules_dir("flowd-rules-lex");
+        let b = root.join("b");
+        let a = root.join("a");
+        fs::create_dir_all(&b).unwrap();
+        fs::create_dir_all(&a).unwrap();
+        fs::write(
+            b.join("r.yaml"),
+            "id: rule-b\nscope: \"**\"\nlevel: warn\ndescription: d\nmatch: m\n",
+        )
+        .unwrap();
+        fs::write(
+            a.join("r.yaml"),
+            "id: rule-a\nscope: \"**\"\nlevel: warn\ndescription: d\nmatch: m\n",
+        )
+        .unwrap();
+
+        let mut ev = InMemoryRuleEvaluator::new();
+        ev.load_rules_from_dir(&root).unwrap();
+        let ids: Vec<_> = ev.rules().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["rule-a", "rule-b"]);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rules_symlink_dir_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let mut base = std::env::temp_dir();
+        base.push(format!(
+            "flowd-rules-symlink-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let rules_root = base.join("rules");
+        let outside = base.join("outside_target");
+        fs::create_dir_all(&rules_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("inside.yaml"),
+            "id: inside\nscope: \"**\"\nlevel: warn\ndescription: d\nmatch: m\n",
+        )
+        .unwrap();
+        symlink(&outside, rules_root.join("via_link")).unwrap();
+
+        let mut ev = InMemoryRuleEvaluator::new();
+        let n = ev.load_rules_from_dir(&rules_root).unwrap();
+        assert_eq!(n, 0, "must not traverse symlinked directory");
+        assert!(ev.get("inside").is_none());
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn load_rules_malformed_nested_yaml_errors_with_path() {
+        let root = temp_rules_dir("flowd-rules-bad-nested");
+        let nested = root.join("x").join("y");
+        fs::create_dir_all(&nested).unwrap();
+        let bad = nested.join("bad.yaml");
+        fs::write(&bad, ":::not-yaml:::").unwrap();
+
+        let mut ev = InMemoryRuleEvaluator::new();
+        let err = ev.load_rules_from_dir(&root).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("parse") && msg.contains(&*bad.to_string_lossy()),
+            "expected path-pointing parse error, got {msg}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_rules_skips_non_yaml_at_depth() {
+        let root = temp_rules_dir("flowd-rules-skip-txt");
+        let deep = root.join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("notes.txt"), "noise").unwrap();
+        fs::write(
+            deep.join("keep.yaml"),
+            "id: keep\nscope: \"**\"\nlevel: warn\ndescription: d\nmatch: m\n",
+        )
+        .unwrap();
+
+        let mut ev = InMemoryRuleEvaluator::new();
+        let n = ev.load_rules_from_dir(&root).unwrap();
+        assert_eq!(n, 1);
+        assert!(ev.get("keep").is_some());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_repo_dot_flowd_rules_flat_layout_regression() {
+        let rules_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.flowd/rules");
+        assert!(
+            rules_dir.is_dir(),
+            "expected {} (repo .flowd/rules)",
+            rules_dir.display()
+        );
+
+        let mut ev = InMemoryRuleEvaluator::new();
+        let n = ev.load_rules_from_dir(&rules_dir).unwrap();
+        assert!(
+            n >= 7,
+            "expected all rules from flat .flowd/rules yaml files, got {n}"
+        );
+        assert!(ev.get("cargo-no-build").is_some());
+        assert!(ev.get("flowd-core-no-io-deps").is_some());
+        assert!(ev.get("forward-only-migrations").is_some());
+        assert!(ev.get("mcp-wire-discipline").is_some());
+        assert!(ev.get("hooks-swallow-errors-by-design").is_some());
     }
 }

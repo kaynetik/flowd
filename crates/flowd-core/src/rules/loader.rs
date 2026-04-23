@@ -1,5 +1,15 @@
 //! YAML loading helpers for the rules engine.
 //!
+//! # Directory layout
+//!
+//! Rule files may live directly under a rules directory (for example
+//! `.flowd/rules/*.yaml`) or in nested subdirectories (for example
+//! `.flowd/rules/team/ci/cargo-discipline.yaml`). Matching paths are collected
+//! recursively, then sorted lexicographically by full path before loading, so
+//! results are stable across machines.
+//! Symbolic links are never followed: symlinked files and directories are
+//! ignored. Non-YAML files are skipped.
+//!
 //! Two file layouts are accepted:
 //!
 //! ```yaml
@@ -64,6 +74,45 @@ pub fn load_rules_file(path: &Path) -> Result<Vec<Rule>> {
         RuleFile::Single(rule) => vec![rule],
         RuleFile::List(rules) => rules,
     })
+}
+
+fn is_rule_yaml_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
+}
+
+/// Recursively list `.yaml` / `.yml` files under `root`, sorted lexicographically by full path.
+///
+/// Subdirectories are traversed; symbolic links are never followed (symlink entries are skipped).
+pub(crate) fn list_rule_yaml_files_under(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    collect_rule_yaml_files(root, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_rule_yaml_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir)
+        .map_err(|e| FlowdError::RuleLoad(format!("read dir {}: {e}", dir.display())))?
+    {
+        let entry = entry
+            .map_err(|e| FlowdError::RuleLoad(format!("iter dir {}: {e}", dir.display())))?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path).map_err(|e| {
+            FlowdError::RuleLoad(format!("stat {}: {e}", path.display()))
+        })?;
+
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_rule_yaml_files(&path, out)?;
+        } else if meta.is_file() && is_rule_yaml_extension(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// Standard locations from which rules are loaded.
