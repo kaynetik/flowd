@@ -1,40 +1,35 @@
 //! Concrete `AgentSpawner` implementations for the `flowd` daemon.
 //!
-//! `flowd-core` deliberately does not spawn OS processes itself; spawning a
-//! real coding agent is the CLI's job. This module wires the orchestration
-//! engine to the agent CLI binaries that ship with Cursor / Claude Code /
-//! `OpenAI` Codex / Anthropic Claude.
+//! `flowd-core` does not spawn OS processes itself; that is the CLI's job.
+//! This module wires the orchestration engine to a local agent CLI binary
+//! (Claude Code, `cursor-agent`, `OpenAI` Codex, Aider, ...).
 //!
 //! ## Selection order
 //!
 //! When a [`LocalShellSpawner`] is built via [`LocalShellSpawner::detect`]:
 //!
-//! 1. `$FLOWD_AGENT_BIN` if set (operator override; absolute or in `$PATH`).
-//! 2. First entry from a fixed candidate list found in `$PATH`:
-//!    `cursor-agent`, `claude`, `codex`, `aider`.
-//! 3. If none are found, returns `None` so the caller can wire a no-op
-//!    fallback that fails *loudly* on `spawn` rather than silently.
+//! 1. `$FLOWD_AGENT_BIN` if set (operator override; absolute path or a name
+//!    on `$PATH`).
+//! 2. The first entry from [`DEFAULT_CANDIDATES`] found on `$PATH`.
+//! 3. Otherwise `None`, so the caller can fall back to [`UnconfiguredSpawner`]
+//!    which fails loudly on `spawn` rather than silently.
 //!
-//! ## Invocation contract
+//! ## Invocation
 //!
-//! All supported CLIs accept `<bin> -p "<prompt>"` (Anthropic's Claude CLI,
-//! Cursor's `cursor-agent`, `OpenAI` Codex CLI, Aider's `--message`).
-//! `LocalShellSpawner` uses `-p` by default; override via
-//! `$FLOWD_AGENT_PROMPT_FLAG` (e.g. `--message`) when wiring a CLI that
-//! uses a different flag name.
+//! Each step is invoked as
 //!
-//! Stdout is captured verbatim and returned in `AgentOutput::stdout`.
-//! Stderr is logged via `tracing` (warn on non-zero exit, debug otherwise)
-//! so it surfaces in the daemon log without polluting the JSON-RPC channel.
+//! ```text
+//! <bin> [extra_args...] <prompt_flag> "<step.prompt>"
+//! ```
 //!
-//! ## Why not stream stdout incrementally?
+//! `prompt_flag` defaults to `-p` (Claude Code, `cursor-agent`); override
+//! it via `$FLOWD_AGENT_PROMPT_FLAG` for CLIs that use a different name
+//! (e.g. `--message` for Aider). Extra leading arguments come from
+//! `$FLOWD_AGENT_EXTRA_ARGS` (whitespace-split).
 //!
-//! The orchestrator currently observes step output once, after the step
-//! completes (`AgentOutput::stdout`). Streaming would require a richer
-//! `AgentSpawner` trait. Until then, we run the child process to completion
-//! before returning, with cancellation handled at the layer above via
-//! `JoinHandle::abort` -- which delivers SIGKILL to the spawned process
-//! group through tokio's reaper.
+//! Stdout is captured verbatim into [`AgentOutput::stdout`]. Stderr is
+//! emitted via `tracing` (warn on non-zero exit, debug otherwise) so it
+//! surfaces in the daemon log without polluting the JSON-RPC channel.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -45,36 +40,27 @@ use flowd_core::orchestration::executor::AgentSpawner;
 use flowd_core::orchestration::{AgentOutput, PlanStep};
 use tokio::process::Command;
 
-/// Default candidate binaries searched in `$PATH` when `$FLOWD_AGENT_BIN`
+/// Default candidate binaries searched on `$PATH` when `$FLOWD_AGENT_BIN`
 /// is unset. Order matters: first match wins.
-const DEFAULT_CANDIDATES: &[&str] = &["cursor-agent", "claude", "codex", "aider"];
+const DEFAULT_CANDIDATES: &[&str] = &["claude", "codex", "aider", "cursor-agent"];
 
-/// Default flag passed before the prompt argument. All four candidate CLIs
-/// accept `-p` for non-interactive single-prompt mode.
+/// Default flag passed before the prompt argument. Suitable for Claude Code
+/// and `cursor-agent`; override via `$FLOWD_AGENT_PROMPT_FLAG` for others.
 const DEFAULT_PROMPT_FLAG: &str = "-p";
 
-/// `AgentSpawner` that shells out to a local CLI binary (claude / cursor-agent
-/// / codex / aider) with the step's prompt.
+/// `AgentSpawner` that shells out to a local CLI binary with the step's
+/// prompt.
 #[derive(Debug, Clone)]
 pub struct LocalShellSpawner {
-    /// Resolved path or PATH-relative name of the agent binary.
     bin: OsString,
-    /// Flag preceding the prompt argument (e.g. `-p`, `--message`).
     prompt_flag: String,
-    /// Working directory for the child. `None` inherits the parent's.
     cwd: Option<PathBuf>,
-    /// Extra leading args inserted between `bin` and `prompt_flag`.
-    /// Useful for wrappers like `cursor-agent --model gpt-5` (set via
-    /// `$FLOWD_AGENT_EXTRA_ARGS`, space-split).
     extra_args: Vec<String>,
 }
 
 impl LocalShellSpawner {
     /// Build a spawner from environment variables, or return `None` if no
     /// usable agent CLI is discoverable.
-    ///
-    /// Inspect the returned binary path with [`LocalShellSpawner::bin_display`]
-    /// before logging so operators can see which CLI was selected.
     #[must_use]
     pub fn detect() -> Option<Self> {
         let bin = std::env::var_os("FLOWD_AGENT_BIN")
@@ -93,11 +79,7 @@ impl LocalShellSpawner {
         let extra_args = std::env::var("FLOWD_AGENT_EXTRA_ARGS")
             .ok()
             .filter(|s| !s.is_empty())
-            .map(|s| {
-                s.split_whitespace()
-                    .map(std::borrow::ToOwned::to_owned)
-                    .collect::<Vec<_>>()
-            })
+            .map(|s| s.split_whitespace().map(str::to_owned).collect())
             .unwrap_or_default();
 
         let cwd = std::env::var_os("FLOWD_AGENT_CWD")
@@ -112,7 +94,8 @@ impl LocalShellSpawner {
         })
     }
 
-    /// Construct an explicit spawner -- handy for tests and embedding.
+    /// Construct an explicit spawner. Used by tests; not gated on `cfg(test)`
+    /// so embedders that depend on the crate can call it directly.
     #[must_use]
     #[allow(dead_code)]
     pub fn new(bin: impl Into<OsString>) -> Self {
@@ -122,32 +105,6 @@ impl LocalShellSpawner {
             cwd: None,
             extra_args: Vec::new(),
         }
-    }
-
-    /// Override the prompt-introducing flag (default `-p`).
-    /// Reserved for downstream embedders that wire flowd into a CLI other
-    /// than the four candidates baked into [`DEFAULT_CANDIDATES`].
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn with_prompt_flag(mut self, flag: impl Into<String>) -> Self {
-        self.prompt_flag = flag.into();
-        self
-    }
-
-    /// Override the working directory of the spawned process.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
-    }
-
-    /// Override the extra args inserted between bin and prompt flag.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
-        self.extra_args = args;
-        self
     }
 
     /// Display the configured binary; for logging only.
@@ -167,13 +124,13 @@ impl AgentSpawner for LocalShellSpawner {
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
         }
-        // Detach stdin: agents that try to prompt the operator must error,
-        // not block forever waiting for input from a closed terminal.
+        // Detach stdin so an agent that tries to prompt the operator errors
+        // immediately instead of blocking on a closed terminal.
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Mark the child for kill_on_drop so the executor's `JoinHandle::abort`
-        // (used by `cancel`) actually terminates the process tree.
+        // kill_on_drop ensures the executor's `JoinHandle::abort` (used by
+        // `cancel`) actually terminates the spawned process tree.
         cmd.kill_on_drop(true);
 
         tracing::info!(
@@ -225,10 +182,9 @@ impl AgentSpawner for LocalShellSpawner {
     }
 }
 
-/// Spawner that returns a clear, actionable error explaining how to wire a
-/// real agent CLI. Used as the fallback when no agent binary is discoverable
-/// at startup -- prefer this to silently succeeding so operators see the
-/// misconfiguration the first time they confirm a plan.
+/// Spawner used as the fallback when no agent binary is discoverable. Fails
+/// every `spawn` with an actionable error so misconfiguration surfaces the
+/// first time a plan is confirmed, instead of silently succeeding.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnconfiguredSpawner;
 
@@ -244,8 +200,7 @@ impl AgentSpawner for UnconfiguredSpawner {
 }
 
 /// Type-erased spawner so the executor can be parametrised at runtime
-/// (`LocalShellSpawner` vs `UnconfiguredSpawner`) without leaking concrete
-/// types into the rest of `start.rs`.
+/// without leaking concrete types into the rest of `start.rs`.
 pub enum BoxedSpawner {
     Local(LocalShellSpawner),
     Unconfigured(UnconfiguredSpawner),
@@ -254,10 +209,7 @@ pub enum BoxedSpawner {
 impl BoxedSpawner {
     /// Build the best available spawner for the current environment.
     pub fn auto() -> Self {
-        match LocalShellSpawner::detect() {
-            Some(s) => Self::Local(s),
-            None => Self::Unconfigured(UnconfiguredSpawner),
-        }
+        LocalShellSpawner::detect().map_or(Self::Unconfigured(UnconfiguredSpawner), Self::Local)
     }
 
     pub fn description(&self) -> String {
@@ -277,17 +229,14 @@ impl AgentSpawner for BoxedSpawner {
     }
 }
 
-/// Look up `name` in the `$PATH`. Mirrors `which(1)` -- returns the first
-/// executable match. Returns `None` if not found or `$PATH` is unset.
+/// First executable match for `name` on `$PATH`. Returns `None` if the name
+/// is not found or `$PATH` is unset.
 fn which_in_path(name: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return candidate.into_os_string().into_string().ok();
-        }
-    }
-    None
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|p| is_executable(p))
+        .and_then(|p| p.into_os_string().into_string().ok())
 }
 
 #[cfg(unix)]
@@ -299,25 +248,23 @@ fn is_executable(p: &std::path::Path) -> bool {
 
 #[cfg(not(unix))]
 fn is_executable(p: &std::path::Path) -> bool {
-    // Conservative: treat any regular file in PATH as executable on
-    // non-unix targets. The agent CLIs we care about are unix-only in
-    // practice; this branch exists so the crate still builds.
+    // Best-effort on non-unix: any regular file in PATH is treated as
+    // executable. The supported agent CLIs are unix-only in practice.
     p.is_file()
 }
 
+/// Truncate `s` to at most `max` bytes on a UTF-8 boundary, appending a
+/// marker noting how many bytes were elided.
 fn truncate_for_log(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_owned()
-    } else {
-        let mut cut = 0;
-        for (i, _) in s.char_indices() {
-            if i > max {
-                break;
-            }
-            cut = i;
-        }
-        format!("{}…[+{} bytes]", &s[..cut], s.len() - cut)
+        return s.to_owned();
     }
+    let cut = s
+        .char_indices()
+        .take_while(|(i, _)| *i <= max)
+        .last()
+        .map_or(0, |(i, _)| i);
+    format!("{}…[+{} bytes]", &s[..cut], s.len() - cut)
 }
 
 #[cfg(test)]
@@ -341,14 +288,13 @@ mod tests {
         }
     }
 
+    /// Smoke test: `echo` stands in for an agent that just prints its
+    /// argv. With the default `-p` flag the invocation is
+    /// `echo -p "<prompt>"`, which exits 0 and contains the prompt.
     #[tokio::test]
     async fn echo_spawner_returns_stdout() {
-        // `echo` is universally available; treat it as an agent that just
-        // prints its prompt.
         let s = LocalShellSpawner::new("echo");
         let out = s.spawn(&step("hello flowd")).await.unwrap();
-        // `echo -p hello flowd` on macOS prints `-p hello flowd\n`. We just
-        // assert non-empty + exit 0; echo is portable enough for a smoke test.
         assert_eq!(out.exit_code, Some(0));
         assert!(out.stdout.contains("hello flowd"));
     }
@@ -369,9 +315,17 @@ mod tests {
         assert!(msg.contains("cursor-agent"));
     }
 
-    // Note: a `detect_honours_explicit_env_override` test would need to
-    // mutate the process-wide `FLOWD_AGENT_BIN` env var. Rust 2024 made
-    // `std::env::set_var` `unsafe`, and the workspace lints `unsafe_code`
-    // as a warning. The detect path is exercised in practice by the
-    // daemon at startup; dropping the test keeps the lint surface clean.
+    #[test]
+    fn truncate_for_log_passes_through_short_strings() {
+        assert_eq!(truncate_for_log("abc", 10), "abc");
+    }
+
+    /// `αβγδε` is 10 bytes (5 chars × 2). With `max = 5` we can fit
+    /// `αβ` (4 bytes) but not `αβγ` (6 bytes); the cut must land on a
+    /// UTF-8 boundary and the elided-byte marker must follow.
+    #[test]
+    fn truncate_for_log_clips_on_utf8_boundary() {
+        let out = truncate_for_log("αβγδε", 5);
+        assert_eq!(out, "αβ…[+6 bytes]");
+    }
 }
