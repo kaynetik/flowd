@@ -7,4 +7,9 @@ description: |
   `tracing::*`, or write to `std::io::stderr()`. A single stray
   `println!`, `print!`, or `dbg!` corrupts the wire and breaks every
   connected MCP client silently.
+
+  Note: the rules engine cannot read source contents (a ProposedAction
+  carries only { tool, file_path, project }), so this rule is an
+  advisory triggered on any edit under crates/flowd-mcp/src/. The agent
+  is responsible for honoring the constraint in the diff itself.
 match: "crates/flowd-mcp/src/.*\\.rs$"

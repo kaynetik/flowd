@@ -1,9 +1,13 @@
 id: forward-only-migrations
-scope: "crates/flowd-storage/migrations/**"
+scope: "crates/flowd-storage/src/**"
 level: deny
 description: |
-  Schema migrations are forward-only by project policy. Editing an
-  existing migration file is a breaking change for every installed
-  user -- add a new, higher-numbered migration instead. Renaming or
-  reordering existing migrations is also forbidden.
-match: "crates/flowd-storage/migrations/.*\\.sql$"
+  Schema migrations are forward-only by project policy and live as inline
+  `const MIGRATION_NNN: &str` constants in
+  `crates/flowd-storage/src/migrations.rs` (not as .sql files in a
+  migrations/ directory).
+
+  Editing or reordering an existing MIGRATION_NNN constant is a breaking
+  change for every installed user -- append a new, higher-numbered
+  constant and add it to the MIGRATIONS slice instead.
+match: "crates/flowd-storage/src/migrations\\.rs$"

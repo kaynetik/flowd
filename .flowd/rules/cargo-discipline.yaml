@@ -1,24 +1,39 @@
 - id: cargo-no-build
   scope: "**"
-  level: deny
+  level: warn
   description: |
-    Use `cargo check` instead of `cargo build` for agent-driven feedback loops.
-    Full builds are wall-clock expensive; only run them on explicit user request
-    or as part of a release step.
-  match: "(^|[^a-zA-Z])cargo[ \\t]+build([ \\t]|$)"
+    Use `cargo check` (or `cargo check -p <crate>`) for agent-driven
+    feedback loops. `cargo build` is wall-clock expensive; reserve it
+    for explicit user request or a release step.
+
+    The rules engine cannot inspect shell command arguments
+    (ProposedAction carries no command string), so this rule fires on
+    any shell-class tool invocation as advisory guidance surfaced via
+    `rules_list`. The agent is responsible for honoring the constraint
+    in the actual command it runs.
+  match: "^(Bash|shell|shell_exec|run_command|run_terminal_cmd)$"
 
 - id: cargo-no-workspace-test
   scope: "**"
   level: warn
   description: |
-    Scope tests with `-p <crate>`; `cargo test --workspace` runs the full
-    suite and is reserved for explicit user request or pre-commit.
-  match: "cargo[ \\t]+test[ \\t]+--workspace"
+    Scope tests with `-p <crate>` during dev iteration;
+    `cargo test --workspace` runs the full suite (the README documents
+    it for pre-commit / CI verification, not for tight feedback loops).
+
+    Same engine caveat as `cargo-no-build`: this is advisory guidance,
+    not a hard gate on the command string.
+  match: "^(Bash|shell|shell_exec|run_command|run_terminal_cmd)$"
 
 - id: cargo-no-install-from-path
   scope: "**"
   level: warn
   description: |
-    Don't `cargo install --path` during dev iteration; that's an explicit
-    release / smoke-test step, not a feedback loop.
-  match: "cargo[ \\t]+install[ \\t]+--path"
+    `cargo install --path crates/flowd-cli` is the documented install
+    command in the README, but it's an explicit release / smoke-test
+    step -- not a feedback loop. Hot-installing during a live agent
+    session also swaps the MCP daemon underneath the connected client
+    (see "The risk the recursion creates" in the dogfooding notes).
+
+    Same engine caveat as the other cargo rules: advisory only.
+  match: "^(Bash|shell|shell_exec|run_command|run_terminal_cmd)$"

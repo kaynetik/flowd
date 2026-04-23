@@ -1,9 +1,18 @@
 id: flowd-core-no-io-deps
-scope: "**"
+scope: "crates/flowd-core/**"
 level: deny
 description: |
-  flowd-core defines traits and domain types only. Adding tokio, sqlx,
-  reqwest, qdrant-client, or ort to its Cargo.toml violates the
-  architecture: I/O belongs in flowd-storage, flowd-vector, or flowd-onnx,
-  with the trait definition staying in flowd-core.
+  flowd-core defines traits and domain types for memory, rules, and
+  orchestration. Concrete I/O belongs in the satellite crates with the
+  trait definitions staying here:
+
+    - SQLite / FTS5  -> flowd-storage  (rusqlite)
+    - Vector index   -> flowd-vector   (qdrant-client)
+    - Embeddings     -> flowd-onnx     (ort)
+    - HTTP / RPC     -> flowd-mcp or a backend crate (reqwest, hyper, tonic)
+
+  Tokio IS already a flowd-core dependency (used by the compactor,
+  layer runner, and executor for async primitives) -- adding it is fine.
+  Adding any of the I/O crates above to crates/flowd-core/Cargo.toml
+  is the violation.
 match: "crates/flowd-core/Cargo\\.toml$"
