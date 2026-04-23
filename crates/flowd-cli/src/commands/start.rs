@@ -145,11 +145,14 @@ pub async fn run(
     //   * `stub`      -- deterministic markdown parser (default).
     //   * `rejecting` -- prose-first disabled at deployment time.
     //   * `llm`       -- `LlmPlanCompiler` over the `[plan.llm]`
-    //                    backend (currently OpenAI-compatible MLX over
-    //                    HTTP). Construction can fail (HTTP client
-    //                    init, unsupported provider); the daemon
-    //                    refuses to start in that case so the operator
-    //                    notices before requests pile up.
+    //                    backend selected by `provider` (claude-cli
+    //                    subprocess shell-out today, OpenAI-compatible
+    //                    HTTP for the `mlx` provider, claude-http
+    //                    reserved for a follow-up). Construction can
+    //                    fail (binary missing on $PATH, HTTP client
+    //                    init failure, unsupported provider); the
+    //                    daemon refuses to start in that case so the
+    //                    operator notices before requests pile up.
     let plan_compiler = Arc::new(
         DaemonPlanCompiler::from_selection(config.plan.compiler, &config.plan.llm)
             .map_err(|e| anyhow::anyhow!("instantiate plan compiler: {e}"))?,
@@ -360,7 +363,7 @@ fn log_llm_startup(style: Style, cfg: &LlmConfig) -> Result<()> {
             "{} llm refine tier configured ({} model={})",
             style.cyan("loaded"),
             refine.provider.wire_name(),
-            describe_provider_model(refine.provider, &refine_as_llm_view(refine, cfg)),
+            describe_provider_model(refine.provider, &refine_as_llm_view(refine)),
         );
     } else {
         eprintln!(
@@ -421,11 +424,14 @@ fn describe_provider_model(provider: LlmProvider, cfg: &LlmConfig) -> String {
     }
 }
 
-/// Build a synthetic `LlmConfig` view that swaps the per-provider
-/// subsections in for the refine tier's overrides. Lets us reuse
-/// `describe_provider_model` for both tiers without duplicating the
-/// formatting strings.
-fn refine_as_llm_view(refine: &crate::config::RefineConfig, _base: &LlmConfig) -> LlmConfig {
+/// Build a synthetic `LlmConfig` view from the refine tier's overrides.
+///
+/// The refine block carries a fully-resolved set of per-provider
+/// subsections (defaulted at parse time, just like the primary), so we
+/// can hand its values straight to `describe_provider_model` without
+/// merging anything in from the primary. Kept as a thin shim purely so
+/// the banner formatting stays uniform across the two tiers.
+fn refine_as_llm_view(refine: &crate::config::RefineConfig) -> LlmConfig {
     LlmConfig {
         provider: refine.provider,
         claude_cli: refine.claude_cli.clone(),

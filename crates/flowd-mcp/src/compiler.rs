@@ -975,13 +975,14 @@ fn parse_llm_response(raw: &str) -> std::result::Result<LlmCompileResponse, Stri
         .map_err(|e| format!("response is not valid JSON for the schema: {e}"))?;
 
     // Normalise every id in the response to snake_case before we run
-    // local invariants. Models in the wild (notably Qwen3.6:35b) emit
-    // a mix of `kebab-case` and `snake_case` ids within the same
-    // response, which the executor accepts but which produces an
-    // inconsistent audit trail and breaks ad-hoc string matching by
-    // callers. Doing the normalisation here keeps the canonical wire
-    // shape consistent with what the prompt asks for and means the
-    // invariant checks below see ids that the executor will also see.
+    // local invariants. Models in the wild (notably mid-sized open
+    // coder models) routinely emit a mix of `kebab-case` and
+    // `snake_case` ids within the same response, which the executor
+    // accepts but which produces an inconsistent audit trail and
+    // breaks ad-hoc string matching by callers. Doing the
+    // normalisation here keeps the canonical wire shape consistent
+    // with what the prompt asks for and means the invariant checks
+    // below see ids that the executor will also see.
     normalize_response_ids(&mut parsed);
 
     // Local invariants -- the things we can check without dragging in

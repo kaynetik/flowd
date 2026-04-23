@@ -6,8 +6,9 @@
 //! flow, ...) so `flowd` never has to ingest, persist, or rotate an
 //! `ANTHROPIC_API_KEY`. The trade-off is that latency is bounded by
 //! whatever the user's `claude` install does -- typically a single
-//! `claude -p` invocation per compile round, which Opus 4.7 answers in
-//! roughly 3-15 seconds for our prompt sizes.
+//! `claude -p` invocation per compile round, typically a few seconds
+//! for the Sonnet tier and climbing into the tens of seconds when the
+//! operator pins an Opus tier on a long prompt.
 //!
 //! ## Wire format
 //!
@@ -64,8 +65,11 @@ pub struct ClaudeCliConfig {
     /// [`ClaudeCliCallback::probe_binary`] runs the same resolution
     /// logic so wiring failures fail fast.
     pub binary: PathBuf,
-    /// Model id passed via `--model`. Anything `claude -p` accepts is
-    /// fair game (`claude-opus-4-7`, `claude-sonnet-4-6`, ...).
+    /// Model identifier passed via `--model`. Anything `claude -p`
+    /// accepts is fair game: tier aliases (`sonnet`, `opus`, `haiku`)
+    /// auto-resolve to the latest build of that tier, while
+    /// fully-pinned identifiers (e.g. `claude-sonnet-4-5`) reproduce
+    /// byte-for-byte across hosts.
     pub model: String,
     /// Per-request timeout. Caps the entire shell-out (start + stdin
     /// write + stdout read + reap), not just the model's first byte.
@@ -270,7 +274,7 @@ mod tests {
     fn cfg_for(binary: PathBuf) -> ClaudeCliConfig {
         ClaudeCliConfig {
             binary,
-            model: "claude-opus-4-7".into(),
+            model: "sonnet".into(),
             timeout: Duration::from_secs(5),
         }
     }
@@ -444,7 +448,7 @@ mod tests {
         );
         let cfg = ClaudeCliConfig {
             binary: path,
-            model: "claude-opus-4-7".into(),
+            model: "sonnet".into(),
             timeout: Duration::from_millis(150),
         };
         let cb = ClaudeCliCallback::new(cfg);

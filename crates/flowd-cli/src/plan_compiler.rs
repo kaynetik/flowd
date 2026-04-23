@@ -74,23 +74,28 @@ pub enum DaemonLlmCallback {
 }
 
 impl LlmCallback for DaemonLlmCallback {
-    // Trait method uses 2024 RPIT capture which already binds `&self`;
-    // adding `+ '_` here is a *narrowing* refinement (more permissive
-    // for the caller) but the lint flags any return-type difference.
-    // We're intentionally explicit so the boxing strategy is readable.
+    // The trait method's RPIT (`impl Future<Output = ...> + Send`)
+    // implicitly captures `&self` under the 2024 edition's lifetime
+    // capture rules, so the impl's return type carries the same `'_`
+    // lifetime. We're forced to box because the two `match` arms'
+    // futures are distinct concrete types and `impl Future` can only
+    // resolve to one of them. The `refining_impl_trait_reachable` lint
+    // fires whenever the impl's RPIT differs from the trait's
+    // (`Pin<Box<dyn Future + Send + '_>>` is more specific than
+    // `impl Future<Output = ...> + Send + '_`); we silence it
+    // intentionally because the unification *is* the point.
     #[allow(refining_impl_trait_reachable)]
     fn complete(
         &self,
         prompt: String,
     ) -> impl std::future::Future<Output = Result<String>> + Send + '_ {
-        // Boxing into a single `Pin<Box<_>>` is the cheapest way to unify
-        // the two arms' future types without introducing a `futures`
-        // crate dependency. We borrow `&self` for the call duration; the
-        // inner futures already own their config (each arm's
-        // `complete()` clones eagerly), so the future itself does not
-        // hold any reference once it is returned -- but we keep the
-        // `'_` lifetime in the signature to satisfy the trait's
-        // implicit `&self` capture in Rust 2024.
+        // Unifying the two arms via a single `Pin<Box<dyn ...>>` keeps
+        // this crate free of a `futures` dependency (we'd otherwise
+        // reach for `Either`). Each inner callback's `complete()`
+        // clones its config eagerly, so the boxed future does not
+        // borrow from `&self` past the call -- the `'_` in the
+        // signature mirrors the trait's implicit capture, not a real
+        // outstanding borrow.
         let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> =
             match self {
                 Self::ClaudeCli(cb) => Box::pin(cb.complete(prompt)),

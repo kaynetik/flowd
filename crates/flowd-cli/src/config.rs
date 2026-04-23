@@ -44,11 +44,23 @@
 //!
 //! # Subsection consumed when provider = "claude-cli".
 //! [plan.llm.claude_cli]
-//! model        = "claude-opus-4-7"
+//! # The `claude` CLI accepts both tier aliases (`sonnet`, `opus`,
+//! # `haiku`) -- which auto-resolve to the current latest build of
+//! # that tier -- and fully-pinned model identifiers (see
+//! # `claude --help`). Operators who need byte-for-byte reproducible
+//! # plans should pin a specific identifier.
+//! model        = "sonnet"
 //! binary       = "claude"   # path or executable name resolved on $PATH
 //! timeout_secs = 120
 //!
 //! # Subsection consumed when provider = "mlx".
+//! #
+//! # Despite the historical name, this section configures *any* OpenAI
+//! # `/v1/chat/completions`-compatible local server (Ollama, mlx_lm.server,
+//! # vLLM, llama.cpp's server, ...). Defaults target Ollama because it
+//! # is the most common local setup; MLX users typically override
+//! # `base_url` to `http://127.0.0.1:8080/v1` and `model` to an MLX
+//! # community identifier (e.g. `mlx-community/Qwen3-Coder-30B-...`).
 //! [plan.llm.mlx]
 //! model        = "qwen3-coder:30b"
 //! base_url     = "http://127.0.0.1:11434/v1"
@@ -57,8 +69,12 @@
 //! temperature  = 0.2
 //!
 //! # Subsection consumed when provider = "claude-http".
+//! # NOTE: the direct Anthropic Messages API transport is not yet
+//! # implemented; the daemon refuses to start with provider = "claude-http"
+//! # today. The block below documents the on-disk shape so operators
+//! # can stage the config now and flip `provider` once it lands.
 //! [plan.llm.claude_http]
-//! model        = "claude-opus-4-7"
+//! model        = "claude-sonnet-4-5"
 //! api_key_env  = "ANTHROPIC_API_KEY"
 //! base_url     = "https://api.anthropic.com"
 //! timeout_secs = 120
@@ -73,7 +89,7 @@
 //! [plan.llm.refine]
 //! provider = "claude-cli"
 //! [plan.llm.refine.claude_cli]
-//! model        = "claude-opus-4-7-thinking-high"
+//! model        = "opus"
 //! timeout_secs = 240
 //! ```
 //!
@@ -99,32 +115,47 @@ pub const DEFAULT_MAX_QUESTIONS: usize = 12;
 // -- Claude CLI defaults ----------------------------------------------------
 
 /// Default model id passed to the local `claude` CLI when
-/// `provider = "claude-cli"`. The CLI accepts any model the operator's
-/// Anthropic plan exposes; we pin Opus 4.7 because plan compilation
-/// needs strong instruction-following on JSON shape.
-pub const DEFAULT_CLAUDE_CLI_MODEL: &str = "claude-opus-4-7";
+/// `provider = "claude-cli"`.
+///
+/// The CLI accepts both tier aliases (`sonnet`, `opus`, `haiku`) and
+/// fully-pinned identifiers; we default to the `"sonnet"` alias because
+/// it is the balanced tier (good instruction-following, lower latency
+/// and cost than Opus) and it auto-resolves to the latest Sonnet build
+/// the operator's `claude` install knows about, so the default does
+/// not bit-rot when Anthropic ships a new model. Operators who want a
+/// stronger tier set this to `"opus"`; those who want byte-for-byte
+/// reproducible plans pin a specific identifier from `claude --help`.
+pub const DEFAULT_CLAUDE_CLI_MODEL: &str = "sonnet";
 
 /// Default `binary` for the Claude CLI backend. Resolved on `$PATH`
 /// when the value contains no path separator; treated as a literal
 /// path otherwise.
 pub const DEFAULT_CLAUDE_CLI_BINARY: &str = "claude";
 
-/// Default per-request timeout for the Claude CLI shell-out. Opus 4.7
-/// has variable latency depending on prompt size and reasoning depth;
-/// 120s leaves headroom while still failing fast enough to be useful
-/// in an interactive loop.
+/// Default per-request timeout for the Claude CLI shell-out. Latency
+/// varies with prompt size and the model's reasoning depth; 120s
+/// leaves headroom for Opus-tier responses while still failing fast
+/// enough to be useful in an interactive loop.
 pub const DEFAULT_CLAUDE_CLI_TIMEOUT_SECS: u64 = 120;
 
 // -- MLX defaults -----------------------------------------------------------
+//
+// Despite the `MLX` naming (preserved for config-file compatibility),
+// these defaults target *any* OpenAI `/v1/chat/completions`-compatible
+// local server. The Ollama-shaped defaults below are the most common
+// local setup; MLX users typically override both the URL (port 8080)
+// and the model id (HuggingFace-style, e.g. `mlx-community/...`).
 
-/// Default model id for the MLX (OpenAI-compatible) backend. Matches the
-/// model we recommend in the docs (qwen3-coder:30b via ollama or
-/// `mlx_lm.server`); operators who run a different model just override
-/// `[plan.llm.mlx].model`.
+/// Default model id for the OpenAI-compatible local backend. The value
+/// is in Ollama tag format (`<name>:<size-tag>`) because Ollama is the
+/// most common local server we see in the wild; users running
+/// `mlx_lm.server`, vLLM, or llama.cpp will override this with whatever
+/// id their server exposes.
 pub const DEFAULT_MLX_MODEL: &str = "qwen3-coder:30b";
 
-/// Default `base_url` for the OpenAI-compatible MLX backend. Matches
-/// the port `ollama` and `mlx_lm.server` listen on by default.
+/// Default `base_url` for the OpenAI-compatible local backend. Matches
+/// the port Ollama listens on by default; `mlx_lm.server` defaults to
+/// 8080 and operators on that stack should override this.
 pub const DEFAULT_MLX_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 
 /// Default request timeout for the MLX backend.
@@ -142,7 +173,13 @@ pub const DEFAULT_MLX_TEMPERATURE: f32 = 0.2;
 // -- Claude HTTP defaults ---------------------------------------------------
 
 /// Default model for the direct Anthropic HTTP backend.
-pub const DEFAULT_CLAUDE_HTTP_MODEL: &str = "claude-opus-4-7";
+///
+/// The HTTP transport is not yet implemented (the daemon refuses to
+/// start with `provider = "claude-http"`), so this value is purely
+/// cosmetic today. When the transport lands, operators must set this
+/// to a model identifier accepted by the Anthropic Messages API
+/// (the API does not honour tier aliases the way the CLI does).
+pub const DEFAULT_CLAUDE_HTTP_MODEL: &str = "claude-sonnet-4-5";
 
 /// Default env-var name the daemon reads at startup to obtain the
 /// Anthropic API key. Operators who already use a different env var
@@ -203,12 +240,14 @@ impl CompilerSelection {
 
 /// LLM backend selector.
 ///
-/// `ClaudeCli` is the default and the recommended path: it shells out to
-/// the local `claude` CLI for auth-free Anthropic access (plan compilation
-/// is quality-sensitive and Opus 4.7 is the strongest model we can route
-/// through without managing secrets). `Mlx` is the offline fallback.
-/// `ClaudeHttp` calls the Anthropic Messages API directly with an
-/// operator-supplied API key.
+/// `ClaudeCli` is the default and the recommended path: it shells out
+/// to the local `claude` CLI for auth-free Anthropic access (plan
+/// compilation is quality-sensitive, and the CLI routes through
+/// whatever Anthropic credentials the binary already manages so flowd
+/// never has to ingest, persist, or rotate an API key). `Mlx` is the
+/// offline / local-server fallback (any OpenAI-compatible endpoint).
+/// `ClaudeHttp` is reserved for a follow-up that will call the
+/// Anthropic Messages API directly with an operator-supplied key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LlmProvider {
     ClaudeCli,
@@ -757,7 +796,7 @@ mod tests {
         assert_eq!(cfg.plan.max_questions, DEFAULT_MAX_QUESTIONS);
         assert_eq!(cfg.plan.compiler, CompilerSelection::Stub);
         assert_eq!(cfg.plan.llm, LlmConfig::default());
-        // The default LLM provider is claude-cli (Opus quality-first).
+        // The default LLM provider is claude-cli (auth-free local CLI).
         assert_eq!(cfg.plan.llm.provider, LlmProvider::ClaudeCli);
         assert_eq!(cfg.plan.llm.claude_cli.model, DEFAULT_CLAUDE_CLI_MODEL);
         assert_eq!(cfg.plan.llm.mlx.model, DEFAULT_MLX_MODEL);
@@ -857,13 +896,13 @@ mod tests {
         let (_d, p) = write_cfg(
             "[plan.llm]\nprovider = \"claude-cli\"\n\n\
              [plan.llm.claude_cli]\n\
-             model        = \"claude-sonnet-4-6\"\n\
+             model        = \"opus\"\n\
              binary       = \"/usr/local/bin/claude\"\n\
              timeout_secs = 90\n",
         );
         let cfg = FlowdConfig::load(&p).unwrap();
         assert_eq!(cfg.plan.llm.provider, LlmProvider::ClaudeCli);
-        assert_eq!(cfg.plan.llm.claude_cli.model, "claude-sonnet-4-6");
+        assert_eq!(cfg.plan.llm.claude_cli.model, "opus");
         assert_eq!(
             cfg.plan.llm.claude_cli.binary,
             PathBuf::from("/usr/local/bin/claude")
@@ -942,7 +981,7 @@ mod tests {
         let (_d, p) = write_cfg(
             "[plan.llm]\nprovider = \"claude-http\"\n\n\
              [plan.llm.claude_http]\n\
-             model        = \"claude-sonnet-4-6\"\n\
+             model        = \"claude-haiku-4-5\"\n\
              api_key_env  = \"CLAUDE_API_KEY\"\n\
              base_url     = \"https://api.example.com\"\n\
              timeout_secs = 30\n\
@@ -951,7 +990,7 @@ mod tests {
         );
         let cfg = FlowdConfig::load(&p).unwrap();
         assert_eq!(cfg.plan.llm.provider, LlmProvider::ClaudeHttp);
-        assert_eq!(cfg.plan.llm.claude_http.model, "claude-sonnet-4-6");
+        assert_eq!(cfg.plan.llm.claude_http.model, "claude-haiku-4-5");
         assert_eq!(cfg.plan.llm.claude_http.api_key_env, "CLAUDE_API_KEY");
         assert_eq!(cfg.plan.llm.claude_http.base_url, "https://api.example.com");
     }
@@ -978,14 +1017,14 @@ mod tests {
             "[plan.llm]\nprovider = \"mlx\"\n\n\
              [plan.llm.refine]\nprovider = \"claude-cli\"\n\n\
              [plan.llm.refine.claude_cli]\n\
-             model        = \"claude-opus-4-7-thinking-high\"\n\
+             model        = \"opus\"\n\
              timeout_secs = 240\n",
         );
         let cfg = FlowdConfig::load(&p).unwrap();
         assert_eq!(cfg.plan.llm.provider, LlmProvider::Mlx);
         let refine = cfg.plan.llm.refine.expect("refine block parsed");
         assert_eq!(refine.provider, LlmProvider::ClaudeCli);
-        assert_eq!(refine.claude_cli.model, "claude-opus-4-7-thinking-high");
+        assert_eq!(refine.claude_cli.model, "opus");
         assert_eq!(refine.claude_cli.timeout_secs, 240);
     }
 

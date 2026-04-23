@@ -18,15 +18,15 @@ uuid = { workspace = true }
 # Used to timestamp DecisionRecord auto-fills produced by the
 # LlmPlanCompiler -- the wire shape from the model doesn't carry one.
 chrono = { workspace = true }
-# OpenAI-compatible HTTP callback for the LlmPlanCompiler. Using rustls
-# rather than native-tls keeps the build hermetic (no system OpenSSL
-# requirement) and matches what qdrant-client already pulls in.
+# OpenAI-compatible HTTP callback for the LlmPlanCompiler. Workspace
+# pinning selects rustls-tls (no system OpenSSL requirement) and
+# matches the rustls stack qdrant-client already pulls in transitively,
+# so the final binary links a single TLS implementation.
 reqwest = { workspace = true }
 
 [dev-dependencies]
 flowd-storage = { workspace = true }
 tempfile = { workspace = true }
-chrono = { workspace = true }
 wiremock = { workspace = true }
 
 [lints]

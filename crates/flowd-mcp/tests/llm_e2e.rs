@@ -4,13 +4,18 @@
 //! daemon nor a model loaded into memory. Run on demand:
 //!
 //! ```bash
-//! # Start the server in another shell first. Either backend works as long
-//! # as it speaks OpenAI `/v1/chat/completions`. The daemon's documented
-//! # MLX default is `qwen3-coder:30b` because Ollama's OpenAI shim ignores
-//! # `think:false` and Qwen3-thinking models will burn the entire token
+//! # Start an OpenAI `/v1/chat/completions`-compatible server in another
+//! # shell. The defaults below target Ollama because it is the most common
+//! # local setup; users on `mlx_lm.server`, vLLM, or llama.cpp override
+//! # `FLOWD_LLM_BASE_URL` and `FLOWD_LLM_MODEL` instead. We pick a
+//! # *non-thinking* coder variant on purpose: Ollama's OpenAI shim ignores
+//! # `think:false`, so Qwen3-thinking variants will burn the entire token
 //! # budget reasoning before emitting JSON.
-//! mlx_lm.server --model mlx-community/qwen3-coder:30b --port 8080
-//! # or:  ollama serve  (then pull `qwen3-coder:30b` once)
+//! ollama serve                              # then `ollama pull qwen3-coder:30b`
+//! # or, for MLX:
+//! #   mlx_lm.server --model <hf-id> --port 8080
+//! #   FLOWD_LLM_BASE_URL=http://127.0.0.1:8080/v1 FLOWD_LLM_MODEL=<hf-id> \
+//! #     cargo test -p flowd-mcp --test llm_e2e -- --ignored --nocapture
 //!
 //! # Then exercise the round-trip:
 //! cargo test -p flowd-mcp --test llm_e2e -- --ignored --nocapture
@@ -18,8 +23,8 @@
 //!
 //! Override the target endpoint and model with environment variables:
 //!
-//! * `FLOWD_LLM_BASE_URL` -- defaults to `http://127.0.0.1:11434/v1`
-//! * `FLOWD_LLM_MODEL` -- defaults to `qwen3-coder:30b`
+//! * `FLOWD_LLM_BASE_URL` -- defaults to `http://127.0.0.1:11434/v1` (Ollama)
+//! * `FLOWD_LLM_MODEL` -- defaults to `qwen3-coder:30b` (Ollama tag format)
 //! * `FLOWD_LLM_TIMEOUT_SECS` -- defaults to `120`
 //!
 //! ## What we assert
@@ -74,7 +79,7 @@ fn build_compiler() -> LlmPlanCompiler<OpenAiCompatibleCallback> {
 }
 
 #[tokio::test]
-#[ignore = "requires a running mlx_lm.server / OpenAI-compatible endpoint -- run with --ignored"]
+#[ignore = "requires a running OpenAI-compatible endpoint (Ollama / mlx_lm.server / vLLM / ...) -- run with --ignored"]
 async fn live_compile_prose_handles_ambiguous_brief() {
     let compiler = build_compiler();
     let prose = "Refactor the auth module so we can swap the JWT signing algorithm \
@@ -102,7 +107,7 @@ async fn live_compile_prose_handles_ambiguous_brief() {
 }
 
 #[tokio::test]
-#[ignore = "requires a running mlx_lm.server / OpenAI-compatible endpoint -- run with --ignored"]
+#[ignore = "requires a running OpenAI-compatible endpoint (Ollama / mlx_lm.server / vLLM / ...) -- run with --ignored"]
 async fn live_compile_prose_handles_structured_brief() {
     let compiler = build_compiler();
     let prose = "Plan: rename `Foo` to `Bar` across the codebase.\n\

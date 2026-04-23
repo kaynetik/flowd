@@ -162,11 +162,13 @@ Each `## <step-id> [agent: <type>]` heading defines a step; the body until the n
 
 For freeform prose -- where the input doesn't fit the structured-markdown convention above -- swap `[plan].compiler` to `"llm"`. `LlmPlanCompiler` then routes the prompt through one of three transports, selected by `[plan.llm].provider`:
 
-| Provider     | Wire name      | When to use                                                         |
-| ------------ | -------------- | ------------------------------------------------------------------- |
-| Claude CLI   | `claude-cli`   | Default. Shells out to the local `claude` binary; no API key in `flowd`. |
-| MLX (local)  | `mlx`          | Offline / air-gapped. Talks OpenAI-compatible HTTP to `mlx_lm.server`.  |
-| Claude HTTP  | `claude-http`  | Reserved for a follow-up. Direct Anthropic Messages API; needs `ANTHROPIC_API_KEY`. |
+| Provider     | Wire name      | When to use                                                                                                |
+| ------------ | -------------- | ---------------------------------------------------------------------------------------------------------- |
+| Claude CLI   | `claude-cli`   | Default. Shells out to the local `claude` binary; no API key in `flowd`.                                   |
+| MLX (local)  | `mlx`          | Any OpenAI `/v1/chat/completions`-compatible local server (Ollama, `mlx_lm.server`, vLLM, llama.cpp, ...). |
+| Claude HTTP  | `claude-http`  | Reserved for a follow-up. Direct Anthropic Messages API; will need `ANTHROPIC_API_KEY`.                    |
+
+The `mlx` name is preserved for config-file compatibility but the section configures any OpenAI-shaped local backend; the defaults below target Ollama because that is the most common local setup. MLX users override `base_url` to `http://127.0.0.1:8080/v1` and `model` to a HuggingFace-style id.
 
 A typical `~/.flowd/flowd.toml` for the default Claude-CLI path:
 
@@ -179,13 +181,18 @@ max_questions = 3
 provider = "claude-cli"
 
 [plan.llm.claude_cli]
-binary       = "claude"          # bare name resolved via $PATH at startup
-model        = "claude-opus-4-7" # forwarded as `claude -p --model <model>`
+binary       = "claude"   # bare name resolved via $PATH at startup
+# `claude -p` accepts tier aliases (`sonnet`, `opus`, `haiku`) which
+# auto-resolve to the latest build of that tier, or fully-pinned
+# identifiers (e.g. `claude-sonnet-4-5`) for byte-for-byte reproducibility.
+model        = "sonnet"
 timeout_secs = 120
 
-[plan.llm.mlx]                    # used when provider = "mlx" or as a refine override
-base_url     = "http://localhost:8080/v1"
-model        = "qwen3-coder:30b"  # documented default; pin whatever your server hosts
+[plan.llm.mlx]                          # used when provider = "mlx" or as a refine override
+# Ollama-shaped defaults; for mlx_lm.server use port 8080 and a
+# HuggingFace-style model id (e.g. mlx-community/Qwen3-Coder-30B-...).
+base_url     = "http://127.0.0.1:11434/v1"
+model        = "qwen3-coder:30b"
 timeout_secs = 90
 max_tokens   = 4096
 temperature  = 0.2
@@ -197,7 +204,7 @@ Optional **two-tier escalation** -- first compile and answer-merging stay on the
 [plan.llm.refine]
 provider = "claude-cli"
 [plan.llm.refine.claude_cli]
-model        = "claude-opus-4-7"
+model        = "opus"
 binary       = "claude"
 timeout_secs = 180
 ```
