@@ -10,6 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use flowd_core::memory::MemoryBackend;
 use flowd_core::types::MemoryTier;
 use flowd_mcp::observer::ObserverHealth;
+use flowd_storage::plan_event_store::{SqlitePlanEventStore, UsageTotals};
 use flowd_storage::sqlite::SqliteBackend;
 
 use crate::daemon::{is_alive, read_pid};
@@ -27,6 +28,7 @@ pub async fn run(paths: &FlowdPaths, style: Style) -> Result<()> {
     print_home(paths, style);
     print_daemon(paths, style)?;
     print_db(paths, style).await?;
+    print_token_usage(paths, style).await?;
     print_plan_event_observer(paths, style);
 
     Ok(())
@@ -119,6 +121,78 @@ async fn print_db(paths: &FlowdPaths, style: Style) -> Result<()> {
         println!("  size:      {} bytes", meta.len());
     }
     Ok(())
+}
+
+/// Render cross-plan token + cost totals, summed straight from the
+/// `plan_events` table via `SqlitePlanEventStore::usage_totals`.
+///
+/// Token counts are split (input / output / `cache_read` / `cache_creation`)
+/// to surface where spend actually lives -- output tokens are roughly
+/// 5x the price of input on Anthropic's rate card, and `cache_read` is
+/// a fraction of either, so the distribution matters more than the bare
+/// total. The cost line is a single bundled `$X.XXXX` because that is
+/// what the provider returns: Anthropic's `total_cost_usd` is per
+/// request, not per direction. A per-direction USD split would require
+/// a client-side rate card (deferred work; multi-provider).
+async fn print_token_usage(paths: &FlowdPaths, style: Style) -> Result<()> {
+    println!("\n{}", style.bold("tokens:"));
+    if !paths.db_file().exists() {
+        println!("  {}  no database yet", style.dim("absent"));
+        return Ok(());
+    }
+
+    let store = SqlitePlanEventStore::open(&paths.db_file())
+        .with_context(|| format!("open plan_events at {}", paths.db_file().display()))?;
+    let totals = store
+        .usage_totals()
+        .await
+        .context("aggregate usage totals")?;
+
+    if totals == UsageTotals::default() {
+        println!(
+            "  {}  no metrics-bearing step events yet",
+            style.dim("none")
+        );
+        return Ok(());
+    }
+
+    println!(
+        "  input:          {}",
+        format_thousands(totals.input_tokens)
+    );
+    println!(
+        "  output:         {}",
+        format_thousands(totals.output_tokens)
+    );
+    println!(
+        "  cache_read:     {}",
+        format_thousands(totals.cache_read_tokens)
+    );
+    println!(
+        "  cache_creation: {}",
+        format_thousands(totals.cache_creation_tokens)
+    );
+    println!("  cost:           ${:.4}", totals.total_cost_usd);
+    println!("  step events:    {}", totals.step_events);
+    Ok(())
+}
+
+/// Render `n` with ASCII thousands separators (e.g. `15_820 -> "15,820"`).
+/// Hand-rolled to keep `flowd-cli`'s dependency graph flat -- the same
+/// helper exists in `commands::plan` for per-event rendering; duplicated
+/// here on purpose to avoid a new shared `output::format` module that
+/// would have exactly two callers.
+fn format_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 /// Render the plan-event observer health snapshot the daemon writes to

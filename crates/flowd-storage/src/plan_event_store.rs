@@ -60,6 +60,66 @@ fn storage_err(e: impl std::fmt::Display) -> FlowdError {
     FlowdError::Storage(e.to_string())
 }
 
+/// Cross-plan token + cost rollup, computed straight from the JSON
+/// `payload` column on `plan_events` rows. We sum only `step_completed`
+/// and `step_failed` (failed steps are billable spend) and deliberately
+/// skip `finished` rows -- their `total_metrics` is itself a sum of those
+/// step rows, so including them would double-count.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct UsageTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_cost_usd: f64,
+    pub step_events: u64,
+}
+
+impl SqlitePlanEventStore {
+    /// Aggregate token + cost totals across all persisted step events.
+    ///
+    /// Returns `UsageTotals::default()` (all zeros) when no events carry
+    /// a `metrics` payload. Pre-metrics rows are ignored by the
+    /// `WHERE json_extract(...) IS NOT NULL` predicate.
+    ///
+    /// # Errors
+    /// Returns `FlowdError::Storage` if the underlying `SQLite` query
+    /// fails or the connection mutex is poisoned.
+    pub async fn usage_totals(&self) -> Result<UsageTotals> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(storage_err)?;
+            conn.query_row(
+                "SELECT
+                    COALESCE(SUM(json_extract(payload, '$.metrics.input_tokens')), 0),
+                    COALESCE(SUM(json_extract(payload, '$.metrics.output_tokens')), 0),
+                    COALESCE(SUM(json_extract(payload, '$.metrics.cache_read_input_tokens')), 0),
+                    COALESCE(SUM(json_extract(payload, '$.metrics.cache_creation_input_tokens')), 0),
+                    COALESCE(SUM(json_extract(payload, '$.metrics.total_cost_usd')), 0.0),
+                    COUNT(*)
+                 FROM plan_events
+                 WHERE kind IN ('step_completed', 'step_failed')
+                   AND json_extract(payload, '$.metrics') IS NOT NULL",
+                [],
+                |row| {
+                    let to_u64 = |v: i64| u64::try_from(v).unwrap_or(0);
+                    Ok(UsageTotals {
+                        input_tokens: to_u64(row.get::<_, i64>(0)?),
+                        output_tokens: to_u64(row.get::<_, i64>(1)?),
+                        cache_read_tokens: to_u64(row.get::<_, i64>(2)?),
+                        cache_creation_tokens: to_u64(row.get::<_, i64>(3)?),
+                        total_cost_usd: row.get::<_, f64>(4)?,
+                        step_events: to_u64(row.get::<_, i64>(5)?),
+                    })
+                },
+            )
+            .map_err(storage_err)
+        })
+        .await
+        .map_err(|e| FlowdError::Storage(format!("spawn_blocking panicked: {e}")))?
+    }
+}
+
 impl PlanEventStore for SqlitePlanEventStore {
     fn record(&self, event: &PlanEvent) -> impl std::future::Future<Output = Result<()>> + Send {
         let conn = Arc::clone(&self.conn);
@@ -354,6 +414,109 @@ mod tests {
             .unwrap();
         assert_eq!(a_only.len(), 1);
         assert_eq!(a_only[0].plan_id, plan_a);
+    }
+
+    #[tokio::test]
+    async fn usage_totals_sums_step_rows_and_skips_finished() {
+        use flowd_core::orchestration::executor::AgentMetrics;
+
+        let store = store();
+        let plan_id = Uuid::new_v4();
+        let project = "demo".to_owned();
+
+        let m1 = AgentMetrics {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_input_tokens: 10,
+            cache_creation_input_tokens: 5,
+            total_cost_usd: 0.0123,
+            duration_ms: 1000,
+            duration_api_ms: 800,
+            ..AgentMetrics::default()
+        };
+        let m2 = AgentMetrics {
+            input_tokens: 200,
+            output_tokens: 75,
+            total_cost_usd: 0.0456,
+            ..AgentMetrics::default()
+        };
+        // Failed steps still cost money -- include them in the rollup.
+        let m_failed = AgentMetrics {
+            input_tokens: 30,
+            output_tokens: 0,
+            total_cost_usd: 0.0010,
+            ..AgentMetrics::default()
+        };
+        // `total_metrics` on Finished is itself a sum of the step rows;
+        // including it in the aggregate would double-count.
+        let mut total = AgentMetrics::default();
+        total.merge(&m1);
+        total.merge(&m2);
+        total.merge(&m_failed);
+
+        let events = [
+            PlanEvent::StepCompleted {
+                plan_id,
+                project: project.clone(),
+                step_id: "a".into(),
+                agent_type: "claude".into(),
+                output: "ok".into(),
+                metrics: Some(m1),
+            },
+            PlanEvent::StepCompleted {
+                plan_id,
+                project: project.clone(),
+                step_id: "b".into(),
+                agent_type: "claude".into(),
+                output: "ok".into(),
+                metrics: Some(m2),
+            },
+            PlanEvent::StepFailed {
+                plan_id,
+                project: project.clone(),
+                step_id: "c".into(),
+                agent_type: "claude".into(),
+                error: "rate limited".into(),
+                metrics: Some(m_failed),
+            },
+            // Pre-metrics row -- must be ignored without poisoning the sum.
+            PlanEvent::StepCompleted {
+                plan_id,
+                project: project.clone(),
+                step_id: "legacy".into(),
+                agent_type: "echo".into(),
+                output: "ok".into(),
+                metrics: None,
+            },
+            PlanEvent::Finished {
+                plan_id,
+                project,
+                status: PlanStatus::Completed,
+                total_metrics: Some(total),
+                step_count: flowd_core::orchestration::observer::PlanStepCounts::default(),
+            },
+        ];
+        for e in &events {
+            store.record(e).await.expect("record");
+        }
+
+        let totals = store.usage_totals().await.expect("usage_totals");
+        assert_eq!(totals.input_tokens, 100 + 200 + 30);
+        assert_eq!(totals.output_tokens, 50 + 75);
+        assert_eq!(totals.cache_read_tokens, 10);
+        assert_eq!(totals.cache_creation_tokens, 5);
+        assert!((totals.total_cost_usd - (0.0123 + 0.0456 + 0.0010)).abs() < 1e-9);
+        // Three step rows had metrics; the `metrics: None` row is filtered
+        // out by the `json_extract IS NOT NULL` predicate, the Finished
+        // row by the `kind IN (...)` clause.
+        assert_eq!(totals.step_events, 3);
+    }
+
+    #[tokio::test]
+    async fn usage_totals_returns_zero_on_empty_db() {
+        let store = store();
+        let totals = store.usage_totals().await.expect("usage_totals");
+        assert_eq!(totals, UsageTotals::default());
     }
 
     #[test]
