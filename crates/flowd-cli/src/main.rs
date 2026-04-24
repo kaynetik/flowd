@@ -96,5 +96,7 @@ async fn main() -> Result<()> {
         Command::Export { output, project } => {
             commands::export::run(&paths, style, output, project).await
         }
+        Command::Init { target } => commands::init::run(target).await,
+        Command::Hook { event } => commands::hook::run(event).await,
     }
 }

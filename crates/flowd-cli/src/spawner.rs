@@ -71,7 +71,9 @@ use tokio::process::Command;
 
 /// Default candidate binaries searched on `$PATH` when `$FLOWD_AGENT_BIN`
 /// is unset. Order matters: first match wins.
-const DEFAULT_CANDIDATES: &[&str] = &["claude", "codex", "aider", "cursor-agent"];
+const DEFAULT_CANDIDATES: &[&str] = &["claude", "cursor-agent"];
+// Temporarily disable codex and aider until we have a way to test them.
+// const DEFAULT_CANDIDATES: &[&str] = &["claude", "codex", "aider", "cursor-agent"];
 
 /// Default flag passed before the prompt argument. Suitable for Claude Code
 /// and `cursor-agent`; override via `$FLOWD_AGENT_PROMPT_FLAG` for others.

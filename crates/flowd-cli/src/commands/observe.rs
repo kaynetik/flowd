@@ -11,6 +11,10 @@
 //! Content is read from stdin to avoid shell-quoting hell and metadata
 //! overflow. A `--session` value of `-` or absence means "start a fresh
 //! session for this observation".
+//!
+//! The storage-write core is factored into [`write_observation`] so the
+//! in-process Claude Code hook dispatcher ([`crate::commands::hook`]) can
+//! share the exact same insert path without duplicating schema awareness.
 
 use std::io::{self, Read};
 
@@ -25,6 +29,24 @@ use flowd_storage::sqlite::SqliteBackend;
 
 use crate::output::Style;
 use crate::paths::FlowdPaths;
+
+/// Input to [`write_observation`]: everything the storage layer needs to
+/// persist one hot-tier row keyed to an existing (or to-be-upserted)
+/// session.
+#[derive(Debug, Clone)]
+pub(crate) struct ObservationPayload {
+    /// Flowd data directory to target.
+    pub paths: FlowdPaths,
+    /// Project slug (required; FK-safe).
+    pub project: String,
+    /// Session UUID to attach to. `write_observation` upserts a row with
+    /// this id so the observations FK constraint always resolves.
+    pub session_id: Uuid,
+    /// Observation body -- whatever the caller already trimmed.
+    pub content: String,
+    /// JSON object persisted to `observations.metadata`.
+    pub metadata: JsonValue,
+}
 
 pub async fn run(
     paths: &FlowdPaths,
@@ -54,23 +76,59 @@ pub async fn run(
 
     let session_id = resolve_session(&db, &project, session.as_deref()).await?;
 
+    let payload = ObservationPayload {
+        paths: paths.clone(),
+        project,
+        session_id,
+        content,
+        metadata,
+    };
+
+    let observation_id = write_observation(payload).await?;
+
+    println!("{observation_id}");
+    eprintln!("session={session_id}");
+    Ok(())
+}
+
+/// Shared storage-write core for CLI `observe` and in-process Claude Code
+/// hook dispatch. Opens the `SQLite` backend, upserts the session row (so
+/// the FK constraint always resolves), and inserts the observation at
+/// `MemoryTier::Hot`. Returns the generated observation UUID.
+///
+/// Vector indexing is intentionally skipped here; the daemon's reindex
+/// pass picks up hot-tier rows asynchronously.
+pub(crate) async fn write_observation(payload: ObservationPayload) -> Result<Uuid> {
+    payload.paths.ensure_home()?;
+
+    let db = SqliteBackend::open(&payload.paths.db_file())
+        .with_context(|| format!("open sqlite at {}", payload.paths.db_file().display()))?;
+
     let now = Utc::now();
+    db.upsert_session(&Session {
+        id: payload.session_id,
+        project: payload.project.clone(),
+        summary: None,
+        started_at: now,
+        ended_at: None,
+    })
+    .await
+    .context("upsert session before writing observation")?;
+
     let observation = Observation {
         id: Uuid::new_v4(),
-        session_id,
-        project,
-        content,
+        session_id: payload.session_id,
+        project: payload.project,
+        content: payload.content,
         tier: MemoryTier::Hot,
-        metadata,
+        metadata: payload.metadata,
         created_at: now,
         updated_at: now,
     };
 
     db.store(&observation).await.context("store observation")?;
 
-    println!("{}", observation.id);
-    eprintln!("session={session_id}");
-    Ok(())
+    Ok(observation.id)
 }
 
 /// Look up an existing session (by UUID) or create a fresh one.

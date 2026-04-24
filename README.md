@@ -39,7 +39,8 @@ Prerequisites:
 
 - Rust 1.85 or newer
 - Qdrant reachable on `http://localhost:6334` (default; see [Qdrant via Podman](#qdrant-via-podman) or override with `flowd start --qdrant-url`)
-- For hooks: `bash`, `jq`, `uuidgen`
+
+Hooks are now first-class `flowd hook <event>` subcommands, so the install footprint is just the `flowd` binary on `$PATH` -- no `bash`, `jq`, or `uuidgen` required.
 
 Build and install:
 
@@ -117,10 +118,8 @@ Reports the flowd home layout, daemon liveness, and row counts per memory tier. 
 
 ### 2. Wire your agent
 
-Configure one or both clients using the templates under `integrations/`:
-
-- Claude Code: `integrations/claude-code/settings.json` plus the three hook scripts under `hooks/`. Merge into `~/.claude/settings.json` after replacing `/ABSOLUTE/PATH`.
-- Cursor: `integrations/cursor/mcp.json` copied to `~/.cursor/mcp.json` or `<repo>/.cursor/mcp.json`.
+- **Cursor.** Run `flowd init cursor --global` (writes `~/.cursor/mcp.json`) or `flowd init cursor --project <path>` (writes `<path>/.cursor/mcp.json`). The command deep-merges the canonical server stanza into any existing file and pins the `command` to the absolute path of the running `flowd` binary; rerunning is a no-op. `integrations/cursor/mcp.json` is kept as a reference snapshot for manual merges.
+- **Claude Code.** Merge `integrations/claude-code/settings.json` into `~/.claude/settings.json` (deep-merge `mcpServers` and `hooks` so your existing keys survive). Hooks are now bare `flowd hook session-start`, `flowd hook post-tool-use`, `flowd hook session-end` commands -- no `/ABSOLUTE/PATH` substitution, no shell scripts to source. Assumes the `flowd` binary is on `$PATH`.
 
 Both clients spawn `flowd start` as a stdio subprocess. You do not run the daemon yourself.
 

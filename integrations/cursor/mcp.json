@@ -1,5 +1,5 @@
 {
-  "_note": "Place at ~/.cursor/mcp.json (global) or <project>/.cursor/mcp.json (per-project). The 'flowd' binary must be on $PATH.",
+  "_note": "Reference snapshot. The supported install path is `flowd init cursor --global` (or `--project <path>`), which deep-merges the canonical stanza below into your existing mcp.json and pins the `command` to the absolute path of the running flowd binary. Use this file as a manual-merge fallback only; when merged by hand, ensure the `flowd` binary is on $PATH.",
   "mcpServers": {
     "flowd": {
       "command": "flowd",

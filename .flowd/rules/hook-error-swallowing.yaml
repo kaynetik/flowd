@@ -1,13 +1,26 @@
 id: hooks-swallow-errors-by-design
-scope: "integrations/claude-code/hooks/**"
+scope: "crates/flowd-cli/src/commands/hook.rs"
 level: warn
 description: |
-  Hooks under integrations/claude-code/hooks/ (session-start.sh,
-  post-tool-use.sh, session-end.sh, _lib.sh) intentionally swallow
-  errors so they never block Claude Code. A future agent will look at
-  the missing error handling and try to "fix" it -- don't.
+  Every error path in `flowd hook <event>` must be logged via `tracing`
+  and swallowed by returning `Ok(())`. Do not propagate errors out of
+  `run` / `dispatch`.
 
-  Persistence guarantees go through MCP (`memory_store`), not hooks.
-  See README "Recommendations" before changing the error-handling shape
-  of any script in this directory.
-match: "integrations/claude-code/hooks/.*\\.(sh|bash)$"
+  Why it matters: Claude Code hooks block the parent process while they
+  execute. A surfaced error hangs the IDE session -- the operator's
+  only recourse is to kill Claude Code. Persistence guarantees live in
+  MCP (`memory_store`), not in hooks; a failed hook is a telemetry
+  gap, not a correctness bug.
+
+  Engine caveat: the rules engine cannot read source contents (a
+  `ProposedAction` carries only `{ tool, file_path, project }`), so the
+  `match` pattern below never fires as a hard gate. The rule surfaces
+  as advisory guidance via `rules_list` whenever an agent scopes an
+  action at `crates/flowd-cli/src/commands/hook.rs`, and the agent is
+  responsible for honoring it in the diff.
+
+  Safe path: log via `tracing::warn!` / `tracing::error!` and return
+  `Ok(())`. Do not introduce `return Err(...)` inside the hook handler;
+  new `?` call sites are only acceptable inside helpers whose `Result`
+  is caught and logged before `run` returns.
+match: "^\\s*return Err\\("

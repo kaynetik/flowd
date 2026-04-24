@@ -2,24 +2,32 @@
 
 Wires the `flowd` daemon into agent environments.
 
+## What changed
+
+Hooks are no longer shell scripts. `flowd hook session-start`, `flowd hook post-tool-use`, and `flowd hook session-end` are first-class subcommands of the `flowd` binary -- they read the same JSON payload Claude Code already writes on stdin and call the same observation-write path that `flowd observe` uses. The previous scripts under `claude-code/hooks/` (`session-start.sh`, `post-tool-use.sh`, `session-end.sh`, `_lib.sh`) are gone; Claude Code's `settings.json` now invokes the subcommands directly.
+
+Cursor install is now automated via `flowd init cursor --global` (or `--project <path>`), which deep-merges the canonical MCP stanza into the target `mcp.json`, pins `command` to the running `flowd` binary, and writes atomically. Re-runs against an already-correct file are no-ops.
+
+`cursor/mcp.json` and `claude-code/settings.json` in this directory are kept as reference snapshots -- use them for manual-merge fallback or to review what `flowd init` produces.
+
 ## Prerequisites
 
 - `flowd` binary on `$PATH` (`cargo install --path crates/flowd-cli` or symlink the release build)
 - Qdrant reachable on `http://localhost:6334` (default) for vector search
-- For hooks: `bash 4+`, `jq`, `uuidgen`
+
+No `bash`, `jq`, or `uuidgen` requirement -- the hook subcommands do their own JSON parsing, UUID generation, and mapping persistence.
 
 ## Claude Code
 
 Two pieces:
 
 1. `mcpServers.flowd` registers `flowd start` as a stdio MCP server. Claude Code starts the daemon on session open and speaks JSON-RPC over stdio.
-2. `hooks.*` invoke shell scripts on session-start, post-tool-use, and session-end. Each hook calls `flowd observe` to persist a structured row keyed to the Claude session.
+2. `hooks.*` invoke `flowd hook <event>` on session-start, post-tool-use, and session-end. Each subcommand records a structured row keyed to the Claude session.
 
 ### Install
 
-1. Replace `/ABSOLUTE/PATH` in `claude-code/settings.json` with the absolute path to this repo.
-2. Merge that JSON into `~/.claude/settings.json` (preserve your existing keys; deep-merge `mcpServers` and `hooks`).
-3. Restart Claude Code.
+1. Merge `claude-code/settings.json` into `~/.claude/settings.json` (preserve your existing keys; deep-merge `mcpServers` and `hooks`). No path substitution required.
+2. Restart Claude Code.
 
 ### What gets recorded
 
@@ -33,10 +41,14 @@ The Claude-to-flowd session mapping lives at `$FLOWD_HOME/hook-sessions/<claude_
 
 ## Cursor
 
-Copy `cursor/mcp.json` to either:
+Run the init command:
 
-- `~/.cursor/mcp.json` — global, all projects
-- `<repo>/.cursor/mcp.json` — per-project
+```bash
+flowd init cursor --global                 # ~/.cursor/mcp.json
+flowd init cursor --project /path/to/repo  # <repo>/.cursor/mcp.json
+```
+
+Or, if you prefer to hand-edit, copy the `cursor/mcp.json` reference snapshot to either `~/.cursor/mcp.json` or `<repo>/.cursor/mcp.json` (ensure `flowd` is on `$PATH`).
 
 Restart Cursor. The agent's tools panel should list: `memory_store`, `memory_search`, `memory_context`, `plan_create`, `plan_confirm`, `plan_status`, `rules_check`, `rules_list`.
 
@@ -57,6 +69,6 @@ A healthy first-use path looks like: `flowd status` shows zero rows, you open a 
 
 ## Failure modes
 
-- **Hook silently no-ops.** The hook scripts swallow errors by design (hooks must not block the parent). Run a script directly with a sample payload to surface errors: `echo '{"session_id":"s1","cwd":"/tmp/foo"}' | integrations/claude-code/hooks/session-start.sh`.
-- **Daemon fails to start.** Run `flowd start` in a plain terminal; stderr has tracing output. Common cause: Qdrant unreachable — pass `--qdrant-url` or start Qdrant first.
+- **Hook silently no-ops.** `flowd hook <event>` swallows every error by design (hooks must not block the parent -- see `.flowd/rules/hook-error-swallowing.yaml`). Exercise it directly with a sample payload to surface errors in your own terminal: `echo '{"session_id":"s1","cwd":"/tmp/foo"}' | flowd hook session-start` and watch `RUST_LOG=flowd=warn` output on stderr.
+- **Daemon fails to start.** Run `flowd start` in a plain terminal; stderr has tracing output. Common cause: Qdrant unreachable -- pass `--qdrant-url` or start Qdrant first.
 - **Stale PID.** `flowd stop` reports `no PID file`; a crashed daemon left a stale entry. Remove `$FLOWD_HOME/flowd.pid` and retry.

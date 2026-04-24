@@ -7,6 +7,8 @@
 
 pub mod export;
 pub mod history;
+pub mod hook;
+pub mod init;
 pub mod observe;
 pub mod plan;
 pub mod rules;

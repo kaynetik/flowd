@@ -75,6 +75,15 @@ impl FlowdPaths {
         self.home.join("plan-event-observer.health")
     }
 
+    /// Directory holding the Claude Code session-id -> flowd session
+    /// UUID mapping files, one file per Claude session id. Used by the
+    /// `flowd hook` subcommand to keep session-start, post-tool-use, and
+    /// session-end observations pinned to the same flowd session.
+    #[must_use]
+    pub fn hook_sessions_dir(&self) -> PathBuf {
+        self.home.join("hook-sessions")
+    }
+
     /// Create the home dir (and parents) if missing. Idempotent.
     ///
     /// # Errors

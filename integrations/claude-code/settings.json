@@ -1,5 +1,5 @@
 {
-  "_note": "Merge this into ~/.claude/settings.json. Replace /ABSOLUTE/PATH with your repo checkout. The 'flowd' binary must be on $PATH; if not, use the absolute path to the built binary (target/release/flowd).",
+  "_note": "Reference snapshot. Merge into ~/.claude/settings.json (deep-merge mcpServers and hooks so existing entries are preserved). The 'flowd' binary must be on $PATH -- `cargo install --path crates/flowd-cli` puts it in ~/.cargo/bin. No /ABSOLUTE/PATH substitution is required; no bash, jq, or uuidgen dependency.",
   "mcpServers": {
     "flowd": {
       "command": "flowd",
@@ -14,7 +14,7 @@
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "/ABSOLUTE/PATH/integrations/claude-code/hooks/session-start.sh" }
+          { "type": "command", "command": "flowd hook session-start" }
         ]
       }
     ],
@@ -22,7 +22,7 @@
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "/ABSOLUTE/PATH/integrations/claude-code/hooks/post-tool-use.sh" }
+          { "type": "command", "command": "flowd hook post-tool-use" }
         ]
       }
     ],
@@ -30,7 +30,7 @@
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "/ABSOLUTE/PATH/integrations/claude-code/hooks/session-end.sh" }
+          { "type": "command", "command": "flowd hook session-end" }
         ]
       }
     ]

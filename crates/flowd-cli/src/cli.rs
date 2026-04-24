@@ -121,6 +121,60 @@ pub enum Command {
         #[arg(short, long)]
         project: Option<String>,
     },
+
+    /// Install flowd integration snippets for external tools.
+    Init {
+        #[command(subcommand)]
+        target: InitTarget,
+    },
+
+    /// Claude Code hook receiver. Reads the hook JSON payload on stdin
+    /// and records a structured observation. Replaces the shell hops in
+    /// `integrations/claude-code/hooks/*.sh` so Claude Code's
+    /// `settings.json` no longer needs `/ABSOLUTE/PATH` placeholders or
+    /// `bash`, `jq`, `uuidgen` on `$PATH`.
+    ///
+    /// All error paths inside the handler are swallowed -- see
+    /// `.flowd/rules/hook-error-swallowing.yaml`.
+    Hook {
+        #[command(subcommand)]
+        event: HookEvent,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HookEvent {
+    /// Claude Code `SessionStart` hook. Records a session-open marker
+    /// so the session appears in `flowd history` even if no tool fires.
+    SessionStart,
+    /// Claude Code `PostToolUse` hook. Records tool name, a truncated
+    /// input/response summary as content, and the full input/response
+    /// JSON under metadata.
+    PostToolUse,
+    /// Claude Code `SessionEnd` hook. Records a terminator row and
+    /// drops the Claude->flowd session mapping so a restart starts
+    /// a clean session.
+    SessionEnd,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InitTarget {
+    /// Install the flowd MCP entry into Cursor's `mcp.json`.
+    ///
+    /// Writes (or deep-merges) the canonical server stanza that points at
+    /// the currently-running `flowd` binary. Existing keys in the target
+    /// file are preserved; only the `mcpServers.flowd` entry is replaced.
+    Cursor {
+        /// Write to `$HOME/.cursor/mcp.json` (user-global Cursor config).
+        /// Mutually exclusive with `--project`.
+        #[arg(long, conflicts_with = "project")]
+        global: bool,
+
+        /// Write to `<path>/.cursor/mcp.json` for a single project
+        /// (the `.cursor/` directory is created if missing).
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
