@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::orchestration::executor::AgentMetrics;
+
 #[derive(Debug, Error)]
 pub enum FlowdError {
     #[error("storage error: {0}")]
@@ -27,8 +29,11 @@ pub enum FlowdError {
     #[error("plan validation failed: {0}")]
     PlanValidation(String),
 
-    #[error("plan execution error: {0}")]
-    PlanExecution(String),
+    #[error("plan execution error: {message}")]
+    PlanExecution {
+        message: String,
+        metrics: Option<AgentMetrics>,
+    },
 
     #[error("plan not found: {0}")]
     PlanNotFound(uuid::Uuid),

@@ -589,6 +589,7 @@ mod tests {
                 step_id: "a".into(),
                 agent_type: "echo".into(),
                 output: "ok".into(),
+                metrics: None,
             },
             PlanEvent::StepFailed {
                 plan_id,
@@ -596,6 +597,7 @@ mod tests {
                 step_id: "b".into(),
                 agent_type: "echo".into(),
                 error: "boom".into(),
+                metrics: None,
             },
             PlanEvent::StepRefused {
                 plan_id,
@@ -614,6 +616,8 @@ mod tests {
                 plan_id,
                 project,
                 status: PlanStatus::Completed,
+                total_metrics: None,
+                step_count: flowd_core::orchestration::observer::PlanStepCounts::default(),
             },
         ];
         let total = events.len();

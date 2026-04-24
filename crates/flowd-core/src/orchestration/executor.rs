@@ -27,7 +27,7 @@
 //! [`crate::orchestration::PlanStore`] is configured, every transition is
 //! mirrored to durable storage so the daemon can `rehydrate` after restart.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use super::gate::SharedRuleGate;
 use super::layer_runner::LayerRunner;
-use super::observer::{PlanEvent, SharedPlanObserver};
+use super::observer::{PlanEvent, PlanStepCounts, SharedPlanObserver};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,8 @@ use super::{
 pub struct AgentOutput {
     pub stdout: String,
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub metrics: Option<AgentMetrics>,
 }
 
 impl AgentOutput {
@@ -62,6 +64,74 @@ impl AgentOutput {
         Self {
             stdout: stdout.into(),
             exit_code: Some(0),
+            metrics: None,
+        }
+    }
+}
+
+/// Per-model token / cost usage reported by an agent invocation.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+impl ModelUsage {
+    fn merge(&mut self, other: &Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cost_usd += other.cost_usd;
+    }
+}
+
+/// Aggregate metrics captured alongside an agent invocation.
+///
+/// `model_usage` is keyed by model name so callers can report the split
+/// across, e.g., a primary model and a cache-hit-heavy auxiliary.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentMetrics {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub total_cost_usd: f64,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub duration_api_ms: u64,
+    #[serde(default)]
+    pub model_usage: BTreeMap<String, ModelUsage>,
+}
+
+impl AgentMetrics {
+    pub fn merge(&mut self, other: &Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.total_cost_usd += other.total_cost_usd;
+        self.duration_ms += other.duration_ms;
+        self.duration_api_ms += other.duration_api_ms;
+        for (model, usage) in &other.model_usage {
+            self.model_usage
+                .entry(model.clone())
+                .or_default()
+                .merge(usage);
         }
     }
 }
@@ -191,10 +261,10 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
                 cancel: Arc::new(AtomicBool::new(false)),
                 in_flight: Vec::new(),
             };
-            let mut guard = self
-                .plans
-                .lock()
-                .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
+            let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
+                message: "plan store poisoned".into(),
+                metrics: None,
+            })?;
             guard.insert(s.id, runtime);
         }
         Ok(())
@@ -219,10 +289,10 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
     }
 
     fn with_plan_mut<R>(&self, plan_id: Uuid, f: impl FnOnce(&mut PlanRuntime) -> R) -> Result<R> {
-        let mut guard = self
-            .plans
-            .lock()
-            .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
+        let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
+            message: "plan store poisoned".into(),
+            metrics: None,
+        })?;
         let entry = guard
             .get_mut(&plan_id)
             .ok_or(FlowdError::PlanNotFound(plan_id))?;
@@ -242,18 +312,21 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
         // Required for the future's auto-`Send` analysis even though
         // `MutexGuard: Send` would otherwise be fine.
         let (plan, cancel) = {
-            let mut guard = self
-                .plans
-                .lock()
-                .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
+            let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
+                message: "plan store poisoned".into(),
+                metrics: None,
+            })?;
             let runtime = guard
                 .get_mut(&plan_id)
                 .ok_or(FlowdError::PlanNotFound(plan_id))?;
             if runtime.plan.status != PlanStatus::Confirmed {
-                return Err(FlowdError::PlanExecution(format!(
-                    "plan `{plan_id}` must be Confirmed before execute (currently {:?})",
-                    runtime.plan.status
-                )));
+                return Err(FlowdError::PlanExecution {
+                    message: format!(
+                        "plan `{plan_id}` must be Confirmed before execute (currently {:?})",
+                        runtime.plan.status
+                    ),
+                    metrics: None,
+                });
             }
             runtime.plan.status = PlanStatus::Running;
             runtime.plan.started_at = Some(Utc::now());
@@ -281,6 +354,8 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
         plan: &Plan,
         cancel: &AtomicBool,
         overall_failed: bool,
+        total_metrics: AgentMetrics,
+        step_count: PlanStepCounts,
     ) -> Result<()> {
         let final_status = if cancel.load(Ordering::SeqCst) {
             PlanStatus::Cancelled
@@ -298,10 +373,21 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
         })?;
         self.persist_snapshot(plan_id).await?;
 
+        // `AgentMetrics` is additive, so the zero-valued default means
+        // "no step reported metrics"; collapse it back to `None` so
+        // downstream consumers can render "no rollup" without inspecting
+        // every field.
+        let total_metrics = if total_metrics == AgentMetrics::default() {
+            None
+        } else {
+            Some(total_metrics)
+        };
         self.emit(PlanEvent::Finished {
             plan_id,
             project: plan.project.clone(),
             status: final_status,
+            total_metrics,
+            step_count,
         });
         Ok(())
     }
@@ -333,10 +419,10 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
         // Explicit `drop(guard)` is not enough for the future's auto-Send
         // analysis — a syntactic scope block is.
         {
-            let mut guard = self
-                .plans
-                .lock()
-                .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
+            let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
+                message: "plan store poisoned".into(),
+                metrics: None,
+            })?;
             guard.insert(id, runtime);
         }
         self.persist_snapshot(id).await?;
@@ -351,10 +437,13 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
     async fn confirm(&self, plan_id: Uuid) -> Result<PlanPreview> {
         let preview = self.with_plan_mut(plan_id, |runtime| {
             if runtime.plan.status != PlanStatus::Draft {
-                return Err(FlowdError::PlanExecution(format!(
-                    "plan `{plan_id}` is not in Draft state (currently {:?})",
-                    runtime.plan.status
-                )));
+                return Err(FlowdError::PlanExecution {
+                    message: format!(
+                        "plan `{plan_id}` is not in Draft state (currently {:?})",
+                        runtime.plan.status
+                    ),
+                    metrics: None,
+                });
             }
             let preview = build_preview(&runtime.plan)?;
             runtime.plan.status = PlanStatus::Confirmed;
@@ -379,6 +468,8 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
         };
 
         let mut overall_failed = false;
+        let mut total_metrics = AgentMetrics::default();
+        let mut step_count = PlanStepCounts::default();
         for layer in plan.execution_layers()? {
             // Cancellation can be set by an external `cancel(plan_id)`
             // call between layers, or by a `Cancelled` step outcome
@@ -388,6 +479,11 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             }
 
             let outcome = runner.run(plan_id, &mut plan, &layer, &cancel).await?;
+            total_metrics.merge(&outcome.metrics);
+            step_count.completed = step_count
+                .completed
+                .saturating_add(outcome.step_count.completed);
+            step_count.failed = step_count.failed.saturating_add(outcome.step_count.failed);
 
             // Persist incremental state after every layer so `status()`
             // calls observe progress in real time.
@@ -404,15 +500,22 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             }
         }
 
-        self.finalize_execution(plan_id, &plan, &cancel, overall_failed)
-            .await
+        self.finalize_execution(
+            plan_id,
+            &plan,
+            &cancel,
+            overall_failed,
+            total_metrics,
+            step_count,
+        )
+        .await
     }
 
     async fn status(&self, plan_id: Uuid) -> Result<Plan> {
-        let guard = self
-            .plans
-            .lock()
-            .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
+        let guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
+            message: "plan store poisoned".into(),
+            metrics: None,
+        })?;
         guard
             .get(&plan_id)
             .map(|r| r.plan.clone())
@@ -462,6 +565,8 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
                     plan_id,
                     project,
                     status: PlanStatus::Cancelled,
+                    total_metrics: None,
+                    step_count: PlanStepCounts::default(),
                 });
                 Ok(())
             }
@@ -480,10 +585,13 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             // `Cancelled` is an explicit user stop (re-create the plan if
             // you want to retry); `Running` is racing with another caller.
             if runtime.plan.status != PlanStatus::Failed {
-                return Err(FlowdError::PlanExecution(format!(
-                    "plan `{plan_id}` is in {:?} state; only Failed plans can be resumed",
-                    runtime.plan.status
-                )));
+                return Err(FlowdError::PlanExecution {
+                    message: format!(
+                        "plan `{plan_id}` is in {:?} state; only Failed plans can be resumed",
+                        runtime.plan.status
+                    ),
+                    metrics: None,
+                });
             }
             for step in &mut runtime.plan.steps {
                 if step.status == StepStatus::Failed {
@@ -505,10 +613,13 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
     async fn apply_compile_output(&self, plan_id: Uuid, output: CompileOutput) -> Result<()> {
         self.with_plan_mut(plan_id, |runtime| {
             if runtime.plan.status != PlanStatus::Draft {
-                return Err(FlowdError::PlanExecution(format!(
-                    "plan `{plan_id}` is not in Draft state (currently {:?}); compile outputs only apply during clarification",
-                    runtime.plan.status
-                )));
+                return Err(FlowdError::PlanExecution {
+                    message: format!(
+                        "plan `{plan_id}` is not in Draft state (currently {:?}); compile outputs only apply during clarification",
+                        runtime.plan.status
+                    ),
+                    metrics: None,
+                });
             }
             runtime.plan.apply_compile_output(output);
             Ok(())
@@ -519,10 +630,13 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
     async fn invalidate_decision(&self, plan_id: Uuid, question_id: String) -> Result<Vec<String>> {
         let removed = self.with_plan_mut(plan_id, |runtime| {
             if runtime.plan.status != PlanStatus::Draft {
-                return Err(FlowdError::PlanExecution(format!(
-                    "plan `{plan_id}` is not in Draft state (currently {:?}); cannot invalidate decisions",
-                    runtime.plan.status
-                )));
+                return Err(FlowdError::PlanExecution {
+                    message: format!(
+                        "plan `{plan_id}` is not in Draft state (currently {:?}); cannot invalidate decisions",
+                        runtime.plan.status
+                    ),
+                    metrics: None,
+                });
             }
             Ok(runtime.plan.invalidate_decision(&question_id))
         })??;
@@ -539,9 +653,11 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
 pub(super) enum StepOutcome {
     Completed {
         output: String,
+        metrics: Option<AgentMetrics>,
     },
     Failed {
         error: String,
+        metrics: Option<AgentMetrics>,
     },
     Cancelled,
     /// Step was never spawned because an executor-side gate (currently the
@@ -561,6 +677,7 @@ pub(super) async fn run_step<S: AgentSpawner + ?Sized>(
 ) -> StepOutcome {
     let attempts = step.retry_count.saturating_add(1);
     let mut last_error: Option<String> = None;
+    let mut last_metrics: Option<AgentMetrics> = None;
 
     for _ in 0..attempts {
         if cancel.load(Ordering::SeqCst) {
@@ -571,22 +688,33 @@ pub(super) async fn run_step<S: AgentSpawner + ?Sized>(
         let result = match step.timeout_secs {
             Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), call).await {
                 Ok(r) => r,
-                Err(_) => Err(FlowdError::PlanExecution(format!(
-                    "step `{}` timed out after {secs}s",
-                    step.id
-                ))),
+                Err(_) => Err(FlowdError::PlanExecution {
+                    message: format!("step `{}` timed out after {secs}s", step.id),
+                    metrics: None,
+                }),
             },
             None => call.await,
         };
 
         match result {
-            Ok(out) => return StepOutcome::Completed { output: out.stdout },
-            Err(e) => last_error = Some(e.to_string()),
+            Ok(out) => {
+                return StepOutcome::Completed {
+                    output: out.stdout,
+                    metrics: out.metrics,
+                };
+            }
+            Err(e) => {
+                if let FlowdError::PlanExecution { metrics, .. } = &e {
+                    last_metrics.clone_from(metrics);
+                }
+                last_error = Some(e.to_string());
+            }
         }
     }
 
     StepOutcome::Failed {
         error: last_error.unwrap_or_else(|| "unknown step failure".into()),
+        metrics: last_metrics,
     }
 }
 
@@ -600,11 +728,11 @@ pub(super) fn apply_outcome(plan: &mut Plan, step_id: &str, outcome: &StepOutcom
     }
     step.completed_at = now;
     match outcome {
-        StepOutcome::Completed { output } => {
+        StepOutcome::Completed { output, .. } => {
             step.status = StepStatus::Completed;
             step.output = Some(output.clone());
         }
-        StepOutcome::Failed { error } => {
+        StepOutcome::Failed { error, .. } => {
             step.status = StepStatus::Failed;
             step.error = Some(error.clone());
         }
@@ -651,7 +779,10 @@ mod tests {
             let plan = plan.clone();
             async move {
                 m.lock()
-                    .map_err(|_| FlowdError::PlanExecution("map store poisoned".into()))?
+                    .map_err(|_| FlowdError::PlanExecution {
+                        message: "map store poisoned".into(),
+                        metrics: None,
+                    })?
                     .insert(plan.id, plan);
                 Ok(())
             }
@@ -661,7 +792,10 @@ mod tests {
             let m = Arc::clone(&self.0);
             async move {
                 Ok(m.lock()
-                    .map_err(|_| FlowdError::PlanExecution("map store poisoned".into()))?
+                    .map_err(|_| FlowdError::PlanExecution {
+                        message: "map store poisoned".into(),
+                        metrics: None,
+                    })?
                     .get(&id)
                     .cloned())
             }
@@ -673,9 +807,10 @@ mod tests {
         ) -> impl Future<Output = Result<Vec<crate::orchestration::PlanSummary>>> + Send {
             let m = Arc::clone(&self.0);
             async move {
-                let guard = m
-                    .lock()
-                    .map_err(|_| FlowdError::PlanExecution("map store poisoned".into()))?;
+                let guard = m.lock().map_err(|_| FlowdError::PlanExecution {
+                    message: "map store poisoned".into(),
+                    metrics: None,
+                })?;
                 let mut out: Vec<crate::orchestration::PlanSummary> = guard
                     .values()
                     .filter(|p| project.is_none_or(|pr| p.project == pr))
@@ -696,7 +831,10 @@ mod tests {
             let m = Arc::clone(&self.0);
             async move {
                 m.lock()
-                    .map_err(|_| FlowdError::PlanExecution("map store poisoned".into()))?
+                    .map_err(|_| FlowdError::PlanExecution {
+                        message: "map store poisoned".into(),
+                        metrics: None,
+                    })?
                     .remove(&id);
                 Ok(())
             }
@@ -740,7 +878,10 @@ mod tests {
     impl AgentSpawner for AlwaysFailSpawner {
         async fn spawn(&self, _: &PlanStep) -> Result<AgentOutput> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
-            Err(FlowdError::PlanExecution("nope".into()))
+            Err(FlowdError::PlanExecution {
+                message: "nope".into(),
+                metrics: None,
+            })
         }
     }
 
@@ -762,7 +903,10 @@ mod tests {
         async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
             let c = self.n.fetch_add(1, Ordering::SeqCst);
             if c == 0 {
-                Err(FlowdError::PlanExecution("first run fails".into()))
+                Err(FlowdError::PlanExecution {
+                    message: "first run fails".into(),
+                    metrics: None,
+                })
             } else {
                 Ok(AgentOutput::success(format!("ok:{}", step.id)))
             }
@@ -831,7 +975,7 @@ mod tests {
                 .await
                 .unwrap();
             let err = exec.execute(id).await.unwrap_err();
-            assert!(matches!(err, FlowdError::PlanExecution(_)));
+            assert!(matches!(err, FlowdError::PlanExecution { .. }));
         });
     }
 
@@ -1019,7 +1163,19 @@ mod tests {
         );
 
         match &events[4] {
-            PlanEvent::Finished { status, .. } => assert_eq!(*status, PlanStatus::Completed),
+            PlanEvent::Finished {
+                status,
+                step_count,
+                total_metrics,
+                ..
+            } => {
+                assert_eq!(*status, PlanStatus::Completed);
+                assert_eq!(step_count.completed, 2);
+                assert_eq!(step_count.failed, 0);
+                // EchoSpawner reports no metrics, so the rollup collapses
+                // back to `None` at finalise time.
+                assert!(total_metrics.is_none());
+            }
             other => panic!("expected Finished event, got: {other:?}"),
         }
     }
@@ -1249,7 +1405,9 @@ mod tests {
                 .apply_compile_output(id, CompileOutput::ready("# late", def_with_step("step-a")))
                 .await
                 .unwrap_err();
-            assert!(matches!(err, FlowdError::PlanExecution(m) if m.contains("Draft")));
+            assert!(
+                matches!(err, FlowdError::PlanExecution { message, .. } if message.contains("Draft"))
+            );
         });
     }
 
@@ -1325,5 +1483,241 @@ mod tests {
             let snap = exec.status(id).await.unwrap();
             assert_eq!(snap.status, PlanStatus::Cancelled);
         });
+    }
+
+    // ---------- AgentMetrics ----------
+
+    fn model_usage(
+        input: u64,
+        output: u64,
+        cache_create: u64,
+        cache_read: u64,
+        cost: f64,
+    ) -> ModelUsage {
+        ModelUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: cache_create,
+            cache_read_input_tokens: cache_read,
+            cost_usd: cost,
+        }
+    }
+
+    #[test]
+    fn agent_metrics_merge_sums_numeric_fields() {
+        let mut a = AgentMetrics {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 3,
+            cache_read_input_tokens: 4,
+            total_cost_usd: 0.5,
+            duration_ms: 100,
+            duration_api_ms: 80,
+            model_usage: BTreeMap::new(),
+        };
+        let b = AgentMetrics {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 6,
+            total_cost_usd: 1.25,
+            duration_ms: 10,
+            duration_api_ms: 7,
+            model_usage: BTreeMap::new(),
+        };
+
+        a.merge(&b);
+
+        assert_eq!(a.input_tokens, 11);
+        assert_eq!(a.output_tokens, 22);
+        assert_eq!(a.cache_creation_input_tokens, 8);
+        assert_eq!(a.cache_read_input_tokens, 10);
+        assert!((a.total_cost_usd - 1.75).abs() < f64::EPSILON);
+        assert_eq!(a.duration_ms, 110);
+        assert_eq!(a.duration_api_ms, 87);
+    }
+
+    #[test]
+    fn agent_metrics_merge_unions_model_usage_with_no_duplicates() {
+        let mut a = AgentMetrics::default();
+        a.model_usage
+            .insert("sonnet".into(), model_usage(10, 20, 0, 0, 0.1));
+        a.model_usage
+            .insert("haiku".into(), model_usage(1, 2, 0, 0, 0.01));
+
+        let mut b = AgentMetrics::default();
+        // Collides with `sonnet`: fields should sum.
+        b.model_usage
+            .insert("sonnet".into(), model_usage(5, 7, 2, 3, 0.4));
+        // New model: should be inserted as-is.
+        b.model_usage
+            .insert("opus".into(), model_usage(100, 200, 0, 0, 1.0));
+
+        a.merge(&b);
+
+        assert_eq!(a.model_usage.len(), 3, "no duplicate keys");
+        assert_eq!(
+            a.model_usage.get("sonnet").unwrap(),
+            &model_usage(15, 27, 2, 3, 0.5),
+            "collision must sum all fields"
+        );
+        assert_eq!(
+            a.model_usage.get("haiku").unwrap(),
+            &model_usage(1, 2, 0, 0, 0.01),
+            "untouched entry survives"
+        );
+        assert_eq!(
+            a.model_usage.get("opus").unwrap(),
+            &model_usage(100, 200, 0, 0, 1.0),
+            "new entry inserted"
+        );
+    }
+
+    /// Spawner that returns a preconfigured (output-or-error, metrics)
+    /// pair per step id. Lets a single test drive a plan where one
+    /// step succeeds with metrics and another fails with metrics, then
+    /// verify the executor accumulated both into the `Finished` event.
+    struct MetricsScriptedSpawner {
+        script: HashMap<String, std::result::Result<AgentMetrics, AgentMetrics>>,
+    }
+
+    impl AgentSpawner for MetricsScriptedSpawner {
+        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+            match self.script.get(&step.id) {
+                Some(Ok(metrics)) => Ok(AgentOutput {
+                    stdout: format!("ok:{}", step.id),
+                    exit_code: Some(0),
+                    metrics: Some(metrics.clone()),
+                }),
+                Some(Err(metrics)) => Err(FlowdError::PlanExecution {
+                    message: format!("scripted failure for {}", step.id),
+                    metrics: Some(metrics.clone()),
+                }),
+                None => panic!("no scripted outcome for step `{}`", step.id),
+            }
+        }
+    }
+
+    /// End-to-end rollup check: a plan with both a successful step and a
+    /// failing step sees its `Finished` event carry `total_metrics` equal
+    /// to the element-wise sum of the per-step metrics emitted on the
+    /// intervening `StepCompleted` / `StepFailed` events. This pins the
+    /// accumulation contract the CLI / MCP renderers depend on.
+    #[test]
+    fn finished_event_aggregates_metrics_across_success_and_failure_steps() {
+        use crate::orchestration::observer::{PlanEvent, PlanObserver};
+
+        #[derive(Default)]
+        struct CollectingObserver {
+            events: Mutex<Vec<PlanEvent>>,
+        }
+        impl PlanObserver for CollectingObserver {
+            fn on_event(&self, event: PlanEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let ok_metrics = AgentMetrics {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 40,
+            total_cost_usd: 0.25,
+            duration_ms: 1_000,
+            duration_api_ms: 800,
+            model_usage: BTreeMap::new(),
+        };
+        let fail_metrics = AgentMetrics {
+            input_tokens: 20,
+            output_tokens: 5,
+            cache_creation_input_tokens: 2,
+            cache_read_input_tokens: 8,
+            total_cost_usd: 0.04,
+            duration_ms: 200,
+            duration_api_ms: 150,
+            model_usage: BTreeMap::new(),
+        };
+
+        let mut script: HashMap<String, std::result::Result<AgentMetrics, AgentMetrics>> =
+            HashMap::new();
+        script.insert("ok".into(), Ok(ok_metrics.clone()));
+        script.insert("bad".into(), Err(fail_metrics.clone()));
+
+        let obs = Arc::new(CollectingObserver::default());
+        let exec = InMemoryPlanExecutor::new(MetricsScriptedSpawner { script })
+            .with_observer(Arc::clone(&obs) as Arc<dyn PlanObserver>);
+
+        // Two independent steps so both outcomes contribute within a
+        // single layer run; any downstream step would be skipped once
+        // the layer fails and muddy the rollup assertion.
+        let plan = Plan::new("p", "proj", vec![step("ok", &[]), step("bad", &[])]);
+        let plan_id = plan.id;
+
+        rt().block_on(async {
+            exec.submit(plan).await.unwrap();
+            exec.confirm(plan_id).await.unwrap();
+            exec.execute(plan_id).await.unwrap();
+        });
+
+        let events = obs.events.lock().unwrap().clone();
+        // Cross-check the per-step events carried the individual metrics
+        // we scripted, so if the rollup assertion fails we can tell
+        // whether the bug is in the spawner wiring or the accumulator.
+        let mut saw_ok_step_metrics = false;
+        let mut saw_bad_step_metrics = false;
+        for e in &events {
+            match e {
+                PlanEvent::StepCompleted {
+                    step_id, metrics, ..
+                } if step_id == "ok" => {
+                    assert_eq!(metrics.as_ref(), Some(&ok_metrics));
+                    saw_ok_step_metrics = true;
+                }
+                PlanEvent::StepFailed {
+                    step_id, metrics, ..
+                } if step_id == "bad" => {
+                    assert_eq!(metrics.as_ref(), Some(&fail_metrics));
+                    saw_bad_step_metrics = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_ok_step_metrics && saw_bad_step_metrics);
+
+        let finished = events
+            .iter()
+            .find_map(|e| match e {
+                PlanEvent::Finished {
+                    status,
+                    total_metrics,
+                    step_count,
+                    ..
+                } => Some((*status, total_metrics.clone(), *step_count)),
+                _ => None,
+            })
+            .expect("Finished event must be present");
+        assert_eq!(finished.0, PlanStatus::Failed);
+        assert_eq!(finished.2.completed, 1);
+        assert_eq!(finished.2.failed, 1);
+
+        let mut expected = ok_metrics.clone();
+        expected.merge(&fail_metrics);
+        let total = finished
+            .1
+            .expect("total_metrics must be present when any step reported metrics");
+        assert_eq!(total, expected);
+    }
+
+    #[test]
+    fn agent_metrics_serde_roundtrip_all_zero_default() {
+        let m = AgentMetrics::default();
+        let json = serde_json::to_string(&m).unwrap();
+        // Shape matters more than exact ordering for BTreeMap (which is stable).
+        assert_eq!(
+            json,
+            r#"{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"total_cost_usd":0.0,"duration_ms":0,"duration_api_ms":0,"model_usage":{}}"#
+        );
+        let back: AgentMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m);
     }
 }

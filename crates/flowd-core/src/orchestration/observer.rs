@@ -23,9 +23,27 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::PlanStatus;
+use super::executor::AgentMetrics;
+
+/// Per-terminal-outcome counts rolled up on the `Finished` event.
+///
+/// Kept as a dedicated struct (rather than a loose `(u32, u32)`) so the
+/// renderer and any future consumer stay type-safe and self-documenting.
+/// `completed` counts every step that ended with a `StepCompleted`
+/// event; `failed` counts every step that ended with a `StepFailed`
+/// event (retries exhausted, panic) or was refused by the rule gate
+/// (which settles into the plan's `Failed` terminal status). Cancelled
+/// steps are excluded: the plan's terminal status already reflects
+/// cancellation.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanStepCounts {
+    pub completed: u32,
+    pub failed: u32,
+}
 
 /// Lifecycle event emitted by the executor at well-defined transitions.
 ///
@@ -50,6 +68,11 @@ pub enum PlanEvent {
         agent_type: String,
         /// May be truncated by the adapter for storage.
         output: String,
+        /// Token / cost usage captured alongside the successful run, if
+        /// the spawner reported any. Adapters may persist this verbatim
+        /// in the event payload; `None` means the spawner did not
+        /// produce metrics (e.g. non-JSON passthrough).
+        metrics: Option<AgentMetrics>,
     },
     /// A step failed after exhausting retries (or never ran due to a panic).
     StepFailed {
@@ -58,6 +81,11 @@ pub enum PlanEvent {
         step_id: String,
         agent_type: String,
         error: String,
+        /// Token / cost usage from the last failing attempt, when the
+        /// spawner attached metrics to [`FlowdError::PlanExecution`].
+        /// Failed steps still cost money, so the audit log keeps the
+        /// spend visible.
+        metrics: Option<AgentMetrics>,
     },
     /// A step was refused by the executor's gate (currently the rule gate).
     StepRefused {
@@ -75,10 +103,19 @@ pub enum PlanEvent {
         agent_type: String,
     },
     /// `execute` has finished -- success, failure, or cancellation.
+    ///
+    /// `total_metrics` is the `AgentMetrics::merge`-accumulated sum of
+    /// every per-step metrics payload the spawner reported during this
+    /// run. `None` means the plan did not run any step that attached
+    /// metrics (e.g. a cancel from `Draft`). `step_count` summarises the
+    /// per-outcome counts so the renderer does not have to re-walk the
+    /// step list.
     Finished {
         plan_id: Uuid,
         project: String,
         status: PlanStatus,
+        total_metrics: Option<AgentMetrics>,
+        step_count: PlanStepCounts,
     },
     /// The compiler surfaced one or more new clarification questions on a
     /// `Draft` plan. Emitted from the prose-first plan-creation MCP path
@@ -181,6 +218,8 @@ mod tests {
             plan_id: Uuid::nil(),
             project: "demo".into(),
             status: PlanStatus::Completed,
+            total_metrics: None,
+            step_count: PlanStepCounts::default(),
         };
         assert_eq!(evt.project(), "demo");
     }

@@ -43,9 +43,11 @@ use uuid::Uuid;
 use crate::error::{FlowdError, Result};
 
 use super::Plan;
-use super::executor::{AgentSpawner, PlanRuntime, StepOutcome, apply_outcome, run_step};
+use super::executor::{
+    AgentMetrics, AgentSpawner, PlanRuntime, StepOutcome, apply_outcome, run_step,
+};
 use super::gate::SharedRuleGate;
-use super::observer::{PlanEvent, SharedPlanObserver};
+use super::observer::{PlanEvent, PlanStepCounts, SharedPlanObserver};
 use super::template;
 
 /// Per-layer fan-out coordinator. Holds borrowed references to the
@@ -66,6 +68,14 @@ pub(super) struct LayerOutcome {
     /// Cancellation is *not* counted here: the executor inspects the
     /// cancellation flag separately to settle the plan as `Cancelled`.
     pub(super) failed: bool,
+    /// Accumulated metrics from every step in this layer that reported
+    /// a non-`None` metrics payload (both successes and failures).
+    /// Kept as `AgentMetrics` with zero-valued defaults so the caller
+    /// can `merge` it into a running plan-wide total unconditionally.
+    pub(super) metrics: AgentMetrics,
+    /// Per-terminal-outcome counts for this layer; the executor sums
+    /// them across layers for the `Finished` event's rollup.
+    pub(super) step_count: PlanStepCounts,
 }
 
 impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
@@ -98,6 +108,8 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
 
         let mut handles: Vec<(String, JoinHandle<StepOutcome>)> = Vec::with_capacity(layer.len());
         let mut layer_failed = false;
+        let mut rollup = AgentMetrics::default();
+        let mut step_count = PlanStepCounts::default();
 
         for step_id in layer {
             let Some(mut step) = plan.steps.iter().find(|s| &s.id == step_id).cloned() else {
@@ -108,6 +120,7 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
 
             if self.refuse_via_gate(plan_id, plan, &step) {
                 layer_failed = true;
+                step_count.failed = step_count.failed.saturating_add(1);
                 continue;
             }
 
@@ -132,14 +145,19 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
                 .unwrap_or_default();
 
             match outcome {
-                StepOutcome::Failed { error } => {
+                StepOutcome::Failed { error, metrics } => {
                     layer_failed = true;
+                    step_count.failed = step_count.failed.saturating_add(1);
+                    if let Some(m) = &metrics {
+                        rollup.merge(m);
+                    }
                     self.emit(PlanEvent::StepFailed {
                         plan_id,
                         project: plan.project.clone(),
                         step_id,
                         agent_type,
                         error,
+                        metrics,
                     });
                 }
                 StepOutcome::Cancelled => {
@@ -155,13 +173,18 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
                         agent_type,
                     });
                 }
-                StepOutcome::Completed { output } => {
+                StepOutcome::Completed { output, metrics } => {
+                    step_count.completed = step_count.completed.saturating_add(1);
+                    if let Some(m) = &metrics {
+                        rollup.merge(m);
+                    }
                     self.emit(PlanEvent::StepCompleted {
                         plan_id,
                         project: plan.project.clone(),
                         step_id,
                         agent_type,
                         output,
+                        metrics,
                     });
                 }
                 // Refused outcomes never reach this loop: a denied step is
@@ -175,6 +198,8 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
 
         Ok(LayerOutcome {
             failed: layer_failed,
+            metrics: rollup,
+            step_count,
         })
     }
 
@@ -235,10 +260,10 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
         plan_id: Uuid,
         handles: &[(String, JoinHandle<StepOutcome>)],
     ) -> Result<()> {
-        let mut guard = self
-            .plans
-            .lock()
-            .map_err(|_| FlowdError::PlanExecution("plan store poisoned".into()))?;
+        let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
+            message: "plan store poisoned".into(),
+            metrics: None,
+        })?;
         if let Some(runtime) = guard.get_mut(&plan_id) {
             runtime.in_flight = handles.iter().map(|(_, h)| h.abort_handle()).collect();
         }
@@ -271,9 +296,11 @@ async fn await_outcome(handle: JoinHandle<StepOutcome>, step_id: &str) -> StepOu
         Err(join_err) if join_err.is_cancelled() => StepOutcome::Cancelled,
         Err(join_err) if join_err.is_panic() => StepOutcome::Failed {
             error: format!("step `{step_id}` panicked: {join_err}"),
+            metrics: None,
         },
         Err(join_err) => StepOutcome::Failed {
             error: format!("step `{step_id}` join error: {join_err}"),
+            metrics: None,
         },
     }
 }
@@ -338,7 +365,7 @@ mod tests {
         });
         let outcome = await_outcome(handle, "explode").await;
         match outcome {
-            StepOutcome::Failed { error } => {
+            StepOutcome::Failed { error, .. } => {
                 assert!(error.contains("explode"), "error should mention step id");
                 assert!(error.contains("panicked"), "error should mention panic");
             }
@@ -365,11 +392,12 @@ mod tests {
         let handle: JoinHandle<StepOutcome> = tokio::spawn(async {
             StepOutcome::Completed {
                 output: "ok".into(),
+                metrics: None,
             }
         });
         let outcome = await_outcome(handle, "fast").await;
         match outcome {
-            StepOutcome::Completed { output } => assert_eq!(output, "ok"),
+            StepOutcome::Completed { output, .. } => assert_eq!(output, "ok"),
             other => panic!("expected Completed, got {other:?}"),
         }
     }

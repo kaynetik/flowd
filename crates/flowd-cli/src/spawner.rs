@@ -55,16 +55,25 @@
 //! Stdout is captured into [`AgentOutput::stdout`]. For Claude-like
 //! bins the JSON envelope is parsed and the human-readable `result`
 //! field is what downstream consumers see; the raw JSON is logged at
-//! `tracing::trace!` only. Stderr is emitted via `tracing` (warn on
-//! non-zero exit, debug otherwise) so it surfaces in the daemon log
-//! without polluting the JSON-RPC channel.
+//! `tracing::trace!` only. The same envelope is also mined for token
+//! counts and USD cost (top-level `usage` + `total_cost_usd`, plus
+//! the per-model `modelUsage` block) and surfaced as
+//! [`AgentMetrics`] on the returned [`AgentOutput`]. Metrics are
+//! captured on both the success path *and* the failure paths
+//! (`is_error: true`, lingering `permission_denials`); the failure
+//! variants attach them to [`FlowdError::PlanExecution`] so an
+//! expensive refusal still lands in the audit log with its true
+//! spend instead of flying under the radar. Stderr is emitted via
+//! `tracing` (warn on non-zero exit, debug otherwise) so it surfaces
+//! in the daemon log without polluting the JSON-RPC channel.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Stdio;
 
 use flowd_core::error::{FlowdError, Result};
-use flowd_core::orchestration::executor::AgentSpawner;
+use flowd_core::orchestration::executor::{AgentMetrics, AgentSpawner, ModelUsage};
 use flowd_core::orchestration::{AgentOutput, PlanStep};
 use serde::Deserialize;
 use tokio::process::Command;
@@ -132,12 +141,97 @@ struct ClaudeJsonEnvelope {
     /// Treated as a hard failure so the audit log does not lie.
     #[serde(default)]
     permission_denials: Vec<ClaudePermissionDenial>,
+    /// Aggregate token counts for the whole run (`snake_case` upstream).
+    #[serde(default)]
+    usage: ClaudeUsage,
+    /// Aggregate USD cost for the run.
+    #[serde(default)]
+    total_cost_usd: f64,
+    /// Wall-clock duration of the run in milliseconds.
+    #[serde(default)]
+    duration_ms: u64,
+    /// Cumulative time spent in Anthropic API calls, in milliseconds.
+    #[serde(default)]
+    duration_api_ms: u64,
+    /// Per-model breakdown, keyed by model name. Note the camelCase
+    /// key (`modelUsage`) and camelCase inner fields -- the rest of
+    /// the envelope is `snake_case`, so upstream is inconsistent and
+    /// this one block needs explicit `rename`s.
+    #[serde(default, rename = "modelUsage")]
+    model_usage: BTreeMap<String, ClaudeModelUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ClaudePermissionDenial {
     #[serde(default)]
     tool_name: String,
+}
+
+/// Top-level `usage` block. Upstream uses `snake_case` here, so no
+/// per-field renames are needed.
+#[derive(Debug, Default, Deserialize)]
+#[allow(clippy::struct_field_names)]
+struct ClaudeUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
+/// Per-model entry under `modelUsage`. Upstream emits camelCase keys
+/// here (unlike the top-level `usage` block), so every field needs
+/// an explicit rename.
+#[derive(Debug, Default, Deserialize)]
+struct ClaudeModelUsage {
+    #[serde(default, rename = "inputTokens")]
+    input_tokens: u64,
+    #[serde(default, rename = "outputTokens")]
+    output_tokens: u64,
+    #[serde(default, rename = "cacheCreationInputTokens")]
+    cache_creation_input_tokens: u64,
+    #[serde(default, rename = "cacheReadInputTokens")]
+    cache_read_input_tokens: u64,
+    #[serde(default, rename = "costUSD")]
+    cost_usd: f64,
+}
+
+/// Single conversion site from the raw Claude envelope to the
+/// transport-agnostic [`AgentMetrics`] type consumed by the rest of
+/// the daemon. Keeping this as the only translation point means
+/// schema-drift fixes land in one place.
+impl From<&ClaudeJsonEnvelope> for AgentMetrics {
+    fn from(e: &ClaudeJsonEnvelope) -> Self {
+        let model_usage = e
+            .model_usage
+            .iter()
+            .map(|(name, u)| {
+                (
+                    name.clone(),
+                    ModelUsage {
+                        input_tokens: u.input_tokens,
+                        output_tokens: u.output_tokens,
+                        cache_creation_input_tokens: u.cache_creation_input_tokens,
+                        cache_read_input_tokens: u.cache_read_input_tokens,
+                        cost_usd: u.cost_usd,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            input_tokens: e.usage.input_tokens,
+            output_tokens: e.usage.output_tokens,
+            cache_creation_input_tokens: e.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: e.usage.cache_read_input_tokens,
+            total_cost_usd: e.total_cost_usd,
+            duration_ms: e.duration_ms,
+            duration_api_ms: e.duration_api_ms,
+            model_usage,
+        }
+    }
 }
 
 /// `AgentSpawner` that shells out to a local CLI binary with the step's
@@ -240,12 +334,13 @@ impl AgentSpawner for LocalShellSpawner {
             "spawning agent step"
         );
 
-        let output = cmd.output().await.map_err(|e| {
-            FlowdError::PlanExecution(format!(
+        let output = cmd.output().await.map_err(|e| FlowdError::PlanExecution {
+            message: format!(
                 "failed to spawn agent `{bin}` for step `{step}`: {e}",
                 bin = self.bin_display(),
                 step = step.id,
-            ))
+            ),
+            metrics: None,
         })?;
 
         let raw_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -259,12 +354,15 @@ impl AgentSpawner for LocalShellSpawner {
                 stderr = %truncate_for_log(&stderr, 4096),
                 "agent step exited non-zero"
             );
-            return Err(FlowdError::PlanExecution(format!(
-                "step `{step}` failed (exit={code}): {stderr}",
-                step = step.id,
-                code = code.map_or_else(|| "signal".into(), |c| c.to_string()),
-                stderr = truncate_for_log(stderr.trim(), 1024),
-            )));
+            return Err(FlowdError::PlanExecution {
+                message: format!(
+                    "step `{step}` failed (exit={code}): {stderr}",
+                    step = step.id,
+                    code = code.map_or_else(|| "signal".into(), |c| c.to_string()),
+                    stderr = truncate_for_log(stderr.trim(), 1024),
+                ),
+                metrics: None,
+            });
         }
 
         if !stderr.is_empty() {
@@ -275,33 +373,41 @@ impl AgentSpawner for LocalShellSpawner {
             );
         }
 
-        let stdout = if claude_like {
+        let (stdout, metrics) = if claude_like {
             interpret_claude_stdout(&step.id, &raw_stdout)?
         } else {
-            raw_stdout
+            (raw_stdout, None)
         };
 
         Ok(AgentOutput {
             stdout,
             exit_code: code,
+            metrics,
         })
     }
 }
 
 /// Parse a Claude `--output-format=json` envelope, fail loudly on
 /// signals that exit-code zero would otherwise hide, and return the
-/// human-readable `result` field as the new stdout. Falls back to
-/// the raw payload if the bytes do not parse as JSON -- common when
-/// an operator overrides `$FLOWD_AGENT_EXTRA_ARGS` to force text
-/// output. Returning `Err` here marks the step `failed` in the
-/// orchestration log.
-fn interpret_claude_stdout(step_id: &str, raw: &str) -> Result<String> {
+/// human-readable `result` field alongside the metrics block the
+/// envelope carries. Falls back to the raw payload (and no metrics)
+/// if the bytes do not parse as JSON -- common when an operator
+/// overrides `$FLOWD_AGENT_EXTRA_ARGS` to force text output.
+///
+/// Failure paths (`is_error: true`, non-empty `permission_denials`)
+/// still attach the envelope's metrics to the returned `Err`: failed
+/// steps still cost money, and the audit log must reflect the spend.
+/// Returning `Err` here marks the step `failed` in the orchestration log.
+fn interpret_claude_stdout(step_id: &str, raw: &str) -> Result<(String, Option<AgentMetrics>)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(FlowdError::PlanExecution(format!(
-            "step `{step_id}` produced empty stdout (claude exited 0 with no JSON envelope; \
-             likely a tool-use timeout or a config that suppressed --output-format=json)"
-        )));
+        return Err(FlowdError::PlanExecution {
+            message: format!(
+                "step `{step_id}` produced empty stdout (claude exited 0 with no JSON envelope; \
+                 likely a tool-use timeout or a config that suppressed --output-format=json)"
+            ),
+            metrics: None,
+        });
     }
 
     let envelope: ClaudeJsonEnvelope = match serde_json::from_str(trimmed) {
@@ -312,15 +418,20 @@ fn interpret_claude_stdout(step_id: &str, raw: &str) -> Result<String> {
                 error = %e,
                 "claude-like spawner: stdout was not parseable JSON; passing through raw"
             );
-            return Ok(raw.to_owned());
+            return Ok((raw.to_owned(), None));
         }
     };
 
+    let metrics: AgentMetrics = (&envelope).into();
+
     if envelope.is_error {
-        return Err(FlowdError::PlanExecution(format!(
-            "step `{step_id}` reported is_error=true: {result}",
-            result = truncate_for_log(envelope.result.trim(), 1024),
-        )));
+        return Err(FlowdError::PlanExecution {
+            message: format!(
+                "step `{step_id}` reported is_error=true: {result}",
+                result = truncate_for_log(envelope.result.trim(), 1024),
+            ),
+            metrics: Some(metrics),
+        });
     }
 
     if !envelope.permission_denials.is_empty() {
@@ -329,16 +440,19 @@ fn interpret_claude_stdout(step_id: &str, raw: &str) -> Result<String> {
             .iter()
             .map(|d| d.tool_name.as_str())
             .collect();
-        return Err(FlowdError::PlanExecution(format!(
-            "step `{step_id}` had {n} tool invocation(s) denied despite \
-             --dangerously-skip-permissions ({denied:?}); the daemon is refusing \
-             to record this as success. result: {result}",
-            n = denied.len(),
-            result = truncate_for_log(envelope.result.trim(), 1024),
-        )));
+        return Err(FlowdError::PlanExecution {
+            message: format!(
+                "step `{step_id}` had {n} tool invocation(s) denied despite \
+                 --dangerously-skip-permissions ({denied:?}); the daemon is refusing \
+                 to record this as success. result: {result}",
+                n = denied.len(),
+                result = truncate_for_log(envelope.result.trim(), 1024),
+            ),
+            metrics: Some(metrics),
+        });
     }
 
-    Ok(envelope.result)
+    Ok((envelope.result, Some(metrics)))
 }
 
 /// Spawner used as the fallback when no agent binary is discoverable. Fails
@@ -349,12 +463,13 @@ pub struct UnconfiguredSpawner;
 
 impl AgentSpawner for UnconfiguredSpawner {
     async fn spawn(&self, _step: &PlanStep) -> Result<AgentOutput> {
-        Err(FlowdError::PlanExecution(
-            "no agent CLI configured. Set $FLOWD_AGENT_BIN to an absolute \
-             path, or install one of: cursor-agent, claude, codex, aider \
-             into $PATH, then restart the daemon."
+        Err(FlowdError::PlanExecution {
+            message: "no agent CLI configured. Set $FLOWD_AGENT_BIN to an absolute \
+                      path, or install one of: cursor-agent, claude, codex, aider \
+                      into $PATH, then restart the daemon."
                 .into(),
-        ))
+            metrics: None,
+        })
     }
 }
 
@@ -462,7 +577,7 @@ mod tests {
     async fn missing_binary_yields_plan_execution_error() {
         let s = LocalShellSpawner::new("/does/not/exist/flowd-agent");
         let err = s.spawn(&step("anything")).await.unwrap_err();
-        assert!(matches!(err, FlowdError::PlanExecution(_)));
+        assert!(matches!(err, FlowdError::PlanExecution { .. }));
     }
 
     #[tokio::test]
@@ -524,7 +639,7 @@ mod tests {
     #[test]
     fn interpret_claude_stdout_extracts_result_on_success() {
         let raw = r#"{"is_error":false,"result":"OK","permission_denials":[]}"#;
-        let out = interpret_claude_stdout("step-1", raw).unwrap();
+        let (out, _) = interpret_claude_stdout("step-1", raw).unwrap();
         assert_eq!(out, "OK");
     }
 
@@ -573,8 +688,12 @@ mod tests {
     #[test]
     fn interpret_claude_stdout_passes_through_non_json_payload() {
         let raw = "just a plain text reply\n";
-        let out = interpret_claude_stdout("step-1", raw).unwrap();
+        let (out, metrics) = interpret_claude_stdout("step-1", raw).unwrap();
         assert_eq!(out, raw);
+        assert!(
+            metrics.is_none(),
+            "plain-text passthrough yields no metrics"
+        );
     }
 
     /// Schema-drift defence: tolerate unknown keys without choking,
@@ -583,8 +702,158 @@ mod tests {
     #[test]
     fn interpret_claude_stdout_tolerates_unknown_fields() {
         let raw = r#"{"is_error":false,"result":"x","future_field":42,"another":"y"}"#;
-        let out = interpret_claude_stdout("step-1", raw).unwrap();
+        let (out, _) = interpret_claude_stdout("step-1", raw).unwrap();
         assert_eq!(out, "x");
+    }
+
+    /// Happy-path metric extraction: a full envelope populates every
+    /// numeric field the daemon bills against.
+    #[test]
+    fn interpret_claude_stdout_extracts_metrics_on_success() {
+        let raw = r#"{
+            "is_error": false,
+            "result": "done",
+            "permission_denials": [],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_creation_input_tokens": 10,
+                "cache_read_input_tokens": 20
+            },
+            "total_cost_usd": 0.0123,
+            "duration_ms": 1500,
+            "duration_api_ms": 1200,
+            "modelUsage": {
+                "claude-sonnet-4-5": {
+                    "inputTokens": 100,
+                    "outputTokens": 50,
+                    "cacheCreationInputTokens": 10,
+                    "cacheReadInputTokens": 20,
+                    "costUSD": 0.0123
+                }
+            }
+        }"#;
+        let (stdout, metrics) = interpret_claude_stdout("step-1", raw).unwrap();
+        assert_eq!(stdout, "done");
+        let m = metrics.expect("metrics must be present on success");
+        assert_eq!(m.input_tokens, 100);
+        assert_eq!(m.output_tokens, 50);
+        assert_eq!(m.cache_creation_input_tokens, 10);
+        assert_eq!(m.cache_read_input_tokens, 20);
+        assert!((m.total_cost_usd - 0.0123).abs() < f64::EPSILON);
+        assert_eq!(m.duration_ms, 1500);
+        assert_eq!(m.duration_api_ms, 1200);
+        let model = m
+            .model_usage
+            .get("claude-sonnet-4-5")
+            .expect("per-model entry must be decoded");
+        assert_eq!(model.input_tokens, 100);
+        assert_eq!(model.output_tokens, 50);
+        assert_eq!(model.cache_creation_input_tokens, 10);
+        assert_eq!(model.cache_read_input_tokens, 20);
+        assert!((model.cost_usd - 0.0123).abs() < f64::EPSILON);
+    }
+
+    /// Failed steps still cost money: the `is_error: true` path must
+    /// surface the envelope's metrics through the `Err` so accounting
+    /// stays honest.
+    #[test]
+    fn interpret_claude_stdout_attaches_metrics_to_is_error_failure() {
+        let raw = r#"{
+            "is_error": true,
+            "result": "upstream API error",
+            "usage": {"input_tokens": 7, "output_tokens": 3},
+            "total_cost_usd": 0.004,
+            "duration_ms": 250,
+            "duration_api_ms": 240
+        }"#;
+        let err = interpret_claude_stdout("step-1", raw).unwrap_err();
+        match err {
+            FlowdError::PlanExecution { metrics, .. } => {
+                let m = metrics.expect("is_error failure must carry metrics");
+                assert_eq!(m.input_tokens, 7);
+                assert_eq!(m.output_tokens, 3);
+                assert!((m.total_cost_usd - 0.004).abs() < f64::EPSILON);
+                assert_eq!(m.duration_ms, 250);
+                assert_eq!(m.duration_api_ms, 240);
+            }
+            other => panic!("expected PlanExecution, got {other:?}"),
+        }
+    }
+
+    /// Same contract as `is_error`: a denied-tool failure must still
+    /// report the cost incurred getting to the refusal.
+    #[test]
+    fn interpret_claude_stdout_attaches_metrics_to_permission_denial_failure() {
+        let raw = r#"{
+            "is_error": false,
+            "result": "refused",
+            "permission_denials": [{"tool_name": "Write"}],
+            "usage": {"input_tokens": 12, "output_tokens": 4},
+            "total_cost_usd": 0.002
+        }"#;
+        let err = interpret_claude_stdout("step-1", raw).unwrap_err();
+        match err {
+            FlowdError::PlanExecution { metrics, .. } => {
+                let m = metrics.expect("permission_denials failure must carry metrics");
+                assert_eq!(m.input_tokens, 12);
+                assert_eq!(m.output_tokens, 4);
+                assert!((m.total_cost_usd - 0.002).abs() < f64::EPSILON);
+            }
+            other => panic!("expected PlanExecution, got {other:?}"),
+        }
+    }
+
+    /// Schema-drift defence: an envelope without `usage` (or any other
+    /// new field) must decode into zero-valued metrics rather than
+    /// erroring. Upstream can drop or rename a field between releases
+    /// and the spawner keeps running.
+    #[test]
+    fn interpret_claude_stdout_handles_envelope_without_usage_block() {
+        let raw = r#"{"is_error":false,"result":"minimal"}"#;
+        let (stdout, metrics) = interpret_claude_stdout("step-1", raw).unwrap();
+        assert_eq!(stdout, "minimal");
+        let m = metrics.expect("metrics envelope is constructed unconditionally on parse");
+        assert_eq!(m.input_tokens, 0);
+        assert_eq!(m.output_tokens, 0);
+        assert_eq!(m.cache_creation_input_tokens, 0);
+        assert_eq!(m.cache_read_input_tokens, 0);
+        assert!(m.total_cost_usd.abs() < f64::EPSILON);
+        assert_eq!(m.duration_ms, 0);
+        assert_eq!(m.duration_api_ms, 0);
+        assert!(m.model_usage.is_empty());
+    }
+
+    /// The `modelUsage` block is the one place upstream swaps to
+    /// camelCase. Verify the serde renames actually bite: if any of
+    /// them regress to `snake_case`, the inner fields silently zero out.
+    #[test]
+    #[allow(non_snake_case)]
+    fn interpret_claude_stdout_parses_modelUsage_camelcase() {
+        let raw = r#"{
+            "is_error": false,
+            "result": "ok",
+            "modelUsage": {
+                "claude-opus-4-7": {
+                    "inputTokens": 11,
+                    "outputTokens": 22,
+                    "cacheCreationInputTokens": 33,
+                    "cacheReadInputTokens": 44,
+                    "costUSD": 0.55
+                }
+            }
+        }"#;
+        let (_, metrics) = interpret_claude_stdout("step-1", raw).unwrap();
+        let m = metrics.expect("metrics present on success");
+        let entry = m
+            .model_usage
+            .get("claude-opus-4-7")
+            .expect("camelCase model-usage key must decode");
+        assert_eq!(entry.input_tokens, 11);
+        assert_eq!(entry.output_tokens, 22);
+        assert_eq!(entry.cache_creation_input_tokens, 33);
+        assert_eq!(entry.cache_read_input_tokens, 44);
+        assert!((entry.cost_usd - 0.55).abs() < f64::EPSILON);
     }
 
     // ----------------------------------------------------------------------
@@ -639,6 +908,20 @@ mod tests {
             out.stdout.to_uppercase().contains("OK"),
             "expected 'OK' in result, got: {stdout}",
             stdout = out.stdout
+        );
+
+        // Live wire-up check: a real claude run must populate metrics
+        // and report non-zero spend. If either fails, the JSON-envelope
+        // contract with upstream has drifted and `From<&ClaudeJsonEnvelope>`
+        // needs a look.
+        assert!(
+            out.metrics.is_some(),
+            "expected metrics on live claude run; got: {out:?}"
+        );
+        let m = out.metrics.clone().unwrap();
+        assert!(
+            m.total_cost_usd > 0.0,
+            "expected non-zero total_cost_usd on live claude run; got: {m:?}"
         );
     }
 

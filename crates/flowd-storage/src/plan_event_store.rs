@@ -221,11 +221,14 @@ mod tests {
                 step_id: "build".into(),
                 agent_type: "echo".into(),
                 output: "ok".into(),
+                metrics: None,
             },
             PlanEvent::Finished {
                 plan_id,
                 project,
                 status: PlanStatus::Completed,
+                total_metrics: None,
+                step_count: flowd_core::orchestration::observer::PlanStepCounts::default(),
             },
         ];
         for e in &events {
@@ -269,6 +272,7 @@ mod tests {
                 step_id: "a".into(),
                 agent_type: "echo".into(),
                 error: "boom".into(),
+                metrics: None,
             })
             .await
             .unwrap();
@@ -279,6 +283,7 @@ mod tests {
                 step_id: "b".into(),
                 agent_type: "echo".into(),
                 output: "ok".into(),
+                metrics: None,
             })
             .await
             .unwrap();

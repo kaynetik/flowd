@@ -258,6 +258,27 @@ flowd export -o /tmp/dump                # browsable markdown per project/sessio
 
 All read commands hit `SQLite` directly. `SQLite` WAL mode makes this safe while `flowd start` is running.
 
+#### Plan event log
+
+`flowd plan events <plan_id>` replays the persisted lifecycle log for one plan. Per-step rows carry the cost and token block mined from the agent's own JSON envelope (success *and* failure paths -- expensive refusals are not silently dropped). The trailing `finished` row carries a per-plan rollup with total spend, compact token counts, cache hit-rate, and per-outcome step counts:
+
+```text
+events: 8e2f1c9a-3b4d-4e07-9c11-1a2b3c4d5e6f
+
+  2026-04-24 14:01:33Z  submitted
+    name: refactor-auth
+  2026-04-24 14:01:34Z  started
+  2026-04-24 14:01:39Z  step_completed  step=extract-jwt  agent=rust-engineer
+    output: pulled JWT helpers out of auth/mod.rs
+    cost: $0.4231   tokens: in 2,148   out 8,392   cache_read 15,820   cache_creation 4,216
+    duration: api 4.1s / total 4.5s
+  2026-04-24 14:05:51Z  finished  status=completed
+    total: $1.42   in 12.4k   out 21.3k   cache hit-rate 78%   completed 4   failed 1
+    duration: api 24.7s / total 268.1s
+```
+
+Filter by event kind with `--kind step_failed,finished` and cap rows with `--limit`. Older plans recorded before metrics capture render without the cost lines rather than as `$0.0000` placeholders.
+
 ### 6. Shut down
 
 ```bash

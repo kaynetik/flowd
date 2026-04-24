@@ -138,21 +138,191 @@ fn normalise_kinds(kinds: Vec<String>) -> Vec<String> {
 }
 
 fn render_event(evt: &StoredPlanEvent, style: Style) {
+    use flowd_core::orchestration::plan_events::kind as k;
+
     let ts = evt.created_at.format("%Y-%m-%d %H:%M:%SZ");
     let header = format!(
         "{ts}  {kind}",
         ts = style.dim(&ts.to_string()),
         kind = style.cyan(&evt.kind),
     );
-    let suffix = match (evt.step_id.as_deref(), evt.agent_type.as_deref()) {
-        (Some(step), Some(agent)) => format!("  step={step}  agent={agent}"),
-        (Some(step), None) => format!("  step={step}"),
-        _ => String::new(),
+    // `finished` hoists its status into the header line so the per-plan
+    // rollup reads as a single self-contained block; per-step events keep
+    // the id/agent suffix they had before.
+    let suffix = if evt.kind == k::FINISHED {
+        evt.payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| format!("  status={s}"))
+            .unwrap_or_default()
+    } else {
+        match (evt.step_id.as_deref(), evt.agent_type.as_deref()) {
+            (Some(step), Some(agent)) => format!("  step={step}  agent={agent}"),
+            (Some(step), None) => format!("  step={step}"),
+            _ => String::new(),
+        }
     };
     println!("  {header}{suffix}");
-    if let Some(detail) = describe_payload(&evt.kind, &evt.payload) {
-        println!("    {}", style.dim(&detail));
+    // Finished events render their own purpose-built rollup below; skip
+    // the generic `describe_payload` fallback that would duplicate the
+    // status we already put on the header line.
+    if evt.kind != k::FINISHED {
+        if let Some(detail) = describe_payload(&evt.kind, &evt.payload) {
+            println!("    {}", style.dim(&detail));
+        }
     }
+    if matches!(evt.kind.as_str(), k::STEP_COMPLETED | k::STEP_FAILED) {
+        if let Some(lines) = format_metrics_block(&evt.payload) {
+            for line in lines {
+                println!("    {}", style.dim(&line));
+            }
+        }
+    }
+    if evt.kind == k::FINISHED {
+        for line in format_finished_rollup(&evt.payload) {
+            println!("    {}", style.dim(&line));
+        }
+    }
+}
+
+/// Two-line summary of an agent's reported `metrics` payload: cost + token
+/// breakdown on the first line, wall/api duration on the second. Returns
+/// `None` when the payload has no `metrics` object at all -- older events
+/// predate metrics capture and shouldn't render a bogus `$0.0000` line.
+// Durations are u64 milliseconds. Loss only matters past 2^53 ms (~285k
+// years); the per-step values we render are seconds-to-minutes.
+#[allow(clippy::cast_precision_loss)]
+fn format_metrics_block(payload: &serde_json::Value) -> Option<Vec<String>> {
+    let m = payload.get("metrics")?;
+    let u64_of = |k: &str| m.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let f64_of = |k: &str| m.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+
+    let input = u64_of("input_tokens");
+    let output = u64_of("output_tokens");
+    let cache_read = u64_of("cache_read_input_tokens");
+    let cache_creation = u64_of("cache_creation_input_tokens");
+    let cost = f64_of("total_cost_usd");
+    let duration_ms = u64_of("duration_ms");
+    let duration_api_ms = u64_of("duration_api_ms");
+
+    let line1 = format!(
+        "cost: ${cost:.4}   tokens: in {in_}   out {out}   cache_read {cr}   cache_creation {cc}",
+        in_ = format_thousands(input),
+        out = format_thousands(output),
+        cr = format_thousands(cache_read),
+        cc = format_thousands(cache_creation),
+    );
+    let line2 = format!(
+        "duration: api {:.1}s / total {:.1}s",
+        duration_api_ms as f64 / 1000.0,
+        duration_ms as f64 / 1000.0,
+    );
+    Some(vec![line1, line2])
+}
+
+/// Rollup rendered beneath the `finished` event header: cost + tokens +
+/// cache hit-rate + per-outcome counts on the first line, duration on the
+/// second. Returns an empty `Vec` when neither `metrics` nor a
+/// `step_count` block was persisted (pre-rollup event rows). Payload
+/// shape is owned by `flowd_core::orchestration::plan_events::event_payload`
+/// for the `Finished` variant.
+//
+// Cast lints, all ranged-safe:
+// - `cast_precision_loss`: u64 ms / token counts well below 2^53.
+// - `cast_possible_truncation` and `cast_sign_loss` on the `pct` cast:
+//   the expression is `cache_read / cache_denom * 100` with
+//   `cache_read <= cache_denom`, so the rounded value lies in `[0, 100]`
+//   and fits trivially in u64 without sign loss.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn format_finished_rollup(payload: &serde_json::Value) -> Vec<String> {
+    use std::fmt::Write as _;
+
+    let metrics = payload.get("metrics");
+    let step_count = payload.get("step_count");
+    if metrics.is_none() && step_count.is_none() {
+        return Vec::new();
+    }
+    let u64_of = |v: Option<&serde_json::Value>, k: &str| -> u64 {
+        v.and_then(|m| m.get(k))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let f64_of = |v: Option<&serde_json::Value>, k: &str| -> f64 {
+        v.and_then(|m| m.get(k))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    };
+
+    let cost = f64_of(metrics, "total_cost_usd");
+    let input = u64_of(metrics, "input_tokens");
+    let output = u64_of(metrics, "output_tokens");
+    let cache_read = u64_of(metrics, "cache_read_input_tokens");
+    let cache_creation = u64_of(metrics, "cache_creation_input_tokens");
+    let duration_ms = u64_of(metrics, "duration_ms");
+    let duration_api_ms = u64_of(metrics, "duration_api_ms");
+    let completed = u64_of(step_count, "completed");
+    let failed = u64_of(step_count, "failed");
+
+    let mut first = format!(
+        "total: ${cost:.2}   in {in_}   out {out}",
+        in_ = format_tokens_compact(input),
+        out = format_tokens_compact(output),
+    );
+    let cache_denom = cache_read + cache_creation;
+    if cache_denom > 0 {
+        // Integer percent to keep output stable: a trailing `.0` on a
+        // dashboard number is visual noise, and fractional precision
+        // changes nothing about the signal the operator acts on.
+        let pct = (cache_read as f64 / cache_denom as f64 * 100.0).round() as u64;
+        write!(first, "   cache hit-rate {pct}%").expect("write to String is infallible");
+    }
+    write!(first, "   completed {completed}   failed {failed}")
+        .expect("write to String is infallible");
+
+    let second = format!(
+        "duration: api {:.1}s / total {:.1}s",
+        duration_api_ms as f64 / 1000.0,
+        duration_ms as f64 / 1000.0,
+    );
+
+    vec![first, second]
+}
+
+/// Token-count formatter that switches to a compact `k` suffix once the
+/// value crosses 10,000 -- high-cardinality rollup numbers stay readable
+/// without widening the line, while per-step events (which usually stay
+/// well under that cap) keep their thousands separators.
+// `n` is a token count; loss only matters past 2^53 tokens, which no
+// realistic agent run will reach.
+#[allow(clippy::cast_precision_loss)]
+fn format_tokens_compact(n: u64) -> String {
+    if n > 9_999 {
+        // Always one decimal place, e.g. 12_400 -> "12.4k", 100_000 -> "100.0k".
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format_thousands(n)
+    }
+}
+
+/// Render `n` with ASCII thousands separators (e.g. `15_820 -> "15,820"`).
+/// Hand-rolled rather than pulling in `num-format` -- cheap enough for a
+/// single-digit-count per event, and keeps the CLI's dependency graph flat.
+fn format_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + (len.saturating_sub(1)) / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 /// One-line human summary of the event payload. Falls back to the raw
@@ -661,6 +831,150 @@ mod tests {
         };
         assert!(format!("{err:#}").contains("no flowd database"), "{err:#}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn format_thousands_inserts_commas_every_three_digits() {
+        assert_eq!(format_thousands(0), "0");
+        assert_eq!(format_thousands(7), "7");
+        assert_eq!(format_thousands(42), "42");
+        assert_eq!(format_thousands(999), "999");
+        assert_eq!(format_thousands(1_000), "1,000");
+        assert_eq!(format_thousands(2_148), "2,148");
+        assert_eq!(format_thousands(15_820), "15,820");
+        assert_eq!(format_thousands(1_234_567), "1,234,567");
+        assert_eq!(format_thousands(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn format_metrics_block_returns_none_when_metrics_absent() {
+        let payload = serde_json::json!({ "output": "ok" });
+        assert!(format_metrics_block(&payload).is_none());
+    }
+
+    #[test]
+    fn format_metrics_block_formats_cost_tokens_and_duration() {
+        let payload = serde_json::json!({
+            "output": "ok",
+            "metrics": {
+                "input_tokens": 2_148,
+                "output_tokens": 8_392,
+                "cache_creation_input_tokens": 4_216,
+                "cache_read_input_tokens": 15_820,
+                "total_cost_usd": 0.4231,
+                "duration_ms": 4_500,
+                "duration_api_ms": 4_100,
+            }
+        });
+        let lines = format_metrics_block(&payload).expect("metrics block");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "cost: $0.4231   tokens: in 2,148   out 8,392   cache_read 15,820   cache_creation 4,216"
+        );
+        assert_eq!(lines[1], "duration: api 4.1s / total 4.5s");
+    }
+
+    #[test]
+    fn format_tokens_compact_keeps_thousands_separator_below_ten_k() {
+        assert_eq!(format_tokens_compact(0), "0");
+        assert_eq!(format_tokens_compact(999), "999");
+        assert_eq!(format_tokens_compact(9_999), "9,999");
+    }
+
+    #[test]
+    fn format_tokens_compact_switches_to_k_suffix_above_ten_k() {
+        assert_eq!(format_tokens_compact(10_000), "10.0k");
+        assert_eq!(format_tokens_compact(12_400), "12.4k");
+        assert_eq!(format_tokens_compact(21_300), "21.3k");
+        assert_eq!(format_tokens_compact(100_000), "100.0k");
+    }
+
+    #[test]
+    fn format_finished_rollup_returns_empty_when_payload_has_no_rollup_fields() {
+        let payload = serde_json::json!({ "status": "completed" });
+        assert!(format_finished_rollup(&payload).is_empty());
+    }
+
+    #[test]
+    fn format_finished_rollup_renders_full_layout() {
+        let payload = serde_json::json!({
+            "status": "completed",
+            "step_count": { "completed": 4, "failed": 1 },
+            "metrics": {
+                "input_tokens": 12_400,
+                "output_tokens": 21_300,
+                "cache_creation_input_tokens": 5_000,
+                "cache_read_input_tokens": 18_000,
+                "total_cost_usd": 1.42,
+                "duration_ms": 268_100,
+                "duration_api_ms": 24_700,
+            }
+        });
+        let lines = format_finished_rollup(&payload);
+        assert_eq!(lines.len(), 2);
+        // 18_000 / (18_000 + 5_000) = 78.26% -> rounds to 78%.
+        assert_eq!(
+            lines[0],
+            "total: $1.42   in 12.4k   out 21.3k   cache hit-rate 78%   completed 4   failed 1"
+        );
+        assert_eq!(lines[1], "duration: api 24.7s / total 268.1s");
+    }
+
+    #[test]
+    fn format_finished_rollup_omits_cache_hit_rate_when_denominator_zero() {
+        let payload = serde_json::json!({
+            "status": "completed",
+            "step_count": { "completed": 1, "failed": 0 },
+            "metrics": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_cost_usd": 0.01,
+                "duration_ms": 500,
+                "duration_api_ms": 400,
+            }
+        });
+        let lines = format_finished_rollup(&payload);
+        assert_eq!(
+            lines[0],
+            "total: $0.01   in 100   out 50   completed 1   failed 0"
+        );
+    }
+
+    #[test]
+    fn format_finished_rollup_tolerates_step_count_without_metrics() {
+        // Plan finished with zero metrics (e.g. cancelled draft) but
+        // still carries a step_count block; render the counts and a
+        // zero-cost/zero-token block rather than skipping the rollup
+        // entirely.
+        let payload = serde_json::json!({
+            "status": "cancelled",
+            "step_count": { "completed": 0, "failed": 0 },
+        });
+        let lines = format_finished_rollup(&payload);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "total: $0.00   in 0   out 0   completed 0   failed 0"
+        );
+        assert_eq!(lines[1], "duration: api 0.0s / total 0.0s");
+    }
+
+    #[test]
+    fn format_metrics_block_defaults_missing_fields_to_zero() {
+        // An agent that only reports cost still gets a well-formed block;
+        // we don't want a crash or `null` formatting when newer fields
+        // are absent from older event rows.
+        let payload = serde_json::json!({
+            "error": "boom",
+            "metrics": { "total_cost_usd": 0.0009 }
+        });
+        let lines = format_metrics_block(&payload).expect("metrics block");
+        assert_eq!(
+            lines[0],
+            "cost: $0.0009   tokens: in 0   out 0   cache_read 0   cache_creation 0"
+        );
+        assert_eq!(lines[1], "duration: api 0.0s / total 0.0s");
     }
 
     #[test]

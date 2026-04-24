@@ -35,7 +35,24 @@ use uuid::Uuid;
 
 use crate::error::Result;
 
+use super::executor::AgentMetrics;
 use super::observer::PlanEvent;
+
+/// Insert a `"metrics"` field into `payload` when `metrics` is
+/// `Some`. A `None` stays absent from the JSON rather than rendering
+/// as `"metrics": null` -- consumers distinguish "no metrics reported"
+/// from "metrics explicitly null".
+fn attach_metrics(payload: &mut JsonValue, metrics: Option<&AgentMetrics>) {
+    let Some(m) = metrics else {
+        return;
+    };
+    let Ok(value) = serde_json::to_value(m) else {
+        return;
+    };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("metrics".into(), value);
+    }
+}
 
 /// Stable string identifiers for [`PlanEvent`] variants. Used as the
 /// `kind` column in the persisted event row and as the `--kind` filter
@@ -116,11 +133,34 @@ pub fn event_payload(event: &PlanEvent) -> JsonValue {
     match event {
         PlanEvent::Submitted { name, .. } => json!({ "name": name }),
         PlanEvent::Started { .. } | PlanEvent::StepCancelled { .. } => json!({}),
-        PlanEvent::StepCompleted { output, .. } => json!({ "output": output }),
-        PlanEvent::StepFailed { error, .. } => json!({ "error": error }),
+        PlanEvent::StepCompleted {
+            output, metrics, ..
+        } => {
+            let mut payload = json!({ "output": output });
+            attach_metrics(&mut payload, metrics.as_ref());
+            payload
+        }
+        PlanEvent::StepFailed { error, metrics, .. } => {
+            let mut payload = json!({ "error": error });
+            attach_metrics(&mut payload, metrics.as_ref());
+            payload
+        }
         PlanEvent::StepRefused { reason, .. } => json!({ "reason": reason }),
-        PlanEvent::Finished { status, .. } => {
-            json!({ "status": format!("{status:?}").to_lowercase() })
+        PlanEvent::Finished {
+            status,
+            total_metrics,
+            step_count,
+            ..
+        } => {
+            let mut payload = json!({
+                "status": format!("{status:?}").to_lowercase(),
+                "step_count": {
+                    "completed": step_count.completed,
+                    "failed": step_count.failed,
+                },
+            });
+            attach_metrics(&mut payload, total_metrics.as_ref());
+            payload
         }
         PlanEvent::ClarificationOpened { question_ids, .. } => {
             json!({ "question_ids": question_ids })
@@ -224,6 +264,7 @@ mod tests {
                     step_id: "a".into(),
                     agent_type: "echo".into(),
                     output: "ok".into(),
+                    metrics: None,
                 },
                 kind::STEP_COMPLETED,
             ),
@@ -234,6 +275,7 @@ mod tests {
                     step_id: "a".into(),
                     agent_type: "echo".into(),
                     error: "boom".into(),
+                    metrics: None,
                 },
                 kind::STEP_FAILED,
             ),
@@ -261,6 +303,8 @@ mod tests {
                     plan_id,
                     project,
                     status: PlanStatus::Completed,
+                    total_metrics: None,
+                    step_count: super::super::observer::PlanStepCounts::default(),
                 },
                 kind::FINISHED,
             ),
@@ -286,6 +330,7 @@ mod tests {
             step_id: "build".into(),
             agent_type: "codex".into(),
             error: "x".into(),
+            metrics: None,
         };
         assert_eq!(event_step_id(&step_evt), Some("build"));
         assert_eq!(event_agent_type(&step_evt), Some("codex"));
@@ -297,9 +342,49 @@ mod tests {
             plan_id: Uuid::nil(),
             project: "demo".into(),
             status: PlanStatus::Failed,
+            total_metrics: None,
+            step_count: super::super::observer::PlanStepCounts::default(),
         };
         let payload = event_payload(&evt);
         assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["step_count"]["completed"], 0);
+        assert_eq!(payload["step_count"]["failed"], 0);
+        assert!(
+            !payload
+                .as_object()
+                .expect("payload is an object")
+                .contains_key("metrics"),
+            "metrics key must be absent when total_metrics is None; got {payload}"
+        );
+    }
+
+    #[test]
+    fn payload_finished_serializes_rollup_metrics_and_counts() {
+        let metrics = AgentMetrics {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_cost_usd: 0.42,
+            duration_ms: 1_500,
+            duration_api_ms: 1_200,
+            ..AgentMetrics::default()
+        };
+        let evt = PlanEvent::Finished {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            status: PlanStatus::Completed,
+            total_metrics: Some(metrics),
+            step_count: super::super::observer::PlanStepCounts {
+                completed: 3,
+                failed: 1,
+            },
+        };
+        let payload = event_payload(&evt);
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["step_count"]["completed"], 3);
+        assert_eq!(payload["step_count"]["failed"], 1);
+        assert_eq!(payload["metrics"]["input_tokens"], 100);
+        assert_eq!(payload["metrics"]["output_tokens"], 50);
+        assert_eq!(payload["metrics"]["total_cost_usd"], 0.42);
     }
 
     #[test]
@@ -310,8 +395,106 @@ mod tests {
             step_id: "a".into(),
             agent_type: "echo".into(),
             output: "hello".into(),
+            metrics: None,
         };
-        assert_eq!(event_payload(&evt)["output"], "hello");
+        let payload = event_payload(&evt);
+        assert_eq!(payload["output"], "hello");
+        // `None` metrics must be *absent* rather than serialized as
+        // `null`: consumers distinguish "no metrics reported" from
+        // "metrics explicitly null".
+        assert!(
+            !payload
+                .as_object()
+                .expect("payload is an object")
+                .contains_key("metrics"),
+            "metrics key must be absent when None; got {payload}"
+        );
+    }
+
+    #[test]
+    fn payload_step_completed_serializes_metrics_when_present() {
+        let mut metrics = AgentMetrics {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_cost_usd: 0.25,
+            duration_ms: 500,
+            ..AgentMetrics::default()
+        };
+        metrics.model_usage.insert(
+            "sonnet".into(),
+            crate::orchestration::executor::ModelUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cost_usd: 0.25,
+                ..Default::default()
+            },
+        );
+        let evt = PlanEvent::StepCompleted {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            step_id: "a".into(),
+            agent_type: "echo".into(),
+            output: "hello".into(),
+            metrics: Some(metrics),
+        };
+        let payload = event_payload(&evt);
+        assert_eq!(payload["output"], "hello");
+        assert_eq!(payload["metrics"]["input_tokens"], 10);
+        assert_eq!(payload["metrics"]["output_tokens"], 5);
+        assert_eq!(payload["metrics"]["total_cost_usd"], 0.25);
+        assert_eq!(payload["metrics"]["duration_ms"], 500);
+        assert_eq!(
+            payload["metrics"]["model_usage"]["sonnet"]["input_tokens"],
+            10
+        );
+    }
+
+    #[test]
+    fn payload_step_failed_carries_error() {
+        let evt = PlanEvent::StepFailed {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            step_id: "a".into(),
+            agent_type: "echo".into(),
+            error: "boom".into(),
+            metrics: None,
+        };
+        let payload = event_payload(&evt);
+        assert_eq!(payload["error"], "boom");
+        assert!(
+            !payload
+                .as_object()
+                .expect("payload is an object")
+                .contains_key("metrics"),
+            "metrics key must be absent when None; got {payload}"
+        );
+    }
+
+    #[test]
+    fn payload_step_failed_serializes_metrics_when_present() {
+        let metrics = AgentMetrics {
+            input_tokens: 7,
+            output_tokens: 3,
+            total_cost_usd: 0.004,
+            duration_ms: 250,
+            duration_api_ms: 240,
+            ..AgentMetrics::default()
+        };
+        let evt = PlanEvent::StepFailed {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            step_id: "a".into(),
+            agent_type: "echo".into(),
+            error: "boom".into(),
+            metrics: Some(metrics),
+        };
+        let payload = event_payload(&evt);
+        assert_eq!(payload["error"], "boom");
+        assert_eq!(payload["metrics"]["input_tokens"], 7);
+        assert_eq!(payload["metrics"]["output_tokens"], 3);
+        assert_eq!(payload["metrics"]["total_cost_usd"], 0.004);
+        assert_eq!(payload["metrics"]["duration_ms"], 250);
+        assert_eq!(payload["metrics"]["duration_api_ms"], 240);
     }
 
     #[test]

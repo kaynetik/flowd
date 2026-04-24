@@ -555,10 +555,13 @@ where
         // error and avoids speculative compiler work.
         let mut plan = self.executor.status(plan_id).await?;
         if plan.status != PlanStatus::Draft {
-            return Err(FlowdError::PlanExecution(format!(
-                "plan_answer: plan `{plan_id}` is not in Draft state (currently {:?})",
-                plan.status
-            )));
+            return Err(FlowdError::PlanExecution {
+                message: format!(
+                    "plan_answer: plan `{plan_id}` is not in Draft state (currently {:?})",
+                    plan.status
+                ),
+                metrics: None,
+            });
         }
 
         // Step 1: invalidate any decision the user is overwriting. This
@@ -638,10 +641,13 @@ where
         let plan_id = parse_uuid(&p.plan_id)?;
         let plan = self.executor.status(plan_id).await?;
         if plan.status != PlanStatus::Draft {
-            return Err(FlowdError::PlanExecution(format!(
-                "plan_refine: plan `{plan_id}` is not in Draft state (currently {:?})",
-                plan.status
-            )));
+            return Err(FlowdError::PlanExecution {
+                message: format!(
+                    "plan_refine: plan `{plan_id}` is not in Draft state (currently {:?})",
+                    plan.status
+                ),
+                metrics: None,
+            });
         }
 
         // Track which questions were already on the plan so we can decide
