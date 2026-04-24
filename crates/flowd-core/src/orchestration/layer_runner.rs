@@ -58,6 +58,11 @@ pub(super) struct LayerRunner<'a, S: AgentSpawner + 'static> {
     pub(super) rule_gate: Option<&'a SharedRuleGate>,
     pub(super) observer: Option<&'a SharedPlanObserver>,
     pub(super) plans: &'a Arc<Mutex<HashMap<Uuid, PlanRuntime>>>,
+    /// Daemon-wide fallback timeout threaded in from
+    /// [`super::executor::InMemoryPlanExecutor::default_step_timeout_secs`].
+    /// Consulted per spawned step via [`run_step`]; per-step
+    /// `timeout_secs` wins when set.
+    pub(super) default_step_timeout_secs: Option<u64>,
 }
 
 /// Outcome of a single layer-run.
@@ -126,8 +131,10 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
 
             let spawner = Arc::clone(self.spawner);
             let cancel_for_task = Arc::clone(cancel);
-            let handle =
-                tokio::spawn(async move { run_step(&*spawner, step, cancel_for_task).await });
+            let default_timeout = self.default_step_timeout_secs;
+            let handle = tokio::spawn(async move {
+                run_step(&*spawner, step, cancel_for_task, default_timeout).await
+            });
             handles.push((step_id.clone(), handle));
         }
 

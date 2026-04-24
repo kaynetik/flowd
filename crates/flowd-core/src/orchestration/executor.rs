@@ -176,6 +176,12 @@ pub struct InMemoryPlanExecutor<S: AgentSpawner + 'static, PS: PlanStore = NoOpP
     store: PS,
     rule_gate: Option<SharedRuleGate>,
     observer: Option<SharedPlanObserver>,
+    /// Daemon-wide fallback timeout for steps whose per-step
+    /// `timeout_secs` is unset. `None` (the default) preserves the
+    /// historic "run forever unless per-step timeout is set" behaviour,
+    /// so non-CLI callers and existing tests do not regress. The CLI
+    /// installs `Some(_)` from `[plan].step_timeout_secs`.
+    default_step_timeout_secs: Option<u64>,
 }
 
 impl<S: AgentSpawner + 'static> InMemoryPlanExecutor<S, NoOpPlanStore> {
@@ -190,6 +196,7 @@ impl<S: AgentSpawner + 'static> InMemoryPlanExecutor<S, NoOpPlanStore> {
             store: NoOpPlanStore,
             rule_gate: None,
             observer: None,
+            default_step_timeout_secs: None,
         }
     }
 }
@@ -202,6 +209,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
             store,
             rule_gate: None,
             observer: None,
+            default_step_timeout_secs: None,
         }
     }
 
@@ -212,6 +220,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
             store,
             rule_gate: None,
             observer: None,
+            default_step_timeout_secs: None,
         }
     }
 
@@ -235,6 +244,18 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
         self
     }
 
+    /// Set the daemon-wide fallback step timeout. A step's own
+    /// `timeout_secs` (when `Some`) always wins; this value is only
+    /// consulted when the step itself left the field unset -- which
+    /// prose-compiled plans always do today, since neither the LLM
+    /// prompt nor the structured-stub markdown grammar can emit it.
+    /// Passing `None` preserves the historic "no fallback" behaviour.
+    #[must_use]
+    pub fn with_default_step_timeout(mut self, secs: Option<u64>) -> Self {
+        self.default_step_timeout_secs = secs;
+        self
+    }
+
     /// Fan out an event to the installed observer (if any). Hot-path call:
     /// inlined to a single `Option::if_let` when no observer is present.
     fn emit(&self, event: PlanEvent) {
@@ -245,6 +266,12 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
 
     /// Reload non-terminal plans from [`PlanStore`] into the in-memory map.
     ///
+    /// Plans that were `Running` when the daemon stopped no longer have an
+    /// executor task driving them, so we settle them as `Failed` (persisting
+    /// the transition and emitting [`PlanEvent::Finished`]) to prevent the
+    /// "stuck forever in Running" state. `resume_plan` can then reset the
+    /// synthetic-Failed steps back to `Pending` so the user retries cleanly.
+    ///
     /// # Errors
     /// Propagates storage failures.
     pub async fn rehydrate(&self) -> Result<()> {
@@ -253,19 +280,75 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
             if s.status.is_terminal() {
                 continue;
             }
-            let Some(plan) = self.store.load_plan(s.id).await? else {
+            let Some(mut plan) = self.store.load_plan(s.id).await? else {
                 continue;
             };
-            let runtime = PlanRuntime {
-                plan,
-                cancel: Arc::new(AtomicBool::new(false)),
-                in_flight: Vec::new(),
-            };
-            let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
-                message: "plan store poisoned".into(),
-                metrics: None,
-            })?;
-            guard.insert(s.id, runtime);
+            match plan.status {
+                PlanStatus::Running => {
+                    let now = Utc::now();
+                    for step in &mut plan.steps {
+                        if !matches!(
+                            step.status,
+                            StepStatus::Completed
+                                | StepStatus::Failed
+                                | StepStatus::Skipped
+                                | StepStatus::Cancelled
+                        ) {
+                            step.status = StepStatus::Failed;
+                            step.error = Some("daemon restarted while step was in flight".into());
+                            step.completed_at = Some(now);
+                        }
+                    }
+                    plan.status = PlanStatus::Failed;
+                    plan.completed_at = Some(now);
+
+                    let mut step_count = PlanStepCounts::default();
+                    for step in &plan.steps {
+                        match step.status {
+                            StepStatus::Completed => {
+                                step_count.completed = step_count.completed.saturating_add(1);
+                            }
+                            StepStatus::Failed => {
+                                step_count.failed = step_count.failed.saturating_add(1);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    self.store.save_plan(&plan).await?;
+                    self.emit(PlanEvent::Finished {
+                        plan_id: s.id,
+                        project: plan.project.clone(),
+                        status: PlanStatus::Failed,
+                        total_metrics: None,
+                        step_count,
+                    });
+
+                    let runtime = PlanRuntime {
+                        plan,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        in_flight: Vec::new(),
+                    };
+                    let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
+                        message: "plan store poisoned".into(),
+                        metrics: None,
+                    })?;
+                    guard.insert(s.id, runtime);
+                }
+                PlanStatus::Draft | PlanStatus::Confirmed => {
+                    let runtime = PlanRuntime {
+                        plan,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        in_flight: Vec::new(),
+                    };
+                    let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
+                        message: "plan store poisoned".into(),
+                        metrics: None,
+                    })?;
+                    guard.insert(s.id, runtime);
+                }
+                PlanStatus::Completed | PlanStatus::Failed | PlanStatus::Cancelled => {}
+            }
         }
         Ok(())
     }
@@ -279,6 +362,23 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
             .ok()?
             .get(&plan_id)
             .map(|r| r.plan.clone())
+    }
+
+    /// Snapshot ids of every plan currently in [`PlanStatus::Running`].
+    ///
+    /// Intended for the daemon's shutdown path: on SIGTERM / Ctrl+C the
+    /// caller issues `cancel(id)` for each returned id so the executing
+    /// task commits a terminal status to `SQLite` instead of leaving a
+    /// stale `Running` row for the rehydrate-as-Failed fallback.
+    #[must_use]
+    pub fn list_running(&self) -> Vec<Uuid> {
+        let Ok(guard) = self.plans.lock() else {
+            return Vec::new();
+        };
+        guard
+            .iter()
+            .filter_map(|(id, r)| (r.plan.status == PlanStatus::Running).then_some(*id))
+            .collect()
     }
 
     async fn persist_snapshot(&self, plan_id: Uuid) -> Result<()> {
@@ -465,6 +565,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             rule_gate: self.rule_gate.as_ref(),
             observer: self.observer.as_ref(),
             plans: &self.plans,
+            default_step_timeout_secs: self.default_step_timeout_secs,
         };
 
         let mut overall_failed = false;
@@ -670,10 +771,16 @@ pub(super) enum StepOutcome {
 /// Execute one step, honouring its retry / timeout configuration. Runs inside
 /// a `tokio::spawn`'d task, so panics surface as `JoinError::is_panic()` to
 /// the caller.
+///
+/// `default_timeout_secs` is the daemon-wide fallback applied when the
+/// step itself left `timeout_secs` unset (prose-compiled plans always do).
+/// The per-step value always wins via [`Option::or`]; passing `None`
+/// preserves the historic "run forever when per-step is unset" behaviour.
 pub(super) async fn run_step<S: AgentSpawner + ?Sized>(
     spawner: &S,
     step: PlanStep,
     cancel: Arc<AtomicBool>,
+    default_timeout_secs: Option<u64>,
 ) -> StepOutcome {
     let attempts = step.retry_count.saturating_add(1);
     let mut last_error: Option<String> = None;
@@ -685,7 +792,7 @@ pub(super) async fn run_step<S: AgentSpawner + ?Sized>(
         }
 
         let call = spawner.spawn(&step);
-        let result = match step.timeout_secs {
+        let result = match step.timeout_secs.or(default_timeout_secs) {
             Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), call).await {
                 Ok(r) => r,
                 Err(_) => Err(FlowdError::PlanExecution {
@@ -913,6 +1020,20 @@ mod tests {
         }
     }
 
+    /// Sleeps for a fixed duration before returning success. Used by the
+    /// default-step-timeout tests to simulate a wedged agent without
+    /// actually spinning.
+    struct SleepSpawner {
+        duration: Duration,
+    }
+
+    impl AgentSpawner for SleepSpawner {
+        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+            tokio::time::sleep(self.duration).await;
+            Ok(AgentOutput::success(format!("ran:{}", step.id)))
+        }
+    }
+
     /// Blocks indefinitely on step id `"c"` (for partial multi-layer runs).
     struct BlockStepC;
 
@@ -1000,6 +1121,62 @@ mod tests {
             assert_eq!(attempts.load(Ordering::SeqCst), 3, "1 + 2 retries = 3");
             assert_eq!(result.steps[0].status, StepStatus::Failed);
         });
+    }
+
+    /// A prose-compiled plan leaves `step.timeout_secs = None`, so the
+    /// daemon-wide fallback is the only thing standing between a wedged
+    /// agent and an indefinitely-blocked execution layer. Pin the fire
+    /// path so a regression surfaces before it lands in production.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_step_timeout_fires_when_per_step_is_none() {
+        let spawner = SleepSpawner {
+            duration: Duration::from_secs(5),
+        };
+        let exec = InMemoryPlanExecutor::new(spawner).with_default_step_timeout(Some(1));
+
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        let id = plan.id;
+        exec.submit(plan).await.unwrap();
+        exec.confirm(id).await.unwrap();
+        exec.execute(id).await.unwrap();
+
+        let result = exec.status(id).await.unwrap();
+        assert_eq!(result.status, PlanStatus::Failed);
+        assert_eq!(result.steps[0].status, StepStatus::Failed);
+        let err = result.steps[0].error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("timed out after 1s"),
+            "expected fallback timeout error, got: {err}"
+        );
+    }
+
+    /// The per-step field is the precise override: when it's set, the
+    /// daemon-wide default must be ignored entirely. Pin the precedence
+    /// so a future refactor doesn't silently invert it (e.g. accidentally
+    /// using `min(per_step, default)` or the other way around).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_step_timeout_overrides_default() {
+        let spawner = SleepSpawner {
+            duration: Duration::from_secs(5),
+        };
+        let exec = InMemoryPlanExecutor::new(spawner).with_default_step_timeout(Some(60));
+
+        let mut s = step("a", &[]);
+        s.timeout_secs = Some(2);
+        let plan = Plan::new("p", "proj", vec![s]);
+        let id = plan.id;
+        exec.submit(plan).await.unwrap();
+        exec.confirm(id).await.unwrap();
+        exec.execute(id).await.unwrap();
+
+        let result = exec.status(id).await.unwrap();
+        assert_eq!(result.status, PlanStatus::Failed);
+        assert_eq!(result.steps[0].status, StepStatus::Failed);
+        let err = result.steps[0].error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("timed out after 2s"),
+            "expected per-step timeout (not the 60s default), got: {err}"
+        );
     }
 
     #[test]
@@ -1098,10 +1275,122 @@ mod tests {
         let exec2 = InMemoryPlanExecutor::with_plan_store(BlockStepC, store.clone());
         exec2.rehydrate().await.unwrap();
         let p = exec2.status(id).await.unwrap();
-        assert_eq!(p.status, PlanStatus::Running);
+        assert_eq!(p.status, PlanStatus::Failed);
         assert_eq!(p.steps[0].status, StepStatus::Completed);
         assert_eq!(p.steps[1].status, StepStatus::Completed);
-        assert_eq!(p.steps[2].status, StepStatus::Pending);
+        assert_eq!(p.steps[2].status, StepStatus::Failed);
+        assert!(
+            p.steps[2]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("daemon restarted"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rehydrate_settles_running_plans_as_failed() {
+        use crate::orchestration::observer::{PlanEvent, PlanObserver};
+
+        #[derive(Default)]
+        struct CollectingObserver {
+            events: Mutex<Vec<PlanEvent>>,
+        }
+        impl PlanObserver for CollectingObserver {
+            fn on_event(&self, event: PlanEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let store = MapPlanStore::default();
+        let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        plan.status = PlanStatus::Running;
+        plan.started_at = Some(Utc::now());
+        plan.steps[0].status = StepStatus::Running;
+        plan.steps[0].started_at = Some(Utc::now());
+        let id = plan.id;
+        store.0.lock().unwrap().insert(id, plan);
+
+        let obs = Arc::new(CollectingObserver::default());
+        let exec = InMemoryPlanExecutor::with_plan_store(
+            EchoSpawner {
+                invocations: Arc::new(AtomicUsize::new(0)),
+            },
+            store.clone(),
+        )
+        .with_observer(Arc::clone(&obs) as Arc<dyn PlanObserver>);
+
+        exec.rehydrate().await.unwrap();
+
+        let snap = exec.status(id).await.unwrap();
+        assert_eq!(snap.status, PlanStatus::Failed);
+        assert!(snap.completed_at.is_some());
+        assert_eq!(snap.steps[0].status, StepStatus::Failed);
+        assert_eq!(
+            snap.steps[0].error.as_deref(),
+            Some("daemon restarted while step was in flight")
+        );
+        assert!(snap.steps[0].completed_at.is_some());
+
+        let persisted = store.0.lock().unwrap().get(&id).unwrap().clone();
+        assert_eq!(persisted.status, PlanStatus::Failed);
+        assert_eq!(persisted.steps[0].status, StepStatus::Failed);
+        assert_eq!(
+            persisted.steps[0].error.as_deref(),
+            Some("daemon restarted while step was in flight")
+        );
+
+        let events = obs.events.lock().unwrap().clone();
+        let finished = events
+            .iter()
+            .find_map(|e| match e {
+                PlanEvent::Finished {
+                    plan_id,
+                    status,
+                    step_count,
+                    ..
+                } if *plan_id == id => Some((*status, *step_count)),
+                _ => None,
+            })
+            .expect("rehydrate must emit a Finished event for settled Running plans");
+        assert_eq!(finished.0, PlanStatus::Failed);
+        assert_eq!(finished.1.failed, 1);
+        assert_eq!(finished.1.completed, 0);
+    }
+
+    #[tokio::test]
+    async fn rehydrate_preserves_draft_and_confirmed() {
+        let store = MapPlanStore::default();
+
+        let draft = Plan::new("draft", "proj", vec![step("a", &[])]);
+        let draft_id = draft.id;
+        assert_eq!(draft.status, PlanStatus::Draft);
+
+        let mut confirmed = Plan::new("confirmed", "proj", vec![step("b", &[])]);
+        confirmed.status = PlanStatus::Confirmed;
+        let confirmed_id = confirmed.id;
+
+        store.0.lock().unwrap().insert(draft_id, draft);
+        store.0.lock().unwrap().insert(confirmed_id, confirmed);
+
+        let exec = InMemoryPlanExecutor::with_plan_store(
+            EchoSpawner {
+                invocations: Arc::new(AtomicUsize::new(0)),
+            },
+            store.clone(),
+        );
+        exec.rehydrate().await.unwrap();
+
+        let draft_snap = exec.status(draft_id).await.unwrap();
+        assert_eq!(draft_snap.status, PlanStatus::Draft);
+        let confirmed_snap = exec.status(confirmed_id).await.unwrap();
+        assert_eq!(confirmed_snap.status, PlanStatus::Confirmed);
+
+        let persisted = store.0.lock().unwrap();
+        assert_eq!(persisted.get(&draft_id).unwrap().status, PlanStatus::Draft);
+        assert_eq!(
+            persisted.get(&confirmed_id).unwrap().status,
+            PlanStatus::Confirmed,
+        );
     }
 
     #[test]
@@ -1467,6 +1756,55 @@ mod tests {
             let persisted = store.0.lock().unwrap().get(&id).unwrap().clone();
             assert_eq!(persisted.status, PlanStatus::Cancelled);
         });
+    }
+
+    /// Graceful shutdown contract: calling `cancel` on a plan whose step
+    /// is wedged in a long sleep must unblock and settle the plan as
+    /// `Cancelled` well within the 10s budget the daemon's shutdown path
+    /// allows. The spawner sleeps 30s so a regression that forgot to
+    /// abort the in-flight task would miss the 2s assertion by an order
+    /// of magnitude.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_settles_long_running_step_within_budget() {
+        let spawner = SleepSpawner {
+            duration: Duration::from_secs(30),
+        };
+        let exec = Arc::new(InMemoryPlanExecutor::new(spawner));
+
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        let id = plan.id;
+        exec.submit(plan).await.unwrap();
+        exec.confirm(id).await.unwrap();
+
+        let exec_for_task = Arc::clone(&exec);
+        let jh = tokio::spawn(async move { exec_for_task.execute(id).await });
+
+        // Wait until the executor has flipped the plan to Running; any
+        // cancellation issued before this point takes the Confirmed
+        // direct-transition branch, which is not what we want to test.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if exec.status(id).await.unwrap().status == PlanStatus::Running {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plan never reached Running",
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(exec.list_running(), vec![id]);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            exec.cancel(id).await.unwrap();
+            jh.await.unwrap().unwrap();
+        })
+        .await
+        .expect("cancel + execute must settle within 2s");
+
+        let snap = exec.status(id).await.unwrap();
+        assert_eq!(snap.status, PlanStatus::Cancelled);
+        assert!(exec.list_running().is_empty());
     }
 
     #[test]

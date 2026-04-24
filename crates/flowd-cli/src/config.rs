@@ -119,6 +119,17 @@ use serde::Deserialize;
 /// small enough that runaway compilers visibly trip the warning.
 pub const DEFAULT_MAX_QUESTIONS: usize = 12;
 
+/// Default daemon-wide fallback timeout (seconds) applied to steps
+/// whose per-step `timeout_secs` is unset. Prose-compiled plans always
+/// leave that field `None` (the LLM prompt doesn't surface it and the
+/// structured-stub markdown grammar can't express it), so without this
+/// bound a wedged step would block its execution layer indefinitely.
+/// 15 minutes is generous enough to accommodate an Opus high-effort
+/// round, yet short enough that a stuck agent can't wedge a layer for
+/// hours before the operator notices. Set `step_timeout_secs = 0` in
+/// `[plan]` to disable the fallback entirely.
+pub const DEFAULT_STEP_TIMEOUT_SECS: u64 = 900;
+
 // -- Claude CLI defaults ----------------------------------------------------
 
 /// Default model id passed to the local `claude` CLI when
@@ -723,6 +734,8 @@ struct RawPlanConfig {
     compiler: Option<String>,
     #[serde(default)]
     llm: Option<RawLlmConfig>,
+    #[serde(default)]
+    step_timeout_secs: Option<u64>,
 }
 
 /// Resolved `[plan]` section, all fields populated.
@@ -734,6 +747,13 @@ pub struct PlanConfig {
     /// (defaults applied) so the daemon can log them on startup
     /// regardless of selection.
     pub llm: LlmConfig,
+    /// Daemon-wide fallback timeout applied to steps whose per-step
+    /// `timeout_secs` is unset. `Some(n)` installs an `n`-second bound;
+    /// `None` leaves such steps unbounded (the pre-HL behaviour). An
+    /// operator explicitly writing `step_timeout_secs = 0` resolves to
+    /// `None` -- the escape hatch for deployments that need to disable
+    /// the fallback without picking an arbitrarily large number.
+    pub step_timeout_secs: Option<u64>,
 }
 
 impl Default for PlanConfig {
@@ -742,6 +762,7 @@ impl Default for PlanConfig {
             max_questions: DEFAULT_MAX_QUESTIONS,
             compiler: CompilerSelection::Stub,
             llm: LlmConfig::default(),
+            step_timeout_secs: Some(DEFAULT_STEP_TIMEOUT_SECS),
         }
     }
 }
@@ -762,10 +783,19 @@ impl PlanConfig {
             Some(r) => LlmConfig::from_raw(r)?,
             None => LlmConfig::default(),
         };
+        // An absent key keeps the 15-minute default; an explicit `0`
+        // disables the fallback so operators have an escape hatch
+        // without picking an arbitrarily large number.
+        let step_timeout_secs = match raw.step_timeout_secs {
+            None => Some(DEFAULT_STEP_TIMEOUT_SECS),
+            Some(0) => None,
+            Some(s) => Some(s),
+        };
         Ok(Self {
             max_questions,
             compiler,
             llm,
+            step_timeout_secs,
         })
     }
 }

@@ -21,6 +21,17 @@ compiler      = "llm"
 # truncate the conversation.
 max_questions = 20
 
+# Daemon-wide fallback timeout for steps whose per-step `timeout_secs`
+# is unset. Prose-compiled plans always leave that field `None` (the
+# LLM prompt doesn't surface it, and the structured-stub markdown
+# grammar has no syntax for it), so without this bound a wedged step
+# would block its execution layer forever. 900s (15 minutes) is the
+# built-in default -- generous enough not to misfire on Opus
+# high-effort steps, tight enough to surface a stuck agent before the
+# daemon's shift ends. A step that sets its own `timeout_secs` still
+# wins; this value is strictly a fallback. Set to 0 to disable.
+# step_timeout_secs = 900
+
 [plan.llm]
 provider = "claude-cli"
 

@@ -35,6 +35,7 @@ use flowd_core::memory::EmbeddingProvider;
 use flowd_core::memory::compactor::{ActivityMonitor, Compactor, CompactorConfig};
 use flowd_core::memory::service::MemoryService;
 use flowd_core::memory::tier::TieringPolicy;
+use flowd_core::orchestration::PlanExecutor;
 use flowd_core::orchestration::executor::InMemoryPlanExecutor;
 use flowd_core::orchestration::gate::RuleGate;
 use flowd_core::orchestration::observer::PlanObserver;
@@ -55,6 +56,7 @@ use crate::spawner::BoxedSpawner;
 use flowd_mcp::ClaudeCliCallback;
 use flowd_mcp::ClaudeCliConfig as McpClaudeCliConfig;
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(
     paths: &FlowdPaths,
     style: Style,
@@ -83,6 +85,14 @@ pub async fn run(
         style.cyan("loaded"),
         config.plan.compiler.wire_name(),
         config.plan.max_questions,
+    );
+    eprintln!(
+        "{} default step timeout: {}",
+        style.cyan("using"),
+        config
+            .plan
+            .step_timeout_secs
+            .map_or("none (steps may run forever)".into(), |s| format!("{s}s")),
     );
     if matches!(config.plan.compiler, crate::config::CompilerSelection::Llm) {
         log_llm_startup(style, &config.plan.llm)?;
@@ -130,7 +140,8 @@ pub async fn run(
     let executor = Arc::new(
         InMemoryPlanExecutor::from_shared_with_store(spawner, plan_store)
             .with_rule_gate(rule_gate)
-            .with_observer(Arc::clone(&plan_observer)),
+            .with_observer(Arc::clone(&plan_observer))
+            .with_default_step_timeout(config.plan.step_timeout_secs),
     );
     executor
         .rehydrate()
@@ -160,7 +171,7 @@ pub async fn run(
     log_llm_router(style, &plan_compiler);
 
     let handlers = Arc::new(
-        FlowdHandlers::new(memory_service, executor, plan_compiler, rules)
+        FlowdHandlers::new(memory_service, Arc::clone(&executor), plan_compiler, rules)
             .with_question_budget(Some(config.plan.max_questions))
             .with_activity_monitor(monitor)
             // Share the plan-event sink with the executor so clarification
@@ -190,6 +201,40 @@ pub async fn run(
         }
         _ = sigterm.recv() => {
             eprintln!("{} received SIGTERM", style.yellow("shutdown"));
+        }
+    }
+
+    // Drain any still-`Running` plans so their executing tasks commit a
+    // terminal status to SQLite. Without this the rows stay `Running`
+    // and the next daemon start has to settle them via the
+    // rehydrate-as-Failed safety net -- correct, but noisier than a
+    // graceful Cancelled.
+    let running = executor.list_running();
+    if !running.is_empty() {
+        eprintln!(
+            "{} draining {} running plan(s)",
+            style.yellow("shutdown"),
+            running.len()
+        );
+        let mut join_set = tokio::task::JoinSet::new();
+        for id in &running {
+            let exec = Arc::clone(&executor);
+            let id = *id;
+            join_set.spawn(async move {
+                let _ = exec.cancel(id).await;
+            });
+        }
+        let drain = async { while join_set.join_next().await.is_some() {} };
+        match tokio::time::timeout(Duration::from_secs(10), drain).await {
+            Ok(()) => {
+                eprintln!("{} drained {} plan(s)", style.cyan("done"), running.len());
+            }
+            Err(_) => {
+                eprintln!(
+                    "{} plan drain timed out after 10s; the rehydrate path will settle stragglers on next start",
+                    style.yellow("warning")
+                );
+            }
         }
     }
 

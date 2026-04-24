@@ -242,6 +242,7 @@ fn resolve_on_path(name: &std::path::Path) -> Option<PathBuf> {
 }
 
 impl LlmCallback for ClaudeCliCallback {
+    #[allow(clippy::too_many_lines)]
     fn complete(&self, prompt: String) -> impl Future<Output = Result<String>> + Send {
         let cfg = self.cfg.clone();
         async move {
@@ -259,6 +260,11 @@ impl LlmCallback for ClaudeCliCallback {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                // Belt to the start_kill() suspenders below: if the
+                // Future is dropped for any reason other than the
+                // timeout branch (caller cancelled, panic, ...) the
+                // child is still reaped instead of orphaned.
+                .kill_on_drop(true)
                 .spawn()
                 .map_err(|e| {
                     let effort_hint = cfg
@@ -291,20 +297,65 @@ impl LlmCallback for ClaudeCliCallback {
             // intent obvious to anyone reading the code.
             drop(stdin);
 
+            // Hand-roll wait_with_output (take pipes, try_join
+            // read_to_end alongside child.wait()) so the child stays
+            // accessible on the timeout branch below -- the stock
+            // wait_with_output consumes `self`, which would leave
+            // start_kill() without a target.
+            let mut stdout_pipe = child
+                .stdout
+                .take()
+                .ok_or_else(|| FlowdError::Internal("claude CLI: stdout pipe missing".into()))?;
+            let mut stderr_pipe = child
+                .stderr
+                .take()
+                .ok_or_else(|| FlowdError::Internal("claude CLI: stderr pipe missing".into()))?;
+            let mut stdout_buf: Vec<u8> = Vec::new();
+            let mut stderr_buf: Vec<u8> = Vec::new();
+
+            let wait_and_drain = async {
+                use tokio::io::AsyncReadExt;
+                let (status, _, _) = tokio::try_join!(
+                    child.wait(),
+                    stdout_pipe.read_to_end(&mut stdout_buf),
+                    stderr_pipe.read_to_end(&mut stderr_buf),
+                )?;
+                std::io::Result::Ok(status)
+            };
+
             // Race the timeout against the wait. On timeout we kill the
             // child explicitly so it doesn't linger past the Future.
-            let out = match tokio::time::timeout(cfg.timeout, child.wait_with_output()).await {
-                Ok(Ok(out)) => out,
+            let status = match tokio::time::timeout(cfg.timeout, wait_and_drain).await {
+                Ok(Ok(status)) => status,
                 Ok(Err(e)) => {
                     return Err(FlowdError::Internal(format!("wait for claude CLI: {e}")));
                 }
                 Err(_elapsed) => {
+                    // Capture the pid for the diagnostic *before*
+                    // start_kill -- after the kernel reaps the child
+                    // `Child::id()` starts returning None.
+                    let pid_hint = child
+                        .id()
+                        .map(|p| format!(" (pid {p})"))
+                        .unwrap_or_default();
+                    // Deliver SIGKILL right now rather than relying on
+                    // the Drop-time kill_on_drop hook: start_kill is
+                    // synchronous, errno-tolerant, and keeps the child
+                    // (plus any MCP grandchildren claude itself
+                    // spawned) from hanging on past the Future.
+                    let _ = child.start_kill();
                     return Err(FlowdError::Internal(format!(
-                        "claude CLI timed out after {:?}; consider raising \
+                        "claude CLI timed out after {:?}{pid_hint}; consider raising \
                          [plan.llm.claude_cli].timeout_secs or shrinking the prompt",
                         cfg.timeout
                     )));
                 }
+            };
+
+            let out = std::process::Output {
+                status,
+                stdout: stdout_buf,
+                stderr: stderr_buf,
             };
 
             if !out.status.success() {
@@ -542,6 +593,98 @@ mod tests {
         let err = cb.complete("hi".into()).await.unwrap_err();
         let s = format!("{err}");
         assert!(s.contains("timed out"), "{s}");
+    }
+
+    /// Regression test for the orphan-process leak: a timed-out
+    /// `complete()` must SIGKILL the spawned child before returning,
+    /// not merely detach it. The fake script `exec`s into `sleep` so
+    /// `$$` (written to a sidecar file) is the PID of the process
+    /// tokio actually spawned -- that's the PID start_kill targets.
+    /// After the timeout fires we probe that PID with `kill(pid, 0)`
+    /// and expect `ESRCH`, proving the kernel has already reaped it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+    async fn timeout_kills_child_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        // Write the pid *first* so it's on disk even if the kill
+        // lands before the shell gets a chance to exec sleep.
+        // `exec sleep` replaces the shell in-place, so the child's
+        // PID (tokio's view) is the same one that ends up running
+        // sleep -- which means killing that PID actually kills the
+        // sleeping process rather than just the wrapper shell.
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s' \"$$\" > {pid_path}\n\
+             exec /bin/sleep 30\n",
+            pid_path = pid_file.display(),
+        );
+        let path = write_fake_claude(&dir, "claude", &script);
+        // 2s rather than the tempting 150ms: under parallel
+        // `cargo test` load (20 tokio tests racing for macOS fork+
+        // exec slots plus page-cache bandwidth) the shell can sit
+        // un-scheduled for close to a second before it even reaches
+        // the `printf` line. A shorter timeout races the scheduler
+        // and the pid file is never written. The test still
+        // exercises the kill-on-timeout path end-to-end; the
+        // exact value is load-tolerance tuning, not semantic
+        // coverage, and the actual sleep(30) below ensures the
+        // child would still be alive without the kill.
+        let cfg = ClaudeCliConfig {
+            binary: path,
+            model: "sonnet".into(),
+            effort: None,
+            timeout: Duration::from_secs(2),
+        };
+        let cb = ClaudeCliCallback::new(cfg);
+        let err = cb.complete("hi".into()).await.unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("timed out"), "{s}");
+
+        // The fake script writes its pid as the very first command,
+        // well before it exec's into sleep -- but the filesystem
+        // write+close back-propagation to a subsequent `read` from
+        // our process can lag a few ms under load, so poll briefly.
+        let pid_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let pid_str = loop {
+            match std::fs::read_to_string(&pid_file) {
+                Ok(s) if !s.trim().is_empty() => break s,
+                _ => {
+                    assert!(
+                        std::time::Instant::now() < pid_deadline,
+                        "fake claude never wrote its pid to {pid_file:?}",
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        };
+        let pid: i32 = pid_str
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("bad pid {pid_str:?}: {e}"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: libc::kill with signal 0 performs no signal
+            // delivery -- it only probes whether `pid` names a
+            // reachable process for the caller. No shared state is
+            // mutated, so there is no soundness hazard here.
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc == -1 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                assert_eq!(
+                    errno,
+                    Some(libc::ESRCH),
+                    "kill(pid, 0) failed with errno {errno:?}, expected ESRCH"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} still alive after timeout fired; start_kill did not reap the child",
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]

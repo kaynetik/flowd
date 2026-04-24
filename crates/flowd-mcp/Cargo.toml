@@ -1,6 +1,6 @@
 [package]
 name = "flowd-mcp"
-version = "0.2.0"
+version = "0.2.5"
 description = "MCP server exposing flowd tools to Claude Code and Cursor"
 edition.workspace = true
 rust-version.workspace = true
@@ -28,6 +28,12 @@ reqwest = { workspace = true }
 flowd-storage = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+
+# Used only by the Unix-gated timeout_kills_child_process test to
+# probe post-kill process state via kill(pid, 0). Kept in
+# target-specific dev-deps so Windows builds don't pull it in.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

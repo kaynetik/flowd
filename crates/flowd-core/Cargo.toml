@@ -1,6 +1,6 @@
 [package]
 name = "flowd-core"
-version = "0.2.0"
+version = "0.3.1"
 description = "Core domain logic for flowd: memory, orchestration, rules"
 edition.workspace = true
 rust-version.workspace = true
