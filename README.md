@@ -291,4 +291,4 @@ The MCP layer has two integration test suites:
 
 ## License
 
-[MIT](LICENSE).
+[GPL-3.0-or-later](LICENSE). Copyright (C) 2026 Aleksandar Nesovic <aleksandar@nesovic.dev>.
