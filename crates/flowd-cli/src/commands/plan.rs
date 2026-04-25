@@ -20,7 +20,8 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use flowd_core::orchestration::plan_events::{PlanEventQuery, PlanEventStore, StoredPlanEvent};
 use flowd_core::orchestration::{
-    Answer, Plan, PlanCompiler, PlanDraftSnapshot, PlanStatus, PlanStore, build_preview, load_plan,
+    Answer, Plan, PlanCompiler, PlanDraftSnapshot, PlanStatus, PlanStore, PlanSummary,
+    build_preview, load_plan,
 };
 use flowd_storage::plan_event_store::SqlitePlanEventStore;
 use flowd_storage::plan_store::SqlitePlanStore;
@@ -115,6 +116,54 @@ pub async fn events(
     for evt in &rows {
         render_event(evt, style);
     }
+    Ok(())
+}
+
+pub async fn list(
+    paths: &FlowdPaths,
+    style: Style,
+    project: Option<String>,
+    status: Option<String>,
+    limit: Option<usize>,
+) -> Result<()> {
+    let store = open_plan_store(paths)?;
+    let status = parse_plan_status_filter(status)?;
+    let mut rows = store
+        .list_plans(project.as_deref())
+        .await
+        .context("list persisted plans")?;
+    rows = filter_plan_summaries(rows, status, limit);
+    render_plan_summaries(&rows, style, "plans");
+    Ok(())
+}
+
+pub async fn show(paths: &FlowdPaths, style: Style, plan_id_arg: String) -> Result<()> {
+    let store = open_plan_store(paths)?;
+    let plan_id = parse_plan_id(&plan_id_arg)?;
+    let plan = store
+        .load_plan(plan_id)
+        .await
+        .with_context(|| format!("load plan {plan_id}"))?
+        .ok_or_else(|| anyhow!("plan {plan_id} not found"))?;
+    print_plan_summary(&plan, style, "snapshot");
+    Ok(())
+}
+
+pub async fn recent(
+    paths: &FlowdPaths,
+    style: Style,
+    project: Option<String>,
+    status: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let store = open_plan_store(paths)?;
+    let status = parse_plan_status_filter(status)?;
+    let mut rows = store
+        .list_plans(project.as_deref())
+        .await
+        .context("list recent persisted plans")?;
+    rows = filter_plan_summaries(rows, status, Some(limit));
+    render_plan_summaries(&rows, style, "recent plans");
     Ok(())
 }
 
@@ -543,7 +592,7 @@ pub async fn cancel(paths: &FlowdPaths, style: Style, plan_id_arg: String) -> Re
                 plan.id
             );
         }
-        PlanStatus::Draft | PlanStatus::Confirmed => {
+        PlanStatus::Draft | PlanStatus::Confirmed | PlanStatus::Interrupted => {
             plan.status = PlanStatus::Cancelled;
             plan.completed_at = Some(chrono::Utc::now());
         }
@@ -573,15 +622,7 @@ struct OfflinePlanRunner {
 
 impl OfflinePlanRunner {
     fn open(paths: &FlowdPaths) -> Result<Self> {
-        let db_path = paths.db_file();
-        if !db_path.exists() {
-            bail!(
-                "no flowd database at {}; start the daemon at least once to initialise it",
-                db_path.display()
-            );
-        }
-        let store = SqlitePlanStore::open(&db_path)
-            .with_context(|| format!("open plan store at {}", db_path.display()))?;
+        let store = open_plan_store(paths)?;
 
         let cfg_path = FlowdConfig::default_path(&paths.home);
         let config = FlowdConfig::load(&cfg_path)
@@ -623,6 +664,18 @@ impl OfflinePlanRunner {
     }
 }
 
+fn open_plan_store(paths: &FlowdPaths) -> Result<SqlitePlanStore> {
+    let db_path = paths.db_file();
+    if !db_path.exists() {
+        bail!(
+            "no flowd database at {}; start the daemon at least once to initialise it",
+            db_path.display()
+        );
+    }
+    SqlitePlanStore::open(&db_path)
+        .with_context(|| format!("open plan store at {}", db_path.display()))
+}
+
 /// Refuse to operate on shared `SQLite` state when the daemon is alive.
 /// The check is best-effort -- the PID file could go stale between
 /// the probe and the first write -- but covers the common operator
@@ -652,6 +705,39 @@ fn parse_plan_id(raw: &str) -> Result<Uuid> {
     Uuid::parse_str(raw.trim()).with_context(|| format!("parse plan id `{raw}` as UUID"))
 }
 
+fn parse_plan_status_filter(raw: Option<String>) -> Result<Option<PlanStatus>> {
+    raw.map(|s| parse_plan_status(&s)).transpose()
+}
+
+fn parse_plan_status(raw: &str) -> Result<PlanStatus> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "draft" => Ok(PlanStatus::Draft),
+        "confirmed" => Ok(PlanStatus::Confirmed),
+        "running" => Ok(PlanStatus::Running),
+        "interrupted" => Ok(PlanStatus::Interrupted),
+        "completed" => Ok(PlanStatus::Completed),
+        "failed" => Ok(PlanStatus::Failed),
+        "cancelled" => Ok(PlanStatus::Cancelled),
+        other => bail!(
+            "unknown plan status `{other}`; expected draft, confirmed, running, interrupted, completed, failed, or cancelled"
+        ),
+    }
+}
+
+fn filter_plan_summaries(
+    mut rows: Vec<PlanSummary>,
+    status: Option<PlanStatus>,
+    limit: Option<usize>,
+) -> Vec<PlanSummary> {
+    if let Some(status) = status {
+        rows.retain(|p| p.status == status);
+    }
+    if let Some(limit) = limit {
+        rows.truncate(limit.max(1));
+    }
+    rows
+}
+
 /// Read text from a path; treat `-` as stdin so callers can pipe.
 fn read_text_input(path: &std::path::Path) -> Result<String> {
     if path == std::path::Path::new("-") {
@@ -664,13 +750,34 @@ fn read_text_input(path: &std::path::Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
 }
 
+fn render_plan_summaries(rows: &[PlanSummary], style: Style, title: &str) {
+    print!("{}", banner(title, style));
+    if rows.is_empty() {
+        println!("  {}", style.dim("(no plans found)"));
+        return;
+    }
+    for p in rows {
+        println!(
+            "  {}  {:<11}  {:<18}  {}",
+            style.dim(&p.id.to_string()),
+            plan_status_label(p.status),
+            p.project,
+            p.name,
+        );
+        println!(
+            "    created: {}",
+            style.dim(&p.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        );
+    }
+}
+
 fn print_plan_summary(plan: &Plan, style: Style, header: &str) {
     print!(
         "{}",
         banner(&format!("plan: {} -- {}", plan.name, header), style)
     );
     println!("  id:               {}", style.dim(&plan.id.to_string()));
-    println!("  status:           {:?}", plan.status);
+    println!("  status:           {}", plan_status_label(plan.status));
     println!("  project:          {}", plan.project);
     println!("  steps:            {}", plan.steps.len());
     println!("  open_questions:   {}", plan.open_questions.len());
@@ -702,6 +809,18 @@ fn print_plan_summary(plan: &Plan, style: Style, header: &str) {
                 style.yellow("warning:")
             ),
         }
+    }
+}
+
+fn plan_status_label(status: PlanStatus) -> &'static str {
+    match status {
+        PlanStatus::Draft => "draft",
+        PlanStatus::Confirmed => "confirmed",
+        PlanStatus::Running => "running",
+        PlanStatus::Interrupted => "interrupted",
+        PlanStatus::Completed => "completed",
+        PlanStatus::Failed => "failed",
+        PlanStatus::Cancelled => "cancelled",
     }
 }
 

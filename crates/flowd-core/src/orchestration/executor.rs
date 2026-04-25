@@ -136,18 +136,48 @@ impl AgentMetrics {
     }
 }
 
+/// Plan-scoped context supplied to an [`AgentSpawner`] for one step.
+#[derive(Debug, Clone)]
+pub struct AgentSpawnContext {
+    pub plan_id: Uuid,
+    pub project: String,
+    pub plan_parallel: bool,
+    pub layer_width: usize,
+}
+
 /// Strategy for invoking a single plan step.
 ///
 /// Implementations are free to spawn an OS process, call an HTTP endpoint,
 /// or simply return canned data in tests. Returning `Err(_)` marks the step
 /// as failed and triggers any configured retries.
 pub trait AgentSpawner: Send + Sync {
+    /// Whether this spawner can isolate parallel plan steps in git worktrees.
+    #[must_use]
+    fn supports_worktree_isolation(&self) -> bool {
+        false
+    }
+
+    /// Validate any plan-level prerequisites before a parallel plan is
+    /// confirmed. Worktree-aware spawners use this to reject dirty base repos
+    /// before the plan leaves Draft.
+    fn prepare_plan(
+        &self,
+        _plan: &Plan,
+        _preview: &PlanPreview,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     /// Run a step and return its captured output.
     ///
     /// # Errors
     /// Implementations should return `FlowdError::PlanExecution` for
     /// transport / process failures.
-    fn spawn(&self, step: &PlanStep) -> impl Future<Output = Result<AgentOutput>> + Send;
+    fn spawn(
+        &self,
+        ctx: AgentSpawnContext,
+        step: &PlanStep,
+    ) -> impl Future<Output = Result<AgentOutput>> + Send;
 }
 
 /// Internal record kept per registered plan.
@@ -267,10 +297,11 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
     /// Reload non-terminal plans from [`PlanStore`] into the in-memory map.
     ///
     /// Plans that were `Running` when the daemon stopped no longer have an
-    /// executor task driving them, so we settle them as `Failed` (persisting
-    /// the transition and emitting [`PlanEvent::Finished`]) to prevent the
-    /// "stuck forever in Running" state. `resume_plan` can then reset the
-    /// synthetic-Failed steps back to `Pending` so the user retries cleanly.
+    /// executor task driving them, so we settle them as `Interrupted`
+    /// (persisting the transition and emitting [`PlanEvent::Finished`]) to
+    /// prevent the "stuck forever in Running" state. `resume_plan` can then
+    /// reset the synthetic-Failed steps back to `Pending` so the user retries
+    /// cleanly.
     ///
     /// # Errors
     /// Propagates storage failures.
@@ -299,7 +330,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
                             step.completed_at = Some(now);
                         }
                     }
-                    plan.status = PlanStatus::Failed;
+                    plan.status = PlanStatus::Interrupted;
                     plan.completed_at = Some(now);
 
                     let mut step_count = PlanStepCounts::default();
@@ -319,7 +350,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
                     self.emit(PlanEvent::Finished {
                         plan_id: s.id,
                         project: plan.project.clone(),
-                        status: PlanStatus::Failed,
+                        status: PlanStatus::Interrupted,
                         total_metrics: None,
                         step_count,
                     });
@@ -335,7 +366,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
                     })?;
                     guard.insert(s.id, runtime);
                 }
-                PlanStatus::Draft | PlanStatus::Confirmed => {
+                PlanStatus::Draft | PlanStatus::Confirmed | PlanStatus::Interrupted => {
                     let runtime = PlanRuntime {
                         plan,
                         cancel: Arc::new(AtomicBool::new(false)),
@@ -623,12 +654,36 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             .ok_or(FlowdError::PlanNotFound(plan_id))
     }
 
+    async fn list_plans(&self, project: Option<String>) -> Result<Vec<super::PlanSummary>> {
+        self.store.list_plans(project.as_deref()).await
+    }
+
+    fn supports_worktree_isolation(&self) -> bool {
+        self.spawner.supports_worktree_isolation()
+    }
+
+    async fn prepare_plan(&self, plan_id: Uuid) -> Result<PlanPreview> {
+        let plan = self.status(plan_id).await?;
+        if plan.status != PlanStatus::Draft {
+            return Err(FlowdError::PlanExecution {
+                message: format!(
+                    "plan `{plan_id}` is not in Draft state (currently {:?})",
+                    plan.status
+                ),
+                metrics: None,
+            });
+        }
+        let preview = build_preview(&plan)?;
+        self.spawner.prepare_plan(&plan, &preview).await?;
+        Ok(preview)
+    }
+
     async fn cancel(&self, plan_id: Uuid) -> Result<()> {
         // Three execution paths depending on where the plan is in its
         // lifecycle:
         //   * Terminal -> idempotent no-op.
-        //   * Draft / Confirmed (no execute() task in flight) -> directly
-        //     transition to Cancelled, persist, emit Finished.
+        //   * Draft / Confirmed / Interrupted (no execute() task in flight)
+        //     -> directly transition to Cancelled, persist, emit Finished.
         //   * Running -> set the latch + abort handles; the executing
         //     task's finalize_execution will see the latch and settle
         //     the plan as Cancelled (preserving the historic ordering
@@ -641,7 +696,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
 
         let action = self.with_plan_mut(plan_id, |runtime| match runtime.plan.status {
             PlanStatus::Completed | PlanStatus::Failed | PlanStatus::Cancelled => Action::Noop,
-            PlanStatus::Draft | PlanStatus::Confirmed => {
+            PlanStatus::Draft | PlanStatus::Confirmed | PlanStatus::Interrupted => {
                 runtime.cancel.store(true, Ordering::SeqCst);
                 runtime.plan.status = PlanStatus::Cancelled;
                 runtime.plan.completed_at = Some(Utc::now());
@@ -685,10 +740,13 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             // Only `Failed` is resumable. `Completed` has nothing to do;
             // `Cancelled` is an explicit user stop (re-create the plan if
             // you want to retry); `Running` is racing with another caller.
-            if runtime.plan.status != PlanStatus::Failed {
+            if !matches!(
+                runtime.plan.status,
+                PlanStatus::Failed | PlanStatus::Interrupted
+            ) {
                 return Err(FlowdError::PlanExecution {
                     message: format!(
-                        "plan `{plan_id}` is in {:?} state; only Failed plans can be resumed",
+                        "plan `{plan_id}` is in {:?} state; only Failed or Interrupted plans can be resumed",
                         runtime.plan.status
                     ),
                     metrics: None,
@@ -778,6 +836,7 @@ pub(super) enum StepOutcome {
 /// preserves the historic "run forever when per-step is unset" behaviour.
 pub(super) async fn run_step<S: AgentSpawner + ?Sized>(
     spawner: &S,
+    ctx: AgentSpawnContext,
     step: PlanStep,
     cancel: Arc<AtomicBool>,
     default_timeout_secs: Option<u64>,
@@ -791,7 +850,7 @@ pub(super) async fn run_step<S: AgentSpawner + ?Sized>(
             return StepOutcome::Cancelled;
         }
 
-        let call = spawner.spawn(&step);
+        let call = spawner.spawn(ctx.clone(), &step);
         let result = match step.timeout_secs.or(default_timeout_secs) {
             Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), call).await {
                 Ok(r) => r,
@@ -954,7 +1013,7 @@ mod tests {
     }
 
     impl AgentSpawner for EchoSpawner {
-        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+        async fn spawn(&self, _ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
             self.invocations.fetch_add(1, Ordering::SeqCst);
             Ok(AgentOutput::success(format!("ran:{}", step.id)))
         }
@@ -968,7 +1027,7 @@ mod tests {
     }
 
     impl AgentSpawner for RecordingSpawner {
-        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+        async fn spawn(&self, _ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
             self.seen
                 .lock()
                 .expect("seen poisoned")
@@ -983,7 +1042,7 @@ mod tests {
     }
 
     impl AgentSpawner for AlwaysFailSpawner {
-        async fn spawn(&self, _: &PlanStep) -> Result<AgentOutput> {
+        async fn spawn(&self, _ctx: AgentSpawnContext, _: &PlanStep) -> Result<AgentOutput> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             Err(FlowdError::PlanExecution {
                 message: "nope".into(),
@@ -996,7 +1055,7 @@ mod tests {
     struct PanicSpawner;
 
     impl AgentSpawner for PanicSpawner {
-        async fn spawn(&self, _: &PlanStep) -> Result<AgentOutput> {
+        async fn spawn(&self, _ctx: AgentSpawnContext, _: &PlanStep) -> Result<AgentOutput> {
             panic!("boom");
         }
     }
@@ -1007,7 +1066,7 @@ mod tests {
     }
 
     impl AgentSpawner for FailOnceThenSucceed {
-        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+        async fn spawn(&self, _ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
             let c = self.n.fetch_add(1, Ordering::SeqCst);
             if c == 0 {
                 Err(FlowdError::PlanExecution {
@@ -1028,7 +1087,7 @@ mod tests {
     }
 
     impl AgentSpawner for SleepSpawner {
-        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+        async fn spawn(&self, _ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
             tokio::time::sleep(self.duration).await;
             Ok(AgentOutput::success(format!("ran:{}", step.id)))
         }
@@ -1038,7 +1097,7 @@ mod tests {
     struct BlockStepC;
 
     impl AgentSpawner for BlockStepC {
-        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+        async fn spawn(&self, _ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
             if step.id == "c" {
                 std::future::poll_fn(|_| std::task::Poll::<()>::Pending).await;
             }
@@ -1275,7 +1334,7 @@ mod tests {
         let exec2 = InMemoryPlanExecutor::with_plan_store(BlockStepC, store.clone());
         exec2.rehydrate().await.unwrap();
         let p = exec2.status(id).await.unwrap();
-        assert_eq!(p.status, PlanStatus::Failed);
+        assert_eq!(p.status, PlanStatus::Interrupted);
         assert_eq!(p.steps[0].status, StepStatus::Completed);
         assert_eq!(p.steps[1].status, StepStatus::Completed);
         assert_eq!(p.steps[2].status, StepStatus::Failed);
@@ -1288,7 +1347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rehydrate_settles_running_plans_as_failed() {
+    async fn rehydrate_settles_running_plans_as_interrupted() {
         use crate::orchestration::observer::{PlanEvent, PlanObserver};
 
         #[derive(Default)]
@@ -1322,7 +1381,7 @@ mod tests {
         exec.rehydrate().await.unwrap();
 
         let snap = exec.status(id).await.unwrap();
-        assert_eq!(snap.status, PlanStatus::Failed);
+        assert_eq!(snap.status, PlanStatus::Interrupted);
         assert!(snap.completed_at.is_some());
         assert_eq!(snap.steps[0].status, StepStatus::Failed);
         assert_eq!(
@@ -1332,7 +1391,7 @@ mod tests {
         assert!(snap.steps[0].completed_at.is_some());
 
         let persisted = store.0.lock().unwrap().get(&id).unwrap().clone();
-        assert_eq!(persisted.status, PlanStatus::Failed);
+        assert_eq!(persisted.status, PlanStatus::Interrupted);
         assert_eq!(persisted.steps[0].status, StepStatus::Failed);
         assert_eq!(
             persisted.steps[0].error.as_deref(),
@@ -1352,7 +1411,7 @@ mod tests {
                 _ => None,
             })
             .expect("rehydrate must emit a Finished event for settled Running plans");
-        assert_eq!(finished.0, PlanStatus::Failed);
+        assert_eq!(finished.0, PlanStatus::Interrupted);
         assert_eq!(finished.1.failed, 1);
         assert_eq!(finished.1.completed, 0);
     }
@@ -1920,7 +1979,7 @@ mod tests {
     }
 
     impl AgentSpawner for MetricsScriptedSpawner {
-        async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+        async fn spawn(&self, _ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
             match self.script.get(&step.id) {
                 Some(Ok(metrics)) => Ok(AgentOutput {
                     stdout: format!("ok:{}", step.id),

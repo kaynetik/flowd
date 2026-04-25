@@ -21,8 +21,9 @@ use crate::handlers::McpHandlers;
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::tools::{
     MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanAnswerParams, PlanCancelParams,
-    PlanConfirmParams, PlanCreateParams, PlanRefineParams, PlanResumeParams, PlanStatusParams,
-    RulesCheckParams, RulesListParams, ToolResult, all_tool_schemas,
+    PlanConfirmParams, PlanCreateParams, PlanListParams, PlanRecentParams, PlanRefineParams,
+    PlanResumeParams, PlanShowParams, PlanStatusParams, RulesCheckParams, RulesListParams,
+    ToolResult, all_tool_schemas,
 };
 
 /// MCP server configuration.
@@ -213,6 +214,18 @@ async fn dispatch_tool_call<H: McpHandlers>(
             Ok(p) => handlers.plan_resume(p).await,
             Err(e) => return Err(e),
         },
+        "plan_list" => match parse_params::<PlanListParams>(arguments) {
+            Ok(p) => handlers.plan_list(p).await,
+            Err(e) => return Err(e),
+        },
+        "plan_show" => match parse_params::<PlanShowParams>(arguments) {
+            Ok(p) => handlers.plan_show(p).await,
+            Err(e) => return Err(e),
+        },
+        "plan_recent" => match parse_params::<PlanRecentParams>(arguments) {
+            Ok(p) => handlers.plan_recent(p).await,
+            Err(e) => return Err(e),
+        },
         "rules_check" => match parse_params::<RulesCheckParams>(arguments) {
             Ok(p) => handlers.rules_check(p).await,
             Err(e) => return Err(e),
@@ -315,6 +328,24 @@ mod tests {
         ) -> flowd_core::error::Result<Value> {
             Ok(json!({"status": "running"}))
         }
+        async fn plan_list(
+            &self,
+            _: crate::tools::PlanListParams,
+        ) -> flowd_core::error::Result<Value> {
+            Ok(json!({"plans": []}))
+        }
+        async fn plan_show(
+            &self,
+            _: crate::tools::PlanShowParams,
+        ) -> flowd_core::error::Result<Value> {
+            Ok(json!({"status": "draft"}))
+        }
+        async fn plan_recent(
+            &self,
+            _: crate::tools::PlanRecentParams,
+        ) -> flowd_core::error::Result<Value> {
+            Ok(json!({"plans": []}))
+        }
         async fn rules_check(
             &self,
             _: crate::tools::RulesCheckParams,
@@ -359,7 +390,7 @@ mod tests {
         .await
         .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 15);
     }
 
     #[tokio::test]

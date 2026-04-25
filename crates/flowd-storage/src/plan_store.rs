@@ -279,6 +279,7 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanSummary> {
         status: match status_str.as_str() {
             "confirmed" => PlanStatus::Confirmed,
             "running" => PlanStatus::Running,
+            "interrupted" => PlanStatus::Interrupted,
             "completed" => PlanStatus::Completed,
             "failed" => PlanStatus::Failed,
             "cancelled" => PlanStatus::Cancelled,
@@ -295,6 +296,7 @@ fn plan_status_str(s: PlanStatus) -> &'static str {
         PlanStatus::Draft => "draft",
         PlanStatus::Confirmed => "confirmed",
         PlanStatus::Running => "running",
+        PlanStatus::Interrupted => "interrupted",
         PlanStatus::Completed => "completed",
         PlanStatus::Failed => "failed",
         PlanStatus::Cancelled => "cancelled",

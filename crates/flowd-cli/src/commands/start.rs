@@ -1,5 +1,5 @@
-//! `flowd start` -- compose all backends, write the PID file, run the MCP
-//! stdio server, and shut down gracefully on SIGTERM / Ctrl+C.
+//! `flowd start` -- compose all backends, write the PID file, run the central
+//! local MCP socket server, and shut down gracefully on SIGTERM / Ctrl+C.
 //!
 //! This command intentionally runs foreground. Service managers
 //! (systemd / launchd) or the shell's `&` handle detachment.
@@ -25,10 +25,12 @@
 //! the live request path and the background sweep, so a summarized
 //! observation is immediately visible to the next `memory_context` call.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 
 use flowd_core::memory::EmbeddingProvider;
@@ -111,7 +113,7 @@ pub async fn run(
     let compactor_handle = spawn_compactor(&backends, monitor.clone(), style);
 
     // ---- Plan execution wiring: select an agent CLI from $PATH or env.
-    let spawner = Arc::new(BoxedSpawner::auto());
+    let spawner = Arc::new(BoxedSpawner::auto(&paths.home));
     eprintln!(
         "{} agent spawner: {}",
         style.cyan("using"),
@@ -179,21 +181,24 @@ pub async fn run(
             // step-level events.
             .with_observer(plan_observer),
     );
-    let server = McpServer::new(handlers, McpServerConfig::default());
+    let server = Arc::new(McpServer::new(handlers, McpServerConfig::default()));
+    let socket = BoundSocket::bind(paths.socket_file())?;
 
     eprintln!(
-        "{} mcp stdio server ready -- press Ctrl+C or send SIGTERM to stop",
-        style.cyan("running")
+        "{} mcp socket server ready at {} -- press Ctrl+C or send SIGTERM to stop",
+        style.cyan("running"),
+        socket.path().display(),
     );
 
-    // Run the server against stdio; race it against termination signals.
+    // Run the central socket server; per-client `flowd mcp` processes proxy
+    // stdio frames to this listener.
     let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
     let ctrl_c = tokio::signal::ctrl_c();
 
     tokio::select! {
-        result = server.run_stdio() => {
+        result = run_socket_server(server, socket.listener()) => {
             if let Err(e) = result {
-                tracing::error!(error = %e, "mcp server exited with error");
+                tracing::error!(error = %e, "mcp socket server exited with error");
             }
         }
         _ = ctrl_c => {
@@ -205,10 +210,9 @@ pub async fn run(
     }
 
     // Drain any still-`Running` plans so their executing tasks commit a
-    // terminal status to SQLite. Without this the rows stay `Running`
-    // and the next daemon start has to settle them via the
-    // rehydrate-as-Failed safety net -- correct, but noisier than a
-    // graceful Cancelled.
+    // terminal status to SQLite. Without this the next daemon start will
+    // settle them as Interrupted via the rehydrate safety net -- correct,
+    // but noisier than a graceful Cancelled.
     let running = executor.list_running();
     if !running.is_empty() {
         eprintln!(
@@ -231,7 +235,7 @@ pub async fn run(
             }
             Err(_) => {
                 eprintln!(
-                    "{} plan drain timed out after 10s; the rehydrate path will settle stragglers on next start",
+                    "{} plan drain timed out after 10s; the rehydrate path will mark stragglers Interrupted on next start",
                     style.yellow("warning")
                 );
             }
@@ -246,8 +250,66 @@ pub async fn run(
     compactor_handle.stop().await;
 
     drop(pid); // explicit for clarity; would run anyway at scope exit
+    drop(socket); // remove the Unix socket before reporting the daemon stopped
     eprintln!("{} daemon stopped", style.green("done"));
     Ok(())
+}
+
+struct BoundSocket {
+    path: PathBuf,
+    listener: UnixListener,
+}
+
+impl BoundSocket {
+    fn bind(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create socket dir: {}", parent.display()))?;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("remove stale socket {}", path.display()));
+            }
+        }
+        let listener = UnixListener::bind(&path)
+            .with_context(|| format!("bind daemon socket at {}", path.display()))?;
+        Ok(Self { path, listener })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn listener(&self) -> &UnixListener {
+        &self.listener
+    }
+}
+
+impl Drop for BoundSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn run_socket_server<H>(
+    server: Arc<McpServer<H>>,
+    listener: &UnixListener,
+) -> std::io::Result<()>
+where
+    H: flowd_mcp::McpHandlers + 'static,
+{
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let (read, write) = stream.into_split();
+        let server = Arc::clone(&server);
+        tokio::spawn(async move {
+            if let Err(e) = server.run(read, write).await {
+                tracing::debug!(error = %e, "mcp socket client disconnected with error");
+            }
+        });
+    }
 }
 
 /// Build the bounded-queue plan-event observer (HL-40).

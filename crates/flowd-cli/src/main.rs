@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
             qdrant_url,
             plan_event_buffer,
         } => commands::start::run(&paths, style, qdrant_url, plan_event_buffer).await,
+        Command::Mcp => commands::mcp::run(&paths).await,
         Command::Stop => commands::stop::run(&paths, style),
         Command::Search {
             query,
@@ -70,6 +71,17 @@ async fn main() -> Result<()> {
                 limit,
                 kind,
             } => commands::plan::events(&paths, style, plan_id, limit, kind).await,
+            PlanAction::List {
+                project,
+                status,
+                limit,
+            } => commands::plan::list(&paths, style, project, status, limit).await,
+            PlanAction::Show { plan_id } => commands::plan::show(&paths, style, plan_id).await,
+            PlanAction::Recent {
+                project,
+                status,
+                limit,
+            } => commands::plan::recent(&paths, style, project, status, limit).await,
             PlanAction::Answer {
                 plan_id,
                 file,

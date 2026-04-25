@@ -28,8 +28,8 @@ use flowd_core::memory::service::MemoryService;
 use flowd_core::memory::{EmbeddingProvider, VectorIndex};
 use flowd_core::orchestration::observer::{PlanEvent, PlanObserver, SharedPlanObserver};
 use flowd_core::orchestration::{
-    AgentOutput, AgentSpawner, CompileOutput, InMemoryPlanExecutor, MockPlanCompiler, OpenQuestion,
-    PlanStep, QuestionOption, loader::StepDefinition,
+    AgentOutput, AgentSpawnContext, AgentSpawner, CompileOutput, InMemoryPlanExecutor,
+    MockPlanCompiler, OpenQuestion, PlanStep, QuestionOption, loader::StepDefinition,
 };
 use flowd_core::rules::InMemoryRuleEvaluator;
 use flowd_core::types::Embedding;
@@ -90,7 +90,11 @@ impl VectorIndex for MemVectors {
 struct EchoSpawner;
 
 impl AgentSpawner for EchoSpawner {
-    fn spawn(&self, step: &PlanStep) -> impl Future<Output = FlowdResult<AgentOutput>> + Send {
+    fn spawn(
+        &self,
+        _ctx: AgentSpawnContext,
+        step: &PlanStep,
+    ) -> impl Future<Output = FlowdResult<AgentOutput>> + Send {
         let id = step.id.clone();
         async move { Ok(AgentOutput::success(format!("ran:{id}"))) }
     }

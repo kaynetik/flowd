@@ -35,7 +35,7 @@ fn cursor(global: bool, project: Option<PathBuf>) -> Result<()> {
 
     let canonical_entry = json!({
         "command": exe_str,
-        "args": ["start", "--mcp"],
+        "args": ["mcp"],
     });
 
     let mut merged = load_json_object(&dest)?;

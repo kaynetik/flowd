@@ -26,7 +26,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Start the flowd daemon (runs the MCP stdio server).
+    /// Start the central flowd daemon (runs the local socket server).
     Start {
         /// Qdrant URL (overrides the default <http://localhost:6334>).
         #[arg(long)]
@@ -42,6 +42,9 @@ pub enum Command {
         #[arg(long, default_value_t = 1024)]
         plan_event_buffer: usize,
     },
+
+    /// Bridge MCP stdio to the central flowd daemon.
+    Mcp,
 
     /// Stop the running flowd daemon (sends SIGTERM).
     Stop,
@@ -209,6 +212,42 @@ pub enum PlanAction {
         /// `step_cancelled`, `finished`.
         #[arg(short, long, value_delimiter = ',')]
         kind: Vec<String>,
+    },
+
+    /// List persisted plan summaries, newest first.
+    List {
+        /// Filter by project.
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Filter by status.
+        #[arg(short, long)]
+        status: Option<String>,
+
+        /// Max rows to return.
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
+
+    /// Show the full persisted snapshot for one plan.
+    Show {
+        /// Plan UUID.
+        plan_id: String,
+    },
+
+    /// Show recent persisted plan summaries. Defaults to five rows.
+    Recent {
+        /// Filter by project.
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Filter by status.
+        #[arg(short, long)]
+        status: Option<String>,
+
+        /// Max rows to return.
+        #[arg(short, long, default_value_t = 5)]
+        limit: usize,
     },
 
     /// Submit answers to a Draft plan's open questions (offline mode).

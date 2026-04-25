@@ -599,7 +599,7 @@ mod tests {
     /// `complete()` must SIGKILL the spawned child before returning,
     /// not merely detach it. The fake script `exec`s into `sleep` so
     /// `$$` (written to a sidecar file) is the PID of the process
-    /// tokio actually spawned -- that's the PID start_kill targets.
+    /// tokio actually spawned -- that's the PID `start_kill` targets.
     /// After the timeout fires we probe that PID with `kill(pid, 0)`
     /// and expect `ESRCH`, proving the kernel has already reaped it.
     #[cfg(unix)]

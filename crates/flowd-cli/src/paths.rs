@@ -5,6 +5,7 @@
 //! ```text
 //! $FLOWD_HOME | ~/.flowd/
 //!   flowd.pid               -- daemon PID file
+//!   flowd.sock              -- local MCP proxy socket
 //!   memory.db               -- SQLite + FTS5
 //!   memory.db-wal           -- WAL file (SQLite managed)
 //!   rules/                  -- global rules
@@ -50,6 +51,11 @@ impl FlowdPaths {
     #[must_use]
     pub fn pid_file(&self) -> PathBuf {
         self.home.join("flowd.pid")
+    }
+
+    #[must_use]
+    pub fn socket_file(&self) -> PathBuf {
+        self.home.join("flowd.sock")
     }
 
     #[must_use]
@@ -117,6 +123,7 @@ mod tests {
     fn with_home_composes_paths() {
         let p = FlowdPaths::with_home(PathBuf::from("/tmp/flowd-test"));
         assert_eq!(p.pid_file(), PathBuf::from("/tmp/flowd-test/flowd.pid"));
+        assert_eq!(p.socket_file(), PathBuf::from("/tmp/flowd-test/flowd.sock"));
         assert_eq!(p.db_file(), PathBuf::from("/tmp/flowd-test/memory.db"));
         assert_eq!(p.rules_dir(), PathBuf::from("/tmp/flowd-test/rules"));
         assert_eq!(p.model_dir(), PathBuf::from("/tmp/flowd-test/models"));

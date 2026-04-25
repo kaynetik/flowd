@@ -150,6 +150,31 @@ pub struct PlanResumeParams {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlanListParams {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlanShowParams {
+    pub plan_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlanRecentParams {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RulesCheckParams {
     pub tool: String,
     #[serde(default)]
@@ -421,6 +446,46 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
             }),
         },
         ToolSchema {
+            name: "plan_list".into(),
+            description: "List persisted plan summaries, newest first. Supports project, status, and limit filters."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string" },
+                    "status": {
+                        "type": "string",
+                        "enum": ["draft", "confirmed", "running", "interrupted", "completed", "failed", "cancelled"]
+                    },
+                    "limit": { "type": "integer", "minimum": 1 }
+                }
+            }),
+        },
+        ToolSchema {
+            name: "plan_show".into(),
+            description: "Return the full persisted plan snapshot for a plan id.".into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["plan_id"],
+                "properties": { "plan_id": { "type": "string" } }
+            }),
+        },
+        ToolSchema {
+            name: "plan_recent".into(),
+            description: "List the most recent persisted plan summaries. Defaults to five rows.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string" },
+                    "status": {
+                        "type": "string",
+                        "enum": ["draft", "confirmed", "running", "interrupted", "completed", "failed", "cancelled"]
+                    },
+                    "limit": { "type": "integer", "minimum": 1, "default": 5 }
+                }
+            }),
+        },
+        ToolSchema {
             name: "rules_check".into(),
             description: "Validate a proposed tool invocation against loaded rules (warn / deny)."
                 .into(),
@@ -461,7 +526,7 @@ mod tests {
             assert!(!s.description.trim().is_empty());
             assert_eq!(s.input_schema["type"], "object");
         }
-        assert_eq!(schemas.len(), 12);
+        assert_eq!(schemas.len(), 15);
     }
 
     #[test]

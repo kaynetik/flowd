@@ -67,14 +67,17 @@
 //! `tracing` (warn on non-zero exit, debug otherwise) so it surfaces
 //! in the daemon log without polluting the JSON-RPC channel.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use flowd_core::error::{FlowdError, Result};
-use flowd_core::orchestration::executor::{AgentMetrics, AgentSpawner, ModelUsage};
-use flowd_core::orchestration::{AgentOutput, PlanStep};
+use flowd_core::orchestration::executor::{
+    AgentMetrics, AgentSpawnContext, AgentSpawner, ModelUsage,
+};
+use flowd_core::orchestration::{AgentOutput, Plan, PlanPreview, PlanStep};
 use serde::Deserialize;
 use tokio::process::Command;
 
@@ -298,10 +301,22 @@ impl LocalShellSpawner {
     pub fn bin_display(&self) -> std::path::Display<'_> {
         std::path::Path::new(&self.bin).display()
     }
-}
 
-impl AgentSpawner for LocalShellSpawner {
-    async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+    fn effective_cwd(&self) -> Result<PathBuf> {
+        match &self.cwd {
+            Some(cwd) => Ok(cwd.clone()),
+            None => std::env::current_dir().map_err(|e| FlowdError::PlanExecution {
+                message: format!("resolve current directory for agent spawner: {e}"),
+                metrics: None,
+            }),
+        }
+    }
+
+    async fn spawn_in_cwd(
+        &self,
+        step: &PlanStep,
+        cwd_override: Option<&Path>,
+    ) -> Result<AgentOutput> {
         let claude_like = is_claude_like(&self.bin);
         let injected = default_args_for(&self.bin);
 
@@ -313,7 +328,9 @@ impl AgentSpawner for LocalShellSpawner {
             cmd.arg(arg);
         }
         cmd.arg(&self.prompt_flag).arg(&step.prompt);
-        if let Some(cwd) = &self.cwd {
+        if let Some(cwd) = cwd_override {
+            cmd.current_dir(cwd);
+        } else if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
         }
         // Detach stdin so an agent that tries to prompt the operator errors
@@ -329,6 +346,7 @@ impl AgentSpawner for LocalShellSpawner {
             step_id = %step.id,
             agent_type = %step.agent_type,
             bin = %self.bin_display(),
+            cwd = ?cwd_override.or(self.cwd.as_deref()),
             injected_args = ?injected,
             claude_like,
             "spawning agent step"
@@ -384,6 +402,288 @@ impl AgentSpawner for LocalShellSpawner {
             exit_code: code,
             metrics,
         })
+    }
+}
+
+impl AgentSpawner for LocalShellSpawner {
+    async fn spawn(&self, _ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
+        self.spawn_in_cwd(step, None).await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GitWorktreeSpawner {
+    inner: LocalShellSpawner,
+    manager: Arc<GitWorktreeManager>,
+}
+
+impl GitWorktreeSpawner {
+    fn try_new(inner: LocalShellSpawner, flowd_home: &Path) -> Option<Self> {
+        let cwd = inner.effective_cwd().ok()?;
+        let repo = discover_git_root(&cwd).ok()?;
+        Some(Self {
+            inner,
+            manager: Arc::new(GitWorktreeManager::new(repo, flowd_home.join("worktrees"))),
+        })
+    }
+
+    fn repo_display(&self) -> std::path::Display<'_> {
+        self.manager.repo.display()
+    }
+}
+
+impl AgentSpawner for GitWorktreeSpawner {
+    fn supports_worktree_isolation(&self) -> bool {
+        true
+    }
+
+    async fn prepare_plan(&self, plan: &Plan, preview: &PlanPreview) -> Result<()> {
+        if preview.max_parallelism <= 1 {
+            return Ok(());
+        }
+        self.manager.prepare_plan(plan).await
+    }
+
+    async fn spawn(&self, ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
+        if !ctx.plan_parallel {
+            return self.inner.spawn_in_cwd(step, None).await;
+        }
+        let worktree = self.manager.prepare_step(&ctx, step).await?;
+        let output = self.inner.spawn_in_cwd(step, Some(&worktree)).await?;
+        self.manager.finish_step(&ctx, step, &worktree).await?;
+        Ok(output)
+    }
+}
+
+#[derive(Debug)]
+struct GitWorktreeManager {
+    repo: PathBuf,
+    root: PathBuf,
+    branches: Mutex<HashMap<uuid::Uuid, HashMap<String, String>>>,
+}
+
+impl GitWorktreeManager {
+    fn new(repo: PathBuf, root: PathBuf) -> Self {
+        Self {
+            repo,
+            root,
+            branches: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn prepare_plan(&self, plan: &Plan) -> Result<()> {
+        let dirty = git_output(&self.repo, ["status", "--porcelain"]).await?;
+        if !dirty.trim().is_empty() {
+            return Err(FlowdError::PlanExecution {
+                message: format!(
+                    "parallel plan `{}` requires a clean git base at {}; refusing to use stashes. Commit or discard these changes first:\n{}",
+                    plan.id,
+                    self.repo.display(),
+                    dirty.trim()
+                ),
+                metrics: None,
+            });
+        }
+        tokio::fs::create_dir_all(self.plan_root(plan))
+            .await
+            .map_err(|e| FlowdError::PlanExecution {
+                message: format!("create worktree root for plan `{}`: {e}", plan.id),
+                metrics: None,
+            })?;
+        Ok(())
+    }
+
+    async fn prepare_step(&self, ctx: &AgentSpawnContext, step: &PlanStep) -> Result<PathBuf> {
+        let branch = step_branch(ctx, step);
+        let path = self
+            .root
+            .join(sanitize_path(&ctx.project))
+            .join(ctx.plan_id.to_string())
+            .join(sanitize_path(&step.id));
+        if path.exists() {
+            return Err(FlowdError::PlanExecution {
+                message: format!(
+                    "worktree path already exists for step `{}`: {}; remove it before resuming this parallel plan",
+                    step.id,
+                    path.display()
+                ),
+                metrics: None,
+            });
+        }
+
+        let dep_branches = self.dependency_branches(ctx.plan_id, step)?;
+        let base = dep_branches.first().map_or("HEAD", String::as_str);
+        let path_arg = path.to_string_lossy().into_owned();
+        git_output(
+            &self.repo,
+            ["worktree", "add", "-b", &branch, &path_arg, base],
+        )
+        .await?;
+        for dep in dep_branches.iter().skip(1) {
+            git_output(&path, ["merge", "--no-edit", dep]).await?;
+        }
+        Ok(path)
+    }
+
+    async fn finish_step(
+        &self,
+        ctx: &AgentSpawnContext,
+        step: &PlanStep,
+        worktree: &Path,
+    ) -> Result<()> {
+        git_output(worktree, ["add", "-A"]).await?;
+        let has_changes = git_status(worktree, ["diff", "--cached", "--quiet"]).await?;
+        if has_changes != 0 {
+            git_output(
+                worktree,
+                [
+                    "-c",
+                    "user.name=flowd",
+                    "-c",
+                    "user.email=flowd@local",
+                    "commit",
+                    "-m",
+                    &format!("flowd step {}", step.id),
+                ],
+            )
+            .await?;
+        }
+        let branch = step_branch(ctx, step);
+        let mut guard = self
+            .branches
+            .lock()
+            .map_err(|_| FlowdError::PlanExecution {
+                message: "worktree branch map poisoned".into(),
+                metrics: None,
+            })?;
+        guard
+            .entry(ctx.plan_id)
+            .or_default()
+            .insert(step.id.clone(), branch);
+        Ok(())
+    }
+
+    fn dependency_branches(&self, plan_id: uuid::Uuid, step: &PlanStep) -> Result<Vec<String>> {
+        let guard = self
+            .branches
+            .lock()
+            .map_err(|_| FlowdError::PlanExecution {
+                message: "worktree branch map poisoned".into(),
+                metrics: None,
+            })?;
+        let Some(plan_branches) = guard.get(&plan_id) else {
+            return Ok(Vec::new());
+        };
+        step.depends_on
+            .iter()
+            .map(|dep| {
+                plan_branches
+                    .get(dep)
+                    .cloned()
+                    .ok_or_else(|| FlowdError::PlanExecution {
+                        message: format!(
+                            "dependency branch for step `{dep}` is missing before running `{}`",
+                            step.id
+                        ),
+                        metrics: None,
+                    })
+            })
+            .collect()
+    }
+
+    fn plan_root(&self, plan: &Plan) -> PathBuf {
+        self.root
+            .join(sanitize_path(&plan.project))
+            .join(plan.id.to_string())
+    }
+}
+
+fn discover_git_root(cwd: &Path) -> Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .map_err(|e| FlowdError::PlanExecution {
+            message: format!("probe git repository at {}: {e}", cwd.display()),
+            metrics: None,
+        })?;
+    if !output.status.success() {
+        return Err(FlowdError::PlanExecution {
+            message: format!("agent cwd {} is not inside a git repository", cwd.display()),
+            metrics: None,
+        });
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok(PathBuf::from(root))
+}
+
+async fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| FlowdError::PlanExecution {
+            message: format!("run git in {}: {e}", cwd.display()),
+            metrics: None,
+        })?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    Err(FlowdError::PlanExecution {
+        message: format!(
+            "git command failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        metrics: None,
+    })
+}
+
+async fn git_status<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<i32> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .status()
+        .await
+        .map_err(|e| FlowdError::PlanExecution {
+            message: format!("run git in {}: {e}", cwd.display()),
+            metrics: None,
+        })?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn step_branch(ctx: &AgentSpawnContext, step: &PlanStep) -> String {
+    format!(
+        "flowd/{}/{}/{}",
+        sanitize_ref(&ctx.project),
+        ctx.plan_id.simple(),
+        sanitize_ref(&step.id),
+    )
+}
+
+fn sanitize_path(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn sanitize_ref(raw: &str) -> String {
+    let cleaned = sanitize_path(raw).trim_matches('-').to_owned();
+    if cleaned.is_empty() {
+        "unnamed".into()
+    } else {
+        cleaned
     }
 }
 
@@ -462,7 +762,7 @@ fn interpret_claude_stdout(step_id: &str, raw: &str) -> Result<(String, Option<A
 pub struct UnconfiguredSpawner;
 
 impl AgentSpawner for UnconfiguredSpawner {
-    async fn spawn(&self, _step: &PlanStep) -> Result<AgentOutput> {
+    async fn spawn(&self, _ctx: AgentSpawnContext, _step: &PlanStep) -> Result<AgentOutput> {
         Err(FlowdError::PlanExecution {
             message: "no agent CLI configured. Set $FLOWD_AGENT_BIN to an absolute \
                       path, or install one of: cursor-agent, claude, codex, aider \
@@ -477,28 +777,50 @@ impl AgentSpawner for UnconfiguredSpawner {
 /// without leaking concrete types into the rest of `start.rs`.
 pub enum BoxedSpawner {
     Local(LocalShellSpawner),
+    Worktree(GitWorktreeSpawner),
     Unconfigured(UnconfiguredSpawner),
 }
 
 impl BoxedSpawner {
     /// Build the best available spawner for the current environment.
-    pub fn auto() -> Self {
-        LocalShellSpawner::detect().map_or(Self::Unconfigured(UnconfiguredSpawner), Self::Local)
+    pub fn auto(flowd_home: &Path) -> Self {
+        let Some(local) = LocalShellSpawner::detect() else {
+            return Self::Unconfigured(UnconfiguredSpawner);
+        };
+        GitWorktreeSpawner::try_new(local.clone(), flowd_home)
+            .map_or(Self::Local(local), Self::Worktree)
     }
 
     pub fn description(&self) -> String {
         match self {
             Self::Local(s) => format!("local-shell ({})", s.bin_display()),
+            Self::Worktree(s) => format!(
+                "git-worktree ({}, repo {})",
+                s.inner.bin_display(),
+                s.repo_display()
+            ),
             Self::Unconfigured(_) => "unconfigured (plan execution will fail)".into(),
         }
     }
 }
 
 impl AgentSpawner for BoxedSpawner {
-    async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+    fn supports_worktree_isolation(&self) -> bool {
+        matches!(self, Self::Worktree(_))
+    }
+
+    async fn prepare_plan(&self, plan: &Plan, preview: &PlanPreview) -> Result<()> {
         match self {
-            Self::Local(s) => s.spawn(step).await,
-            Self::Unconfigured(s) => s.spawn(step).await,
+            Self::Worktree(s) => s.prepare_plan(plan, preview).await,
+            Self::Local(_) | Self::Unconfigured(_) => Ok(()),
+        }
+    }
+
+    async fn spawn(&self, ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
+        match self {
+            Self::Local(s) => s.spawn(ctx, step).await,
+            Self::Worktree(s) => s.spawn(ctx, step).await,
+            Self::Unconfigured(s) => s.spawn(ctx, step).await,
         }
     }
 }
@@ -547,11 +869,15 @@ mod tests {
     use flowd_core::orchestration::StepStatus;
 
     fn step(prompt: &str) -> PlanStep {
+        step_with_id("t", prompt, &[])
+    }
+
+    fn step_with_id(id: &str, prompt: &str, depends_on: &[&str]) -> PlanStep {
         PlanStep {
-            id: "t".into(),
+            id: id.into(),
             agent_type: "test".into(),
             prompt: prompt.into(),
-            depends_on: vec![],
+            depends_on: depends_on.iter().map(|s| (*s).to_owned()).collect(),
             timeout_secs: None,
             retry_count: 0,
             status: StepStatus::Pending,
@@ -562,13 +888,36 @@ mod tests {
         }
     }
 
+    fn ctx() -> AgentSpawnContext {
+        AgentSpawnContext {
+            plan_id: uuid::Uuid::new_v4(),
+            project: "test".into(),
+            plan_parallel: false,
+            layer_width: 1,
+        }
+    }
+
+    fn git_sync(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("spawn git");
+        assert!(
+            status.success(),
+            "git {args:?} failed in {}",
+            repo.display()
+        );
+    }
+
     /// Smoke test: `echo` stands in for an agent that just prints its
     /// argv. With the default `-p` flag the invocation is
     /// `echo -p "<prompt>"`, which exits 0 and contains the prompt.
     #[tokio::test]
     async fn echo_spawner_returns_stdout() {
         let s = LocalShellSpawner::new("echo");
-        let out = s.spawn(&step("hello flowd")).await.unwrap();
+        let out = s.spawn(ctx(), &step("hello flowd")).await.unwrap();
         assert_eq!(out.exit_code, Some(0));
         assert!(out.stdout.contains("hello flowd"));
     }
@@ -576,14 +925,14 @@ mod tests {
     #[tokio::test]
     async fn missing_binary_yields_plan_execution_error() {
         let s = LocalShellSpawner::new("/does/not/exist/flowd-agent");
-        let err = s.spawn(&step("anything")).await.unwrap_err();
+        let err = s.spawn(ctx(), &step("anything")).await.unwrap_err();
         assert!(matches!(err, FlowdError::PlanExecution { .. }));
     }
 
     #[tokio::test]
     async fn unconfigured_spawner_reports_actionable_error() {
         let s = UnconfiguredSpawner;
-        let err = s.spawn(&step("x")).await.unwrap_err();
+        let err = s.spawn(ctx(), &step("x")).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("FLOWD_AGENT_BIN"));
         assert!(msg.contains("cursor-agent"));
@@ -824,6 +1173,67 @@ mod tests {
         assert!(m.model_usage.is_empty());
     }
 
+    #[tokio::test]
+    async fn worktree_manager_rejects_dirty_base_and_records_step_branch() {
+        let repo = tempfile::tempdir().expect("repo");
+        git_sync(repo.path(), &["init"]);
+        std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
+        git_sync(repo.path(), &["add", "README.md"]);
+        git_sync(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=flowd-test",
+                "-c",
+                "user.email=flowd@test.local",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+
+        let worktrees = tempfile::tempdir().expect("worktrees");
+        let manager = GitWorktreeManager::new(
+            repo.path().to_path_buf(),
+            worktrees.path().join("worktrees"),
+        );
+        let plan = flowd_core::orchestration::Plan::new(
+            "p",
+            "proj",
+            vec![
+                step_with_id("a", "do a", &[]),
+                step_with_id("b", "do b", &[]),
+            ],
+        );
+
+        std::fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
+        let dirty = manager.prepare_plan(&plan).await.unwrap_err();
+        assert!(dirty.to_string().contains("requires a clean git base"));
+        std::fs::remove_file(repo.path().join("dirty.txt")).unwrap();
+
+        manager.prepare_plan(&plan).await.unwrap();
+        let ctx = AgentSpawnContext {
+            plan_id: plan.id,
+            project: plan.project.clone(),
+            plan_parallel: true,
+            layer_width: 2,
+        };
+        let step = step_with_id("a", "do a", &[]);
+        let worktree = manager.prepare_step(&ctx, &step).await.unwrap();
+        assert!(worktree.is_dir());
+        std::fs::write(worktree.join("a.txt"), "a\n").unwrap();
+        manager.finish_step(&ctx, &step, &worktree).await.unwrap();
+
+        let branches = manager.branches.lock().unwrap();
+        assert_eq!(
+            branches
+                .get(&plan.id)
+                .and_then(|plan_branches| plan_branches.get("a"))
+                .map(String::as_str),
+            Some(step_branch(&ctx, &step).as_str()),
+        );
+    }
+
     /// The `modelUsage` block is the one place upstream swaps to
     /// camelCase. Verify the serde renames actually bite: if any of
     /// them regress to `snake_case`, the inner fields silently zero out.
@@ -892,7 +1302,7 @@ mod tests {
         };
         let s = LocalShellSpawner::new(claude);
         let out = s
-            .spawn(&step("Reply with exactly the two characters: OK"))
+            .spawn(ctx(), &step("Reply with exactly the two characters: OK"))
             .await
             .expect("live claude smoke: simple reply must succeed");
 
@@ -959,7 +1369,7 @@ mod tests {
              other file. Reply with the single word `done` when complete."
         );
         let out = s
-            .spawn(&step(&prompt))
+            .spawn(ctx(), &step(&prompt))
             .await
             .expect("live claude smoke: write step must succeed");
 
@@ -1004,7 +1414,7 @@ mod tests {
             extra_args: vec!["--output-format=text".to_owned()],
         };
         let out = s
-            .spawn(&step("Reply with exactly the two characters: OK"))
+            .spawn(ctx(), &step("Reply with exactly the two characters: OK"))
             .await
             .expect("live claude passthrough: must not error on plain-text output");
 

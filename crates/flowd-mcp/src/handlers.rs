@@ -45,15 +45,16 @@ use flowd_core::memory::service::MemoryService;
 use flowd_core::memory::{EmbeddingProvider, MemoryBackend, VectorIndex};
 use flowd_core::orchestration::observer::{PlanEvent, SharedPlanObserver};
 use flowd_core::orchestration::{
-    Answer, Plan, PlanCompiler, PlanDraftSnapshot, PlanExecutor, PlanStatus, loader::PlanDefinition,
+    Answer, Plan, PlanCompiler, PlanDraftSnapshot, PlanExecutor, PlanStatus, PlanSummary,
+    loader::PlanDefinition,
 };
 use flowd_core::rules::{ProposedAction, RuleEvaluator};
 use flowd_core::types::SearchQuery;
 
 use crate::tools::{
     MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanAnswerParams, PlanCancelParams,
-    PlanConfirmParams, PlanCreateParams, PlanRefineParams, PlanResumeParams, PlanStatusParams,
-    RulesCheckParams, RulesListParams,
+    PlanConfirmParams, PlanCreateParams, PlanListParams, PlanRecentParams, PlanRefineParams,
+    PlanResumeParams, PlanShowParams, PlanStatusParams, RulesCheckParams, RulesListParams,
 };
 
 /// Maximum number of characters preserved for a derived plan name.
@@ -113,6 +114,12 @@ pub trait McpHandlers: Send + Sync {
     fn plan_status(&self, params: PlanStatusParams) -> impl Future<Output = Result<Value>> + Send;
 
     fn plan_resume(&self, params: PlanResumeParams) -> impl Future<Output = Result<Value>> + Send;
+
+    fn plan_list(&self, params: PlanListParams) -> impl Future<Output = Result<Value>> + Send;
+
+    fn plan_show(&self, params: PlanShowParams) -> impl Future<Output = Result<Value>> + Send;
+
+    fn plan_recent(&self, params: PlanRecentParams) -> impl Future<Output = Result<Value>> + Send;
 
     fn rules_check(&self, params: RulesCheckParams) -> impl Future<Output = Result<Value>> + Send;
 
@@ -385,6 +392,45 @@ fn prose_plan_payload_with(
         map.insert("clarification_reopened".into(), Value::Bool(flag));
     }
     Ok(payload)
+}
+
+fn filter_plan_summaries(
+    mut summaries: Vec<PlanSummary>,
+    status: Option<PlanStatus>,
+    limit: Option<usize>,
+) -> Vec<PlanSummary> {
+    if let Some(status) = status {
+        summaries.retain(|s| s.status == status);
+    }
+    if let Some(limit) = limit {
+        summaries.truncate(limit.max(1));
+    }
+    summaries
+}
+
+fn plan_summaries_payload(summaries: &[PlanSummary]) -> Value {
+    json!({
+        "plans": summaries,
+    })
+}
+
+fn parse_plan_status_filter(raw: Option<String>) -> Result<Option<PlanStatus>> {
+    raw.map(|s| parse_plan_status(&s)).transpose()
+}
+
+fn parse_plan_status(raw: &str) -> Result<PlanStatus> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "draft" => Ok(PlanStatus::Draft),
+        "confirmed" => Ok(PlanStatus::Confirmed),
+        "running" => Ok(PlanStatus::Running),
+        "interrupted" => Ok(PlanStatus::Interrupted),
+        "completed" => Ok(PlanStatus::Completed),
+        "failed" => Ok(PlanStatus::Failed),
+        "cancelled" => Ok(PlanStatus::Cancelled),
+        other => Err(FlowdError::PlanValidation(format!(
+            "unknown plan status `{other}`; expected draft, confirmed, running, interrupted, completed, failed, or cancelled"
+        ))),
+    }
 }
 
 /// Sum of outstanding questions and recorded decisions on a plan.
@@ -714,6 +760,20 @@ where
             }));
         }
 
+        let preview = flowd_core::orchestration::build_preview(&plan)?;
+        if preview.max_parallelism > 1 {
+            if !self.executor.supports_worktree_isolation() {
+                return Err(FlowdError::PlanExecution {
+                    message: format!(
+                        "plan `{id}` has max_parallelism={} but the configured agent spawner does not support git worktree isolation; refusing to run agents in one checkout",
+                        preview.max_parallelism
+                    ),
+                    metrics: None,
+                });
+            }
+            self.executor.prepare_plan(id).await?;
+        }
+
         let preview = self.executor.confirm(id).await?;
         // Kick off execution in the background; plan_status is the polling
         // entry point. We intentionally do not propagate errors from the
@@ -768,6 +828,29 @@ where
             "plan_id": id.to_string(),
             "status": "running",
         }))
+    }
+
+    async fn plan_list(&self, p: PlanListParams) -> Result<Value> {
+        self.touch_activity();
+        let status = parse_plan_status_filter(p.status)?;
+        let summaries = self.executor.list_plans(p.project).await?;
+        let summaries = filter_plan_summaries(summaries, status, p.limit);
+        Ok(plan_summaries_payload(&summaries))
+    }
+
+    async fn plan_show(&self, p: PlanShowParams) -> Result<Value> {
+        self.touch_activity();
+        let id = parse_uuid(&p.plan_id)?;
+        let plan = self.executor.status(id).await?;
+        serde_json::to_value(&plan).map_err(|e| FlowdError::Serialization(e.to_string()))
+    }
+
+    async fn plan_recent(&self, p: PlanRecentParams) -> Result<Value> {
+        self.touch_activity();
+        let status = parse_plan_status_filter(p.status)?;
+        let summaries = self.executor.list_plans(p.project).await?;
+        let summaries = filter_plan_summaries(summaries, status, Some(p.limit.unwrap_or(5)));
+        Ok(plan_summaries_payload(&summaries))
     }
 
     async fn rules_check(&self, p: RulesCheckParams) -> Result<Value> {
@@ -892,6 +975,7 @@ pub fn plan_status_label(status: PlanStatus) -> &'static str {
         PlanStatus::Draft => "draft",
         PlanStatus::Confirmed => "confirmed",
         PlanStatus::Running => "running",
+        PlanStatus::Interrupted => "interrupted",
         PlanStatus::Completed => "completed",
         PlanStatus::Failed => "failed",
         PlanStatus::Cancelled => "cancelled",

@@ -44,7 +44,8 @@ use crate::error::{FlowdError, Result};
 
 use super::Plan;
 use super::executor::{
-    AgentMetrics, AgentSpawner, PlanRuntime, StepOutcome, apply_outcome, run_step,
+    AgentMetrics, AgentSpawnContext, AgentSpawner, PlanRuntime, StepOutcome, apply_outcome,
+    run_step,
 };
 use super::gate::SharedRuleGate;
 use super::observer::{PlanEvent, PlanStepCounts, SharedPlanObserver};
@@ -116,6 +117,8 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
         let mut rollup = AgentMetrics::default();
         let mut step_count = PlanStepCounts::default();
 
+        let plan_parallel = plan.execution_layers()?.iter().any(|l| l.len() > 1);
+
         for step_id in layer {
             let Some(mut step) = plan.steps.iter().find(|s| &s.id == step_id).cloned() else {
                 continue;
@@ -132,8 +135,14 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
             let spawner = Arc::clone(self.spawner);
             let cancel_for_task = Arc::clone(cancel);
             let default_timeout = self.default_step_timeout_secs;
+            let ctx = AgentSpawnContext {
+                plan_id,
+                project: plan.project.clone(),
+                plan_parallel,
+                layer_width: layer.len(),
+            };
             let handle = tokio::spawn(async move {
-                run_step(&*spawner, step, cancel_for_task, default_timeout).await
+                run_step(&*spawner, ctx, step, cancel_for_task, default_timeout).await
             });
             handles.push((step_id.clone(), handle));
         }

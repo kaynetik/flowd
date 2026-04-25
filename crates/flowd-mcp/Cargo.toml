@@ -1,6 +1,6 @@
 [package]
 name = "flowd-mcp"
-version = "0.2.5"
+version = "0.3.0"
 description = "MCP server exposing flowd tools to Claude Code and Cursor"
 edition.workspace = true
 rust-version.workspace = true

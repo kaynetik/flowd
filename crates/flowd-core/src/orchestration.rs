@@ -2,7 +2,8 @@
 //!
 //! A `Plan` is a DAG of `PlanStep`s. The engine drives plans through a small
 //! state machine: `Draft` → `Confirmed` → `Running` → `Completed` / `Failed`,
-//! with `Cancelled` reachable from `Confirmed` or `Running`.
+//! with `Cancelled` reachable from `Confirmed` or `Running`. A daemon restart
+//! while work is in flight settles the plan as `Interrupted`, which is resumable.
 //!
 //! This module owns the trait surface and pure-data types. Concrete pieces:
 //!
@@ -33,7 +34,7 @@ use uuid::Uuid;
 
 pub use clarification::{Answer, DecisionRecord, OpenQuestion, QuestionOption};
 pub use compiler::{CompileOutput, MockPlanCompiler, PlanCompiler, PlanDraftSnapshot};
-pub use executor::{AgentOutput, AgentSpawner, InMemoryPlanExecutor};
+pub use executor::{AgentOutput, AgentSpawnContext, AgentSpawner, InMemoryPlanExecutor};
 pub use loader::{PlanDefinition, StepDefinition, load_plan, load_plan_json, load_plan_yaml};
 pub use store::{NoOpPlanStore, PlanStore, PlanSummary};
 
@@ -136,6 +137,7 @@ pub enum PlanStatus {
     Draft,
     Confirmed,
     Running,
+    Interrupted,
     Completed,
     Failed,
     Cancelled,
@@ -227,6 +229,27 @@ pub trait PlanExecutor: Send + Sync {
     /// Returns `FlowdError::PlanNotFound` if the plan is unknown.
     fn status(&self, plan_id: Uuid) -> impl Future<Output = Result<Plan>> + Send;
 
+    /// List persisted plan summaries, newest first, optionally scoped to
+    /// one project.
+    ///
+    /// # Errors
+    /// Propagates storage failures from the backing [`PlanStore`].
+    fn list_plans(
+        &self,
+        project: Option<String>,
+    ) -> impl Future<Output = Result<Vec<PlanSummary>>> + Send;
+
+    /// Whether confirmed parallel plans can run in isolated git worktrees.
+    #[must_use]
+    fn supports_worktree_isolation(&self) -> bool;
+
+    /// Validate plan-level execution prerequisites before confirmation.
+    ///
+    /// # Errors
+    /// Returns a plan execution error when the plan cannot safely execute
+    /// with the installed spawner.
+    fn prepare_plan(&self, plan_id: Uuid) -> impl Future<Output = Result<PlanPreview>> + Send;
+
     /// Cancel a plan. Behaviour depends on current state:
     ///
     /// * `Draft` or `Confirmed` (no execution in flight): transitions
@@ -252,7 +275,7 @@ pub trait PlanExecutor: Send + Sync {
     ///
     /// # Errors
     /// Returns `FlowdError::PlanNotFound` if the plan is unknown, or
-    /// `FlowdError::PlanExecution` if the plan is in a terminal state.
+    /// `FlowdError::PlanExecution` if the plan is not `Failed` or `Interrupted`.
     fn resume_plan(&self, plan_id: Uuid) -> impl Future<Output = Result<()>> + Send;
 
     /// Apply a [`compiler::CompileOutput`] onto an in-flight `Draft`

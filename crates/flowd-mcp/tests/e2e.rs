@@ -27,7 +27,9 @@ use uuid::Uuid;
 use flowd_core::error::{Result as FlowdResult, RuleLevel};
 use flowd_core::memory::service::MemoryService;
 use flowd_core::memory::{EmbeddingProvider, VectorIndex};
-use flowd_core::orchestration::{AgentOutput, AgentSpawner, InMemoryPlanExecutor, PlanStep};
+use flowd_core::orchestration::{
+    AgentOutput, AgentSpawnContext, AgentSpawner, InMemoryPlanExecutor, PlanStep,
+};
 use flowd_core::rules::{InMemoryRuleEvaluator, Rule, RuleEvaluator};
 use flowd_core::types::Embedding;
 use flowd_mcp::protocol::JsonRpcResponse;
@@ -112,7 +114,11 @@ struct EchoSpawner {
 }
 
 impl AgentSpawner for EchoSpawner {
-    fn spawn(&self, step: &PlanStep) -> impl Future<Output = FlowdResult<AgentOutput>> + Send {
+    fn spawn(
+        &self,
+        _ctx: AgentSpawnContext,
+        step: &PlanStep,
+    ) -> impl Future<Output = FlowdResult<AgentOutput>> + Send {
         let id = step.id.clone();
         self.calls.lock().unwrap().push(id.clone());
         async move { Ok(AgentOutput::success(format!("ran:{id}"))) }
@@ -200,14 +206,16 @@ async fn full_composed_session_roundtrip() {
     // A known session so memory_store/memory_search line up.
     let session_id = Uuid::new_v4().to_string();
 
-    // The plan exercises a fan-out: a,b parallel -> c depends on both.
+    // Keep the composed e2e plan serial: parallel plan execution is refused
+    // until the daemon can isolate each agent in its own git worktree.
     let plan_def = json!({
         "name": "e2e",
         "steps": [
             { "id": "a", "agent_type": "echo", "prompt": "do a" },
-            { "id": "b", "agent_type": "echo", "prompt": "do b" },
+            { "id": "b", "agent_type": "echo", "prompt": "do b",
+              "depends_on": ["a"] },
             { "id": "c", "agent_type": "echo", "prompt": "do c",
-              "depends_on": ["a", "b"] }
+              "depends_on": ["b"] }
         ]
     });
 
@@ -261,11 +269,11 @@ async fn full_composed_session_roundtrip() {
     // initialize: protocol handshake sanity
     assert!(responses[0].result.as_ref().unwrap()["protocolVersion"].is_string());
 
-    // tools/list: we ship exactly the 9 MCP tools
+    // tools/list: memory, plan lifecycle/recovery, and rules tools.
     let tools = responses[1].result.as_ref().unwrap()["tools"]
         .as_array()
         .unwrap();
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 15);
 
     // memory_store: returns the new UUID
     let stored = tool_payload(&responses[2]);
@@ -297,13 +305,14 @@ async fn full_composed_session_roundtrip() {
             .contains("no-shell")
     );
 
-    // plan_create: returns a plan_id and a preview with 2 layers
+    // plan_create: returns a plan_id and a serial preview.
     let created = tool_payload(&responses[5]);
     let plan_id = created["plan_id"].as_str().expect("plan_id string");
     let layers = created["preview"]["execution_order"].as_array().unwrap();
-    assert_eq!(layers.len(), 2);
-    assert_eq!(layers[0].as_array().unwrap().len(), 2);
-    assert_eq!(layers[1].as_array().unwrap()[0], "c");
+    assert_eq!(layers.len(), 3);
+    assert_eq!(layers[0].as_array().unwrap()[0], "a");
+    assert_eq!(layers[1].as_array().unwrap()[0], "b");
+    assert_eq!(layers[2].as_array().unwrap()[0], "c");
 
     // Now confirm + drive the plan through the same server in a follow-up
     // session. McpServer is stateless across `run` calls, so we reuse it.
@@ -343,9 +352,8 @@ async fn full_composed_session_roundtrip() {
         calls.len(),
         calls
     );
-    assert!(calls[0] == "a" || calls[0] == "b");
-    assert!(calls[1] == "a" || calls[1] == "b");
-    assert_ne!(calls[0], calls[1]);
+    assert_eq!(calls[0], "a");
+    assert_eq!(calls[1], "b");
     assert_eq!(calls[2], "c");
 }
 

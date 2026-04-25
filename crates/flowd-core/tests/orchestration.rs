@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use flowd_core::error::{FlowdError, Result};
 use flowd_core::orchestration::{
-    AgentOutput, AgentSpawner, InMemoryPlanExecutor, PlanExecutor, PlanStatus, PlanStep,
-    StepStatus, load_plan,
+    AgentOutput, AgentSpawnContext, AgentSpawner, InMemoryPlanExecutor, PlanExecutor, PlanStatus,
+    PlanStep, StepStatus, load_plan,
 };
 
 fn temp_dir(prefix: &str) -> PathBuf {
@@ -30,7 +30,7 @@ fn temp_dir(prefix: &str) -> PathBuf {
 struct EchoSpawner(Arc<AtomicUsize>);
 
 impl AgentSpawner for EchoSpawner {
-    async fn spawn(&self, step: &PlanStep) -> Result<AgentOutput> {
+    async fn spawn(&self, _ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(AgentOutput::success(format!("ran:{}", step.id)))
     }
@@ -41,7 +41,7 @@ impl AgentSpawner for EchoSpawner {
 struct SleepySpawner;
 
 impl AgentSpawner for SleepySpawner {
-    async fn spawn(&self, _: &PlanStep) -> Result<AgentOutput> {
+    async fn spawn(&self, _ctx: AgentSpawnContext, _: &PlanStep) -> Result<AgentOutput> {
         tokio::time::sleep(Duration::from_secs(30)).await;
         Ok(AgentOutput::success("late"))
     }
