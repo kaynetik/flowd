@@ -121,26 +121,45 @@ Reports the flowd home layout, daemon liveness, and row counts per memory tier. 
 - **Cursor.** Run `flowd init cursor --global` (writes `~/.cursor/mcp.json`) or `flowd init cursor --project <path>` (writes `<path>/.cursor/mcp.json`). The command deep-merges the canonical server stanza into any existing file and pins the `command` to the absolute path of the running `flowd` binary; rerunning is a no-op. `integrations/cursor/mcp.json` is kept as a reference snapshot for manual merges.
 - **Claude Code.** Merge `integrations/claude-code/settings.json` into `~/.claude/settings.json` (deep-merge `mcpServers` and `hooks` so your existing keys survive). Hooks are now bare `flowd hook session-start`, `flowd hook post-tool-use`, `flowd hook session-end` commands -- no `/ABSOLUTE/PATH` substitution, no shell scripts to source. Assumes the `flowd` binary is on `$PATH`.
 
-Both clients spawn `flowd start` as a stdio subprocess. You do not run the daemon yourself.
+Run the daemon before starting Cursor or Claude Code. Clients should launch `flowd mcp`, which bridges their stdio MCP session to the daemon's local socket at `$FLOWD_HOME/flowd.sock`.
+
+For local macOS use, keep it as a background process next to Qdrant:
+
+```bash
+podman machine start
+podman start qdrant
+mkdir -p "${FLOWD_HOME:-$HOME/.flowd}"
+flowd start >> "${FLOWD_HOME:-$HOME/.flowd}/flowd.log" 2>&1 &
+```
+
+Check and stop it with:
+
+```bash
+flowd status
+flowd stop
+```
 
 ### 3. Use the agent
 
-The agent now has twelve MCP tools. Inside a Claude Code or Cursor session:
+The agent now has fifteen MCP tools. Inside a Claude Code or Cursor session:
 
-| Tool             | When the agent calls it                                                                |
-| ---------------- | -------------------------------------------------------------------------------------- |
-| `memory_store`   | To persist a decision, design note, or tool result.                                    |
-| `memory_search`  | To recall prior observations by keyword or semantic similarity.                        |
-| `memory_context` | Auto-injection at file or session scope (skips cold tier).                             |
-| `plan_create`    | To submit a plan, either as a structured DAG (`definition`) or as `prose`.             |
-| `plan_answer`    | To resolve open clarification questions emitted by the prose-first compiler.           |
-| `plan_refine`    | To apply freeform feedback to a draft plan and re-compile.                             |
-| `plan_confirm`   | To advance a plan from draft to running after human review.                            |
-| `plan_cancel`    | To abandon a draft, confirmed, or running plan.                                        |
-| `plan_status`    | To poll execution progress.                                                            |
-| `plan_resume`    | To reset failed steps on a stalled plan and re-execute from the failure boundary.      |
-| `rules_check`    | Pre-flight gate before a risky tool invocation.                                        |
-| `rules_list`     | To enumerate rules active for the current project or file scope.                       |
+| Tool             | When the agent calls it                                                           |
+| ---------------- | --------------------------------------------------------------------------------- |
+| `memory_store`   | To persist a decision, design note, or tool result.                               |
+| `memory_search`  | To recall prior observations by keyword or semantic similarity.                   |
+| `memory_context` | Auto-injection at file or session scope (skips cold tier).                        |
+| `plan_create`    | To submit a plan, either as a structured DAG (`definition`) or as `prose`.        |
+| `plan_answer`    | To resolve open clarification questions emitted by the prose-first compiler.      |
+| `plan_refine`    | To apply freeform feedback to a draft plan and re-compile.                        |
+| `plan_confirm`   | To advance a plan from draft to running after human review.                       |
+| `plan_cancel`    | To abandon a draft, confirmed, or running plan.                                   |
+| `plan_status`    | To poll execution progress.                                                       |
+| `plan_resume`    | To reset failed or interrupted steps and re-execute from the failure boundary.    |
+| `plan_list`      | To list persisted plan summaries.                                                 |
+| `plan_show`      | To inspect one persisted plan snapshot.                                           |
+| `plan_recent`    | To recover recent plan ids after restarting an agent client.                      |
+| `rules_check`    | Pre-flight gate before a risky tool invocation.                                   |
+| `rules_list`     | To enumerate rules active for the current project or file scope.                  |
 
 Rules are YAML files under `~/.flowd/rules/` (global) and `<repo>/.flowd/rules/` (project). See `flowd-core/src/rules/loader.rs` for the schema. To inspect what the daemon loaded, run `flowd rules list -p <project>` (or `-f <file>`). Bare `flowd rules list` evaluates against an empty scope and returns no matches even when rules are loaded.
 
