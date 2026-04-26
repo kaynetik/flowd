@@ -1,0 +1,38 @@
+id: flowd-crate-version-bumps
+scope: "crates/**"
+level: warn
+description: |
+  Crate version bumps are release-management work and must be handled in a
+  separate PR from feature, fix, refactor, or docs changes. After changing a
+  crate, identify every touched crate since the target base and decide the
+  appropriate SemVer bump before opening the dedicated version-bump PR.
+
+  Use the usual SemVer expectation:
+    - major: incompatible public API, CLI, MCP, storage, or behavior change
+    - minor: backwards-compatible user-facing or public API capability
+    - patch: backwards-compatible bug fix, documentation, tests, or internals
+
+  For pre-1.0 crates, treat incompatible public changes conservatively and
+  bump the minor version unless this repository has already documented a
+  stricter release policy. Keep the version-bump commit message in this form:
+
+    chore(CRATE_SHORT_NAME): bump version to vX.Y.Z
+
+  Examples: `chore(core): bump version to v0.3.4`,
+  `chore(cli): bump version to v0.3.4`.
+
+  The footgun is letting implementation commits silently modify public crate
+  surface without a release-management follow-up, or mixing version bumps into
+  the implementation PR so review has to reason about behavior and release
+  bookkeeping at the same time.
+
+  Note: the rules engine cannot inspect diff bodies, infer SemVer impact, or
+  enforce PR boundaries (a ProposedAction carries only { tool, file_path,
+  project }). This rule is advisory on crate-scoped edits; the agent must
+  inspect the diff, list touched crates, and keep version bumping in its own
+  branch/PR.
+
+  Cross-reference: crate manifests under `crates/*/Cargo.toml`; use
+  `git diff --name-only <base>..HEAD -- 'crates/*' | awk -F/ 'NF>=2 {print
+  $1"/"$2}' | sort -u` to list touched crates.
+match: "^(Write|Edit|MultiEdit|Bash|shell|shell_exec|run_command|run_terminal_cmd)$"

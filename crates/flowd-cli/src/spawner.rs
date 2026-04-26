@@ -406,8 +406,14 @@ impl LocalShellSpawner {
 }
 
 impl AgentSpawner for LocalShellSpawner {
-    async fn spawn(&self, _ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
-        self.spawn_in_cwd(step, None).await
+    async fn spawn(&self, ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
+        // The plan's persisted `project_root` wins over the spawner's
+        // own `cwd` (which is a daemon-process-wide fallback set from
+        // `$FLOWD_AGENT_CWD` or, ultimately, `current_dir()`). Without
+        // this, every plan would silently anchor to wherever the
+        // operator launched flowd from -- fine for one workspace,
+        // wrong the moment a daemon services more than one plan.
+        self.spawn_in_cwd(step, ctx.project_root.as_deref()).await
     }
 }
 
@@ -446,7 +452,14 @@ impl AgentSpawner for GitWorktreeSpawner {
 
     async fn spawn(&self, ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
         if !ctx.plan_parallel {
-            return self.inner.spawn_in_cwd(step, None).await;
+            // Sequential plans skip the worktree machinery but must
+            // still honour the plan's `project_root` over the wrapped
+            // spawner's daemon-cwd fallback -- same precedence rule
+            // `LocalShellSpawner::spawn` enforces directly.
+            return self
+                .inner
+                .spawn_in_cwd(step, ctx.project_root.as_deref())
+                .await;
         }
         let worktree = self.manager.prepare_step(&ctx, step).await?;
         let output = self.inner.spawn_in_cwd(step, Some(&worktree)).await?;
@@ -472,13 +485,21 @@ impl GitWorktreeManager {
     }
 
     async fn prepare_plan(&self, plan: &Plan) -> Result<()> {
-        let dirty = git_output(&self.repo, ["status", "--porcelain"]).await?;
+        // Plans persisted with `project_root` win over the manager's
+        // construction-time `self.repo` (discovered once from the
+        // daemon cwd by `try_new`). Without this, a parallel plan
+        // submitted from a workspace different from the daemon's
+        // launch dir would dirty-check and `git worktree add` against
+        // the wrong repo. Legacy plans (`project_root = None`) fall
+        // back to `self.repo` -- same behaviour as before this wiring.
+        let repo = self.repo_for(plan.project_root.as_deref().map(Path::new));
+        let dirty = git_output(repo, ["status", "--porcelain"]).await?;
         if !dirty.trim().is_empty() {
             return Err(FlowdError::PlanExecution {
                 message: format!(
                     "parallel plan `{}` requires a clean git base at {}; refusing to use stashes. Commit or discard these changes first:\n{}",
                     plan.id,
-                    self.repo.display(),
+                    repo.display(),
                     dirty.trim()
                 ),
                 metrics: None,
@@ -514,15 +535,27 @@ impl GitWorktreeManager {
         let dep_branches = self.dependency_branches(ctx.plan_id, step)?;
         let base = dep_branches.first().map_or("HEAD", String::as_str);
         let path_arg = path.to_string_lossy().into_owned();
-        git_output(
-            &self.repo,
-            ["worktree", "add", "-b", &branch, &path_arg, base],
-        )
-        .await?;
+        // Same precedence rule as `prepare_plan`: use `ctx.project_root`
+        // when the plan persisted one, fall back to `self.repo` for
+        // legacy plans. The dependent `git merge` calls below run
+        // inside the freshly-added worktree, not the base repo, so they
+        // already operate on the right tree without needing the override.
+        let repo = self.repo_for(ctx.project_root.as_deref());
+        git_output(repo, ["worktree", "add", "-b", &branch, &path_arg, base]).await?;
         for dep in dep_branches.iter().skip(1) {
             git_output(&path, ["merge", "--no-edit", dep]).await?;
         }
         Ok(path)
+    }
+
+    /// Resolve the git repo path to drive `git worktree add` / `git status`
+    /// from. The plan's persisted `project_root` (when present) overrides
+    /// `self.repo`, which is only meaningful as a fallback for plans that
+    /// pre-date the field. Returning `&Path` (not `PathBuf`) keeps the
+    /// borrow tied to the input lifetimes -- callers pass either an owned
+    /// or borrowed override and never need to clone.
+    fn repo_for<'a>(&'a self, override_root: Option<&'a Path>) -> &'a Path {
+        override_root.unwrap_or(self.repo.as_path())
     }
 
     async fn finish_step(
@@ -894,6 +927,7 @@ mod tests {
             project: "test".into(),
             plan_parallel: false,
             layer_width: 1,
+            project_root: None,
         }
     }
 
@@ -927,6 +961,104 @@ mod tests {
         let s = LocalShellSpawner::new("/does/not/exist/flowd-agent");
         let err = s.spawn(ctx(), &step("anything")).await.unwrap_err();
         assert!(matches!(err, FlowdError::PlanExecution { .. }));
+    }
+
+    /// `LocalShellSpawner::spawn` must take its cwd from
+    /// `ctx.project_root` (the plan's persisted workspace) and override
+    /// the daemon-set `LocalShellSpawner.cwd` field. Without this,
+    /// every step silently inherits the directory the operator launched
+    /// flowd from -- fine for one workspace, wrong the moment a daemon
+    /// services more than one plan. We assert against real subprocess
+    /// state (`pwd`) so a future refactor that "passes the value
+    /// through" but never reaches `Command::current_dir` would still
+    /// fail this test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_shell_spawn_uses_ctx_project_root_over_daemon_cwd() {
+        let daemon_cwd = tempfile::tempdir().expect("daemon cwd");
+        let plan_root = tempfile::tempdir().expect("plan root");
+
+        let s = LocalShellSpawner {
+            bin: OsString::from("/bin/sh"),
+            prompt_flag: "-c".to_owned(),
+            cwd: Some(daemon_cwd.path().to_path_buf()),
+            extra_args: Vec::new(),
+        };
+
+        let mut ctx = ctx();
+        ctx.project_root = Some(plan_root.path().to_path_buf());
+
+        let out = s
+            .spawn(ctx, &step("pwd"))
+            .await
+            .expect("pwd subprocess must succeed");
+        assert_eq!(out.exit_code, Some(0));
+
+        // Canonicalise both sides: macOS resolves `/var/...` -> `/private/var/...`
+        // when a process chdirs through the symlink, and `tempdir()` may
+        // return either form. Compare canonical paths to dodge that.
+        let expected = std::fs::canonicalize(plan_root.path()).expect("canonicalize plan root");
+        let observed_raw = std::path::PathBuf::from(out.stdout.trim());
+        let observed = std::fs::canonicalize(&observed_raw).expect("canonicalize pwd stdout");
+        assert_eq!(
+            observed,
+            expected,
+            "subprocess cwd resolved to {observed:?}; expected plan_root {expected:?}. \
+             Daemon cwd was {daemon:?} -- ctx.project_root must win.",
+            daemon = daemon_cwd.path()
+        );
+    }
+
+    /// Sequential branch of `GitWorktreeSpawner::spawn` skips the
+    /// worktree machinery and delegates to the wrapped
+    /// `LocalShellSpawner`. Pin that the delegation still threads
+    /// `ctx.project_root` through -- the historical bug had this
+    /// branch hardcode `None`, silently anchoring sequential plans to
+    /// the daemon cwd even after the executor learned to carry the
+    /// plan root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_spawner_sequential_uses_ctx_project_root_over_daemon_cwd() {
+        let daemon_cwd = tempfile::tempdir().expect("daemon cwd");
+        let plan_root = tempfile::tempdir().expect("plan root");
+        let flowd_home = tempfile::tempdir().expect("flowd home");
+
+        let inner = LocalShellSpawner {
+            bin: OsString::from("/bin/sh"),
+            prompt_flag: "-c".to_owned(),
+            cwd: Some(daemon_cwd.path().to_path_buf()),
+            extra_args: Vec::new(),
+        };
+        let s = GitWorktreeSpawner {
+            inner,
+            // Manager `repo` is irrelevant on the sequential branch
+            // (no `git worktree add` is called); pick any path so
+            // construction succeeds.
+            manager: Arc::new(GitWorktreeManager::new(
+                daemon_cwd.path().to_path_buf(),
+                flowd_home.path().join("worktrees"),
+            )),
+        };
+
+        let mut ctx = ctx();
+        ctx.plan_parallel = false;
+        ctx.project_root = Some(plan_root.path().to_path_buf());
+
+        let out = s
+            .spawn(ctx, &step("pwd"))
+            .await
+            .expect("pwd subprocess must succeed");
+        assert_eq!(out.exit_code, Some(0));
+
+        let expected = std::fs::canonicalize(plan_root.path()).unwrap();
+        let observed = std::fs::canonicalize(std::path::PathBuf::from(out.stdout.trim())).unwrap();
+        assert_eq!(
+            observed,
+            expected,
+            "GitWorktreeSpawner sequential delegation lost ctx.project_root: \
+             observed {observed:?}, expected {expected:?}, daemon was {:?}",
+            daemon_cwd.path()
+        );
     }
 
     #[tokio::test]
@@ -1217,6 +1349,7 @@ mod tests {
             project: plan.project.clone(),
             plan_parallel: true,
             layer_width: 2,
+            project_root: None,
         };
         let step = step_with_id("a", "do a", &[]);
         let worktree = manager.prepare_step(&ctx, &step).await.unwrap();

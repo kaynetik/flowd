@@ -140,6 +140,7 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
                 project: plan.project.clone(),
                 plan_parallel,
                 layer_width: layer.len(),
+                project_root: plan.project_root.as_deref().map(std::path::PathBuf::from),
             };
             let handle = tokio::spawn(async move {
                 run_step(&*spawner, ctx, step, cancel_for_task, default_timeout).await

@@ -124,11 +124,13 @@ pub const DEFAULT_MAX_QUESTIONS: usize = 12;
 /// leave that field `None` (the LLM prompt doesn't surface it and the
 /// structured-stub markdown grammar can't express it), so without this
 /// bound a wedged step would block its execution layer indefinitely.
-/// 15 minutes is generous enough to accommodate an Opus high-effort
-/// round, yet short enough that a stuck agent can't wedge a layer for
-/// hours before the operator notices. Set `step_timeout_secs = 0` in
-/// `[plan]` to disable the fallback entirely.
-pub const DEFAULT_STEP_TIMEOUT_SECS: u64 = 900;
+/// 1 hour is generous enough to accommodate a long Opus high-effort
+/// round (multi-tool reasoning, refine passes, slow CLI hand-offs)
+/// without misfiring, yet still keeps a stuck agent from wedging a
+/// layer overnight before the operator notices. Set
+/// `step_timeout_secs = 0` in `[plan]` to disable the fallback
+/// entirely.
+pub const DEFAULT_STEP_TIMEOUT_SECS: u64 = 3600;
 
 // -- Claude CLI defaults ----------------------------------------------------
 
@@ -783,7 +785,7 @@ impl PlanConfig {
             Some(r) => LlmConfig::from_raw(r)?,
             None => LlmConfig::default(),
         };
-        // An absent key keeps the 15-minute default; an explicit `0`
+        // An absent key keeps the 1-hour default; an explicit `0`
         // disables the fallback so operators have an escape hatch
         // without picking an arbitrarily large number.
         let step_timeout_secs = match raw.step_timeout_secs {
@@ -846,6 +848,52 @@ impl FlowdConfig {
                 Err(anyhow::Error::new(e).context(format!("read flowd config: {}", path.display())))
             }
         }
+    }
+
+    /// Path the project-scoped resolver consults: `<project_root>/.flowd/flowd.toml`.
+    ///
+    /// The `.flowd/` directory is the same one that already houses
+    /// project-local rules, so a project that has opted into rules can
+    /// adopt config without introducing a second marker.
+    // Allowed-dead until the daemon entry point switches from the
+    // global `$FLOWD_HOME/flowd.toml` load to project-scoped
+    // resolution; the contract + tests land first so wiring follow-ups
+    // can rely on it.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn project_path(project_root: &Path) -> PathBuf {
+        project_root.join(".flowd").join("flowd.toml")
+    }
+
+    /// Resolve the effective runtime config for an MCP / project session.
+    ///
+    /// Contract:
+    ///
+    /// * If `project_root` is `Some` and `<project_root>/.flowd/flowd.toml`
+    ///   exists, that file is the **only** source of overrides for this
+    ///   project. The per-machine `$FLOWD_HOME/flowd.toml` is never
+    ///   layered or inherited -- `$FLOWD_HOME` stays a state home for
+    ///   the socket, memory DB, models, and global rules.
+    /// * Otherwise (no project root, or the project file is absent) the
+    ///   result is `FlowdConfig::default()`.
+    ///
+    /// A project file that is present but malformed surfaces as an
+    /// error, matching `FlowdConfig::load`'s loud-validation policy --
+    /// silently falling back to defaults on a typo would mask the
+    /// operator's intent.
+    ///
+    /// # Errors
+    /// Propagates parse / validation errors from `FlowdConfig::load`.
+    #[allow(dead_code)] // see note on `project_path`
+    pub fn resolve(project_root: Option<&Path>) -> Result<Self> {
+        let Some(root) = project_root else {
+            return Ok(Self::default());
+        };
+        let path = Self::project_path(root);
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        Self::load(&path)
     }
 }
 
@@ -921,6 +969,48 @@ mod tests {
         let (_d, p) = write_cfg("[plan]\nmax_questions = 0\n");
         let err = FlowdConfig::load(&p).unwrap_err();
         assert!(format!("{err:#}").contains("max_questions"));
+    }
+
+    // -------- [plan] step_timeout_secs -- fallback bound contract -------
+    //
+    // The fallback timeout is load-bearing: prose-compiled plans never
+    // populate per-step `timeout_secs`, so PlanConfig::step_timeout_secs
+    // is the only thing standing between a wedged step and an indefinite
+    // block on its execution layer. Pin the three contract points here
+    // so a refactor that flips a default or drops the explicit-zero
+    // escape hatch trips a test rather than silently changing prod
+    // behaviour.
+
+    #[test]
+    fn step_timeout_missing_key_resolves_to_default_fallback() {
+        // No file at all -> defaults; the daemon-wide fallback applies.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = FlowdConfig::load(&dir.path().join("absent.toml")).unwrap();
+        assert_eq!(cfg.plan.step_timeout_secs, Some(DEFAULT_STEP_TIMEOUT_SECS));
+
+        // Present `[plan]` with the key omitted -> same default; an
+        // operator overriding `max_questions` must not lose the bound.
+        let (_d, p) = write_cfg("[plan]\nmax_questions = 4\n");
+        let cfg = FlowdConfig::load(&p).unwrap();
+        assert_eq!(cfg.plan.step_timeout_secs, Some(DEFAULT_STEP_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn step_timeout_zero_disables_the_fallback() {
+        // `0` is the documented escape hatch -- it resolves to `None`
+        // (unbounded) rather than a 0-second timeout that would fire
+        // immediately. Operators who need to disable the bound rely on
+        // this without picking an arbitrarily large number.
+        let (_d, p) = write_cfg("[plan]\nstep_timeout_secs = 0\n");
+        let cfg = FlowdConfig::load(&p).unwrap();
+        assert_eq!(cfg.plan.step_timeout_secs, None);
+    }
+
+    #[test]
+    fn step_timeout_explicit_value_is_honoured() {
+        let (_d, p) = write_cfg("[plan]\nstep_timeout_secs = 3600\n");
+        let cfg = FlowdConfig::load(&p).unwrap();
+        assert_eq!(cfg.plan.step_timeout_secs, Some(3600));
     }
 
     #[test]
@@ -1196,5 +1286,156 @@ mod tests {
         assert_eq!(LlmProvider::ClaudeCli.wire_name(), "claude-cli");
         assert_eq!(LlmProvider::Mlx.wire_name(), "mlx");
         assert_eq!(LlmProvider::ClaudeHttp.wire_name(), "claude-http");
+    }
+
+    // -------- FlowdConfig::resolve -- project-scoped resolution contract -----
+    //
+    // Each test below isolates state in its own `tempfile::TempDir`,
+    // touches no environment variables, and never changes `cwd`, so
+    // `cargo test` can execute them on parallel worker threads without
+    // serialising on shared state. The `within_deadline` helper bounds
+    // every resolution: pure file I/O on a tempdir should finish in
+    // milliseconds, so a regression that introduces blocking work
+    // surfaces as a fast test failure rather than a hung CI job.
+    mod resolve {
+        use super::*;
+        use std::path::Path;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        const RESOLVE_DEADLINE: Duration = Duration::from_secs(5);
+
+        fn within_deadline<T, F>(f: F) -> T
+        where
+            F: FnOnce() -> T + Send + 'static,
+            T: Send + 'static,
+        {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(f());
+            });
+            match rx.recv_timeout(RESOLVE_DEADLINE) {
+                Ok(v) => v,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("FlowdConfig::resolve exceeded {RESOLVE_DEADLINE:?}")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("FlowdConfig::resolve worker panicked (see thread output)")
+                }
+            }
+        }
+
+        fn write_project_config(root: &Path, body: &str) {
+            let dir = root.join(".flowd");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("flowd.toml"), body).unwrap();
+        }
+
+        #[test]
+        fn project_path_composition_is_stable() {
+            let p = FlowdConfig::project_path(Path::new("/tmp/proj"));
+            assert_eq!(p, PathBuf::from("/tmp/proj/.flowd/flowd.toml"));
+        }
+
+        #[test]
+        fn no_project_root_returns_defaults() {
+            let cfg = within_deadline(|| FlowdConfig::resolve(None).unwrap());
+            let defaults = FlowdConfig::default();
+            assert_eq!(cfg.plan.max_questions, defaults.plan.max_questions);
+            assert_eq!(cfg.plan.compiler, defaults.plan.compiler);
+        }
+
+        #[test]
+        fn missing_project_file_returns_defaults() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_path_buf();
+            let cfg = within_deadline(move || FlowdConfig::resolve(Some(&root)).unwrap());
+            let defaults = FlowdConfig::default();
+            assert_eq!(cfg.plan.max_questions, defaults.plan.max_questions);
+            assert_eq!(cfg.plan.compiler, defaults.plan.compiler);
+        }
+
+        #[test]
+        fn flowd_dir_without_toml_returns_defaults() {
+            // `.flowd/` may exist for rules even when no `flowd.toml` is
+            // authored. The resolver must still treat that as "no
+            // project config" rather than erroring on the directory.
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".flowd")).unwrap();
+            let root = dir.path().to_path_buf();
+            let cfg = within_deadline(move || FlowdConfig::resolve(Some(&root)).unwrap());
+            assert_eq!(cfg.plan.compiler, CompilerSelection::Stub);
+        }
+
+        #[test]
+        fn present_project_file_overrides_defaults() {
+            let dir = tempfile::tempdir().unwrap();
+            write_project_config(
+                dir.path(),
+                "[plan]\nmax_questions = 7\ncompiler = \"rejecting\"\n",
+            );
+            let root = dir.path().to_path_buf();
+            let cfg = within_deadline(move || FlowdConfig::resolve(Some(&root)).unwrap());
+            assert_eq!(cfg.plan.max_questions, 7);
+            assert_eq!(cfg.plan.compiler, CompilerSelection::Rejecting);
+        }
+
+        #[test]
+        fn malformed_project_file_surfaces_loud_error() {
+            let dir = tempfile::tempdir().unwrap();
+            write_project_config(dir.path(), "[plan]\ncompiler = \"gpt\"\n");
+            let root = dir.path().to_path_buf();
+            let err = within_deadline(move || FlowdConfig::resolve(Some(&root)).unwrap_err());
+            let msg = format!("{err:#}");
+            assert!(msg.contains("not a known compiler"), "{msg}");
+        }
+
+        // The two invariants below are the load-bearing assertions of
+        // this contract: `$FLOWD_HOME/flowd.toml` must never bleed into
+        // a project's effective config, in either branch of the
+        // resolver. We materialise a deliberately-conflicting
+        // `$FLOWD_HOME/flowd.toml` in a *separate* tempdir and prove
+        // that none of its values reach the resolved config.
+
+        #[test]
+        fn flowd_home_is_not_layered_when_project_file_present() {
+            let project = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+
+            write_project_config(project.path(), "[plan]\nmax_questions = 3\n");
+            std::fs::write(
+                home.path().join("flowd.toml"),
+                "[plan]\nmax_questions = 99\ncompiler = \"rejecting\"\n",
+            )
+            .unwrap();
+
+            let root = project.path().to_path_buf();
+            let cfg = within_deadline(move || FlowdConfig::resolve(Some(&root)).unwrap());
+
+            // Project-local override wins for `max_questions`, and the
+            // compiler stays at the project's *implicit* default
+            // (`Stub`) -- not the home file's `Rejecting`. If layering
+            // ever sneaks in, the compiler assertion catches it.
+            assert_eq!(cfg.plan.max_questions, 3);
+            assert_eq!(cfg.plan.compiler, CompilerSelection::Stub);
+        }
+
+        #[test]
+        fn flowd_home_is_not_layered_when_project_file_absent() {
+            let project = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(
+                home.path().join("flowd.toml"),
+                "[plan]\nmax_questions = 99\ncompiler = \"rejecting\"\n",
+            )
+            .unwrap();
+
+            let root = project.path().to_path_buf();
+            let cfg = within_deadline(move || FlowdConfig::resolve(Some(&root)).unwrap());
+            let defaults = FlowdConfig::default();
+            assert_eq!(cfg.plan.max_questions, defaults.plan.max_questions);
+            assert_eq!(cfg.plan.compiler, defaults.plan.compiler);
+        }
     }
 }

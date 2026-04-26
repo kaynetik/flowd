@@ -618,6 +618,7 @@ mod tests {
                 status: PlanStatus::Completed,
                 total_metrics: None,
                 step_count: flowd_core::orchestration::observer::PlanStepCounts::default(),
+                elapsed_ms: None,
             },
         ];
         let total = events.len();

@@ -150,6 +150,7 @@ pub fn event_payload(event: &PlanEvent) -> JsonValue {
             status,
             total_metrics,
             step_count,
+            elapsed_ms,
             ..
         } => {
             let mut payload = json!({
@@ -160,6 +161,14 @@ pub fn event_payload(event: &PlanEvent) -> JsonValue {
                 },
             });
             attach_metrics(&mut payload, total_metrics.as_ref());
+            // Wall-clock span; absent rather than `null` so older event
+            // rows and "never executed" transitions render the rollup
+            // without the elapsed segment.
+            if let Some(ms) = elapsed_ms {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("elapsed_ms".into(), json!(ms));
+                }
+            }
             payload
         }
         PlanEvent::ClarificationOpened { question_ids, .. } => {
@@ -305,6 +314,7 @@ mod tests {
                     status: PlanStatus::Completed,
                     total_metrics: None,
                     step_count: super::super::observer::PlanStepCounts::default(),
+                    elapsed_ms: None,
                 },
                 kind::FINISHED,
             ),
@@ -344,17 +354,20 @@ mod tests {
             status: PlanStatus::Failed,
             total_metrics: None,
             step_count: super::super::observer::PlanStepCounts::default(),
+            elapsed_ms: None,
         };
         let payload = event_payload(&evt);
         assert_eq!(payload["status"], "failed");
         assert_eq!(payload["step_count"]["completed"], 0);
         assert_eq!(payload["step_count"]["failed"], 0);
+        let obj = payload.as_object().expect("payload is an object");
         assert!(
-            !payload
-                .as_object()
-                .expect("payload is an object")
-                .contains_key("metrics"),
+            !obj.contains_key("metrics"),
             "metrics key must be absent when total_metrics is None; got {payload}"
+        );
+        assert!(
+            !obj.contains_key("elapsed_ms"),
+            "elapsed_ms key must be absent when None; got {payload}"
         );
     }
 
@@ -377,6 +390,7 @@ mod tests {
                 completed: 3,
                 failed: 1,
             },
+            elapsed_ms: Some(900),
         };
         let payload = event_payload(&evt);
         assert_eq!(payload["status"], "completed");
@@ -385,6 +399,9 @@ mod tests {
         assert_eq!(payload["metrics"]["input_tokens"], 100);
         assert_eq!(payload["metrics"]["output_tokens"], 50);
         assert_eq!(payload["metrics"]["total_cost_usd"], 0.42);
+        // Elapsed gets serialised when present; the per-step duration sum
+        // (1500ms here) lives inside `metrics.duration_ms` and is independent.
+        assert_eq!(payload["elapsed_ms"], 900);
     }
 
     #[test]

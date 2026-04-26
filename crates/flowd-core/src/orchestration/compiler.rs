@@ -254,6 +254,66 @@ pub trait PlanCompiler: Send + Sync {
         // exactly one transport so the override is meaningless to them.
         self.compile_prose(prose, project)
     }
+
+    /// Variant of [`Self::compile_prose_with_override`] that also
+    /// receives the trusted `project_root` the MCP layer resolved for
+    /// this request.
+    ///
+    /// The default implementation ignores `project_root` entirely and
+    /// delegates to [`Self::compile_prose_with_override`]; that's the
+    /// correct shape for every compiler whose configuration is
+    /// process-global. The daemon's project-scoped wrapper (in
+    /// `flowd-cli`) overrides this to resolve
+    /// `<project_root>/.flowd/flowd.toml` and dispatch through a
+    /// project-effective compiler so per-project `[plan].compiler` /
+    /// `[plan.llm]` overrides take effect without restarting the daemon.
+    ///
+    /// `project_root` is `None` when the request did not carry a workspace
+    /// hint and the daemon's resolver did not infer one; in that case the
+    /// dispatcher should fall back to the daemon's default compiler.
+    ///
+    /// # Errors
+    /// Same as [`Self::compile_prose_with_override`].
+    fn compile_prose_in_project(
+        &self,
+        prose: String,
+        project: String,
+        _project_root: Option<String>,
+        compiler_override: Option<String>,
+    ) -> impl Future<Output = Result<CompileOutput>> + Send {
+        self.compile_prose_with_override(prose, project, compiler_override)
+    }
+
+    /// Variant of [`Self::apply_answers`] that also receives the
+    /// trusted `project_root` for the in-flight draft. Mirrors the
+    /// dispatch story documented on [`Self::compile_prose_in_project`].
+    ///
+    /// # Errors
+    /// Same as [`Self::apply_answers`].
+    fn apply_answers_in_project(
+        &self,
+        snapshot: PlanDraftSnapshot,
+        answers: Vec<(String, Answer)>,
+        defer_remaining: bool,
+        _project_root: Option<String>,
+    ) -> impl Future<Output = Result<CompileOutput>> + Send {
+        self.apply_answers(snapshot, answers, defer_remaining)
+    }
+
+    /// Variant of [`Self::refine`] that also receives the trusted
+    /// `project_root` for the in-flight draft. Mirrors the dispatch
+    /// story documented on [`Self::compile_prose_in_project`].
+    ///
+    /// # Errors
+    /// Same as [`Self::refine`].
+    fn refine_in_project(
+        &self,
+        snapshot: PlanDraftSnapshot,
+        feedback: String,
+        _project_root: Option<String>,
+    ) -> impl Future<Output = Result<CompileOutput>> + Send {
+        self.refine(snapshot, feedback)
+    }
 }
 
 /// Scripted compiler that returns pre-canned [`CompileOutput`]s in order.

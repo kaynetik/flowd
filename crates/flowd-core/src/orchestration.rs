@@ -1179,6 +1179,41 @@ mod tests {
     }
 
     #[test]
+    fn apply_compile_output_preserves_project_root_across_refine() {
+        // The execution root is injected by the trusted handler at
+        // `plan_create` time and must survive every refine/recompile.
+        // The compiler is free to emit a `PlanDefinition` without a
+        // `project_root` (the prose-first stub does, and the LLM-backed
+        // compiler may), and we must not let that wipe the daemon-trusted
+        // root the executor relies on for spawn cwd.
+        use loader::{PlanDefinition, StepDefinition};
+
+        let mut plan =
+            Plan::new("p", "proj", vec![step("a", &[])]).with_project_root("/repos/flowd");
+
+        let refined = PlanDefinition {
+            name: "p".into(),
+            project: Some("proj".into()),
+            project_root: None,
+            steps: vec![StepDefinition {
+                id: "a".into(),
+                agent_type: "echo".into(),
+                prompt: "refined".into(),
+                depends_on: vec![],
+                timeout_secs: None,
+                retry_count: 0,
+            }],
+        };
+        plan.apply_compile_output(compiler::CompileOutput::ready("# refined", refined));
+
+        assert_eq!(
+            plan.project_root.as_deref(),
+            Some("/repos/flowd"),
+            "project_root survives a refine that emits no project_root"
+        );
+    }
+
+    #[test]
     fn apply_compile_output_without_definition_sets_dirty() {
         let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
         plan.apply_compile_output(compiler::CompileOutput::pending(

@@ -654,16 +654,20 @@ where
 
         // Step 2: project to a snapshot and call the compiler. The
         // compiler is free to surface new questions in addition to the
-        // ones the user just answered.
+        // ones the user just answered. The Draft plan carries the
+        // trusted `project_root` we resolved on `plan_create`, so
+        // follow-up rounds dispatch through the same project-scoped
+        // config and never drift to the daemon's $FLOWD_HOME defaults.
         let snapshot = PlanDraftSnapshot::from_plan(&plan);
         let answers: Vec<(String, Answer)> = p
             .answers
             .into_iter()
             .map(|a| (a.question_id, a.answer))
             .collect();
+        let project_root = plan.project_root.clone();
         let output = self
             .compiler
-            .apply_answers(snapshot, answers, effective_defer)
+            .apply_answers_in_project(snapshot, answers, effective_defer, project_root)
             .await?;
 
         // Capture deltas before applying so we can emit them once the
@@ -713,7 +717,13 @@ where
 
         let snapshot = PlanDraftSnapshot::from_plan(&plan);
         let summary = truncate_summary(&p.feedback);
-        let output = self.compiler.refine(snapshot, p.feedback).await?;
+        // Same dispatch-by-project_root contract as plan_answer: the
+        // Draft's persisted root drives compiler routing.
+        let project_root = plan.project_root.clone();
+        let output = self
+            .compiler
+            .refine_in_project(snapshot, p.feedback, project_root)
+            .await?;
 
         let new_question_ids: Vec<String> =
             output.open_questions.iter().map(|q| q.id.clone()).collect();
@@ -952,9 +962,19 @@ where
         let (resolved_root, _src) = resolve_workspace_root(client_root_hint)?;
 
         let derived_name = derive_plan_name(&prose);
+        // Pass the resolved root through to the compiler so the daemon's
+        // project-scoped wrapper can dispatch on
+        // `<project_root>/.flowd/flowd.toml` rather than its global
+        // `$FLOWD_HOME/flowd.toml`. Single-backend / test compilers ignore
+        // it via the trait's default `_in_project` impl.
         let output = self
             .compiler
-            .compile_prose_with_override(prose, project.clone(), compiler_override)
+            .compile_prose_in_project(
+                prose,
+                project.clone(),
+                Some(resolved_root.clone()),
+                compiler_override,
+            )
             .await?;
 
         // Build a Plan around whatever the compiler returned. If the

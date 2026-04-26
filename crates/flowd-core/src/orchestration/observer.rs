@@ -110,12 +110,21 @@ pub enum PlanEvent {
     /// metrics (e.g. a cancel from `Draft`). `step_count` summarises the
     /// per-outcome counts so the renderer does not have to re-walk the
     /// step list.
+    ///
+    /// `elapsed_ms` is the wall-clock span between `Plan.started_at` and
+    /// the moment this event is emitted. It is `None` for transitions
+    /// that never actually executed (cancel from `Draft`/`Confirmed`)
+    /// or that span a daemon restart (rehydrate-as-`Interrupted`), where
+    /// the wall-clock figure would be either zero or misleading.
+    /// Distinct from the summed `total_metrics.duration_ms`: with parallel
+    /// steps the sum of per-step runtimes can exceed wall-clock elapsed.
     Finished {
         plan_id: Uuid,
         project: String,
         status: PlanStatus,
         total_metrics: Option<AgentMetrics>,
         step_count: PlanStepCounts,
+        elapsed_ms: Option<u64>,
     },
     /// The compiler surfaced one or more new clarification questions on a
     /// `Draft` plan. Emitted from the prose-first plan-creation MCP path
@@ -220,6 +229,7 @@ mod tests {
             status: PlanStatus::Completed,
             total_metrics: None,
             step_count: PlanStepCounts::default(),
+            elapsed_ms: None,
         };
         assert_eq!(evt.project(), "demo");
     }

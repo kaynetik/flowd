@@ -25,12 +25,13 @@ max_questions = 20
 # is unset. Prose-compiled plans always leave that field `None` (the
 # LLM prompt doesn't surface it, and the structured-stub markdown
 # grammar has no syntax for it), so without this bound a wedged step
-# would block its execution layer forever. 900s (15 minutes) is the
-# built-in default -- generous enough not to misfire on Opus
-# high-effort steps, tight enough to surface a stuck agent before the
-# daemon's shift ends. A step that sets its own `timeout_secs` still
-# wins; this value is strictly a fallback. Set to 0 to disable.
-# step_timeout_secs = 900
+# would block its execution layer forever. 3600s (1 hour) is the
+# built-in default -- generous enough not to misfire on long Opus
+# high-effort steps (multi-tool reasoning, refine passes), tight
+# enough to surface a stuck agent before the daemon's shift ends. A
+# step that sets its own `timeout_secs` still wins; this value is
+# strictly a fallback. Set to 0 to disable.
+# step_timeout_secs = 3600
 
 [plan.llm]
 provider = "claude-cli"

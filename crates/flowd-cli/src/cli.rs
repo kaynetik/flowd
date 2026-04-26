@@ -296,6 +296,21 @@ pub enum PlanAction {
         /// Plan UUID.
         plan_id: String,
     },
+
+    /// Concise audit rollup: total cost, raw cache read/create totals,
+    /// cache reuse rate, input/output tokens, summed API + agent
+    /// runtime, wall-clock span (when derivable), step count, and a
+    /// per-model breakdown. Reads the persisted event log -- WAL-safe
+    /// against a live daemon.
+    Usage {
+        /// Plan UUID.
+        plan_id: String,
+
+        /// Emit the same rollup as machine-readable JSON instead of the
+        /// human-formatted block.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

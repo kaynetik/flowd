@@ -11,13 +11,14 @@
 //! up (future issue) "confirming" can only print the plan id a daemon
 //! would accept. We surface this clearly so users don't think plans run.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use chrono::{DateTime, Utc};
 use flowd_core::orchestration::plan_events::{PlanEventQuery, PlanEventStore, StoredPlanEvent};
 use flowd_core::orchestration::{
     Answer, Plan, PlanCompiler, PlanDraftSnapshot, PlanStatus, PlanStore, PlanSummary,
@@ -25,7 +26,7 @@ use flowd_core::orchestration::{
 };
 use flowd_storage::plan_event_store::SqlitePlanEventStore;
 use flowd_storage::plan_store::SqlitePlanStore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::config::FlowdConfig;
@@ -117,6 +118,60 @@ pub async fn events(
         render_event(evt, style);
     }
     Ok(())
+}
+
+/// `flowd plan usage <plan_id>` -- concise audit rollup of token/cost
+/// spend for a single plan. Reads the same persisted event log as
+/// [`events`] and aggregates step-event metrics in process so it works
+/// against a live daemon (WAL-safe) without needing the executor.
+///
+/// `--json` emits the same [`UsageReport`] struct that backs the human
+/// renderer, so scripted callers and the human surface share a schema.
+pub async fn usage(
+    paths: &FlowdPaths,
+    style: Style,
+    plan_id_arg: String,
+    json: bool,
+) -> Result<()> {
+    let plan_id = parse_plan_id(&plan_id_arg)?;
+    let report = prepare_usage_report(paths, plan_id).await?;
+
+    if json {
+        let s = serde_json::to_string_pretty(&report).context("serialize usage report")?;
+        println!("{s}");
+    } else {
+        render_usage_report(&report, style);
+    }
+    Ok(())
+}
+
+/// DB-read half of [`usage`]: open the event store, pull the plan's
+/// event tail, and aggregate. Split out so command-level tests can
+/// drive end-to-end through a temp `SQLite` file without capturing
+/// stdout.
+async fn prepare_usage_report(paths: &FlowdPaths, plan_id: Uuid) -> Result<UsageReport> {
+    let db_path = paths.db_file();
+    if !db_path.exists() {
+        bail!(
+            "no flowd database at {}; start the daemon at least once to initialise it",
+            db_path.display()
+        );
+    }
+    let store = SqlitePlanEventStore::open(&db_path)
+        .with_context(|| format!("open plan event store at {}", db_path.display()))?;
+
+    // Pull the entire event tail for this plan; bounded by the per-plan
+    // event count, which is small (one row per step plus a handful of
+    // lifecycle events). usize::MAX maps to i64::MAX inside the store.
+    let rows = store
+        .list_for_plan(plan_id, PlanEventQuery::new(usize::MAX))
+        .await
+        .with_context(|| format!("list events for plan {plan_id}"))?;
+
+    if rows.is_empty() {
+        bail!("plan {plan_id}: no events recorded; nothing to summarise");
+    }
+    Ok(build_usage_report(plan_id, &rows))
 }
 
 pub async fn list(
@@ -269,24 +324,28 @@ fn format_metrics_block(payload: &serde_json::Value) -> Option<Vec<String>> {
     Some(vec![line1, line2])
 }
 
-/// Rollup rendered beneath the `finished` event header: cost + tokens +
-/// cache hit-rate + per-outcome counts on the first line, duration on the
-/// second. Returns an empty `Vec` when neither `metrics` nor a
-/// `step_count` block was persisted (pre-rollup event rows). Payload
-/// shape is owned by `flowd_core::orchestration::plan_events::event_payload`
-/// for the `Finished` variant.
+/// Rollup rendered beneath the `finished` event header. Two lines:
+///
+/// 1. `total: $… in … out … cache_read … cache_create … reuse …% completed … failed …`
+///    -- per-token totals plus a one-decimal `reuse` rate, so an
+///    integer-rounded `78%` no longer hides the difference between
+///    78.1% and 78.9%. The `cache_read` and `cache_create` totals are
+///    surfaced directly so the operator can sanity-check the rate.
+/// 2. `runtime sum: api …s   agent …s   elapsed …s` -- API and agent
+///    durations are explicitly summed across steps; with parallel layers
+///    that sum can exceed `elapsed`, which is the wall-clock from
+///    `Plan.started_at` to `completed_at`. Older events without
+///    `elapsed_ms` and "never executed" transitions (cancel from `Draft`,
+///    rehydrate-as-`Interrupted`) drop the `elapsed` segment rather than
+///    rendering a misleading `0.0s`.
+///
+/// Returns an empty `Vec` when neither `metrics` nor a `step_count` block
+/// was persisted (pre-rollup event rows). Payload shape is owned by
+/// `flowd_core::orchestration::plan_events::event_payload` for the
+/// `Finished` variant.
 //
 // Cast lints, all ranged-safe:
 // - `cast_precision_loss`: u64 ms / token counts well below 2^53.
-// - `cast_possible_truncation` and `cast_sign_loss` on the `pct` cast:
-//   the expression is `cache_read / cache_denom * 100` with
-//   `cache_read <= cache_denom`, so the rounded value lies in `[0, 100]`
-//   and fits trivially in u64 without sign loss.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
 fn format_finished_rollup(payload: &serde_json::Value) -> Vec<String> {
     use std::fmt::Write as _;
 
@@ -315,6 +374,9 @@ fn format_finished_rollup(payload: &serde_json::Value) -> Vec<String> {
     let duration_api_ms = u64_of(metrics, "duration_api_ms");
     let completed = u64_of(step_count, "completed");
     let failed = u64_of(step_count, "failed");
+    let elapsed_ms = payload
+        .get("elapsed_ms")
+        .and_then(serde_json::Value::as_u64);
 
     let mut first = format!(
         "total: ${cost:.2}   in {in_}   out {out}",
@@ -323,22 +385,330 @@ fn format_finished_rollup(payload: &serde_json::Value) -> Vec<String> {
     );
     let cache_denom = cache_read + cache_creation;
     if cache_denom > 0 {
-        // Integer percent to keep output stable: a trailing `.0` on a
-        // dashboard number is visual noise, and fractional precision
-        // changes nothing about the signal the operator acts on.
-        let pct = (cache_read as f64 / cache_denom as f64 * 100.0).round() as u64;
-        write!(first, "   cache hit-rate {pct}%").expect("write to String is infallible");
+        write!(
+            first,
+            "   cache_read {read}   cache_create {create}   reuse {pct}",
+            read = format_tokens_compact(cache_read),
+            create = format_tokens_compact(cache_creation),
+            pct = format_one_decimal_percent(cache_read, cache_denom),
+        )
+        .expect("write to String is infallible");
     }
     write!(first, "   completed {completed}   failed {failed}")
         .expect("write to String is infallible");
 
-    let second = format!(
-        "duration: api {:.1}s / total {:.1}s",
+    #[allow(clippy::cast_precision_loss)]
+    let mut second = format!(
+        "runtime sum: api {:.1}s   agent {:.1}s",
         duration_api_ms as f64 / 1000.0,
         duration_ms as f64 / 1000.0,
     );
+    if let Some(ms) = elapsed_ms {
+        #[allow(clippy::cast_precision_loss)]
+        let elapsed_secs = ms as f64 / 1000.0;
+        write!(second, "   elapsed {elapsed_secs:.1}s").expect("write to String is infallible");
+    }
 
     vec![first, second]
+}
+
+/// Format `numerator / denominator` as a one-decimal percent like `78.3%`.
+/// Caller must ensure `denominator > 0`; we still guard against it
+/// defensively because the rollup feeds in u64 sums that can theoretically
+/// be zero in malformed payloads.
+//
+// `cast_precision_loss` is fine: cache totals fit comfortably in f64.
+#[allow(clippy::cast_precision_loss)]
+fn format_one_decimal_percent(numerator: u64, denominator: u64) -> String {
+    if denominator == 0 {
+        return "0.0%".to_owned();
+    }
+    let pct = numerator as f64 / denominator as f64 * 100.0;
+    format!("{pct:.1}%")
+}
+
+/// JSON-friendly per-plan usage rollup powering both the human render
+/// and `--json` output. Field names mirror the on-disk metrics keys so
+/// scripted callers can correlate without consulting docs; counters that
+/// would always be `null` for plans without metrics (cache reuse rate,
+/// wall-clock window) are skipped via `Option`-elision rather than
+/// rendered as `0` or `null`.
+#[derive(Debug, Default, Serialize, PartialEq)]
+pub(crate) struct UsageReport {
+    pub plan_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    pub steps: u64,
+    pub total_cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    /// `cache_read / (cache_read + cache_creation)`, in `[0.0, 1.0]`.
+    /// `None` when both counters are zero -- there was no cache activity
+    /// to compute a ratio over, and rendering `0.0%` would mislead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<f64>,
+    pub duration_api_ms: u64,
+    pub duration_total_ms: u64,
+    /// Wall-clock span between the first and last persisted event for
+    /// this plan. `None` when only a single event was recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wall_clock_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_event_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<DateTime<Utc>>,
+    pub model_breakdown: BTreeMap<String, ModelBreakdown>,
+}
+
+/// Per-model rollup inside [`UsageReport::model_breakdown`].
+///
+/// Cache fields use the short alias (`cache_read_tokens`) the report
+/// surfaces for `UsageTotals` consumers; the corresponding storage
+/// keys are `cache_read_input_tokens` / `cache_creation_input_tokens`,
+/// which the aggregator translates inline.
+#[derive(Debug, Default, Serialize, PartialEq)]
+pub(crate) struct ModelBreakdown {
+    pub cost_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
+
+/// Walk `events` and aggregate the metrics blocks attached to step
+/// outcomes. Pure function over the event slice so the unit tests can
+/// drive it without booting `SQLite`.
+//
+// Token / duration counters and the cache ratio cast match the rationale
+// in `format_finished_rollup`: well below the f64 precision ceiling, and
+// the ratio is bounded to `[0, 1]` before any cast to a percent value
+// happens at the render layer.
+#[allow(clippy::cast_precision_loss)]
+fn build_usage_report(plan_id: Uuid, events: &[StoredPlanEvent]) -> UsageReport {
+    use flowd_core::orchestration::plan_events::kind as k;
+
+    let mut report = UsageReport {
+        plan_id,
+        ..UsageReport::default()
+    };
+
+    if let (Some(first), Some(last)) = (events.first(), events.last()) {
+        report.first_event_at = Some(first.created_at);
+        report.last_event_at = Some(last.created_at);
+        // Distinct events: derive an actual span. A single event leaves
+        // `wall_clock_ms` as `None` -- a 0ms wall-clock is misleading
+        // because there's no real span to report on.
+        if events.len() > 1 {
+            let delta = (last.created_at - first.created_at).num_milliseconds();
+            report.wall_clock_ms = Some(u64::try_from(delta.max(0)).unwrap_or(0));
+        }
+    }
+
+    for evt in events {
+        if report.project.is_none() {
+            report.project = Some(evt.project.clone());
+        }
+        match evt.kind.as_str() {
+            k::SUBMITTED => {
+                report.plan_name = evt
+                    .payload
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            k::FINISHED => {
+                report.status = evt
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            k::STEP_COMPLETED | k::STEP_FAILED => {
+                let Some(metrics) = evt.payload.get("metrics") else {
+                    continue;
+                };
+                let u64_of = |key: &str| {
+                    metrics
+                        .get(key)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                };
+                let f64_of = |key: &str| {
+                    metrics
+                        .get(key)
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0)
+                };
+
+                report.steps += 1;
+                report.input_tokens += u64_of("input_tokens");
+                report.output_tokens += u64_of("output_tokens");
+                report.cache_read_tokens += u64_of("cache_read_input_tokens");
+                report.cache_creation_tokens += u64_of("cache_creation_input_tokens");
+                report.total_cost_usd += f64_of("total_cost_usd");
+                report.duration_api_ms += u64_of("duration_api_ms");
+                report.duration_total_ms += u64_of("duration_ms");
+
+                if let Some(model_usage) = metrics
+                    .get("model_usage")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    for (model, m) in model_usage {
+                        let entry = report.model_breakdown.entry(model.clone()).or_default();
+                        entry.input_tokens += m
+                            .get("input_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        entry.output_tokens += m
+                            .get("output_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        entry.cache_read_tokens += m
+                            .get("cache_read_input_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        entry.cache_creation_tokens += m
+                            .get("cache_creation_input_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0);
+                        entry.cost_usd += m
+                            .get("cost_usd")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let cache_denom = report.cache_read_tokens + report.cache_creation_tokens;
+    if cache_denom > 0 {
+        report.cache_hit_rate = Some(report.cache_read_tokens as f64 / cache_denom as f64);
+    }
+    report
+}
+
+/// Sort the model breakdown by descending cost (with a name tiebreaker
+/// so the order is deterministic when two models report the same spend).
+fn model_rows_by_cost(report: &UsageReport) -> Vec<(&String, &ModelBreakdown)> {
+    let mut rows: Vec<_> = report.model_breakdown.iter().collect();
+    rows.sort_by(|a, b| {
+        b.1.cost_usd
+            .partial_cmp(&a.1.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+    rows
+}
+
+/// Format a duration in milliseconds for human display:
+/// * `<1s`   -> `Xms`
+/// * `<60s`  -> `S.Ds` (one decimal)
+/// * `<60m`  -> `Mm Ss`
+/// * else    -> `Hh Mm Ss`
+//
+// The seconds branch crosses an `as f64` boundary; we are always under
+// `60_000` here, well within precision, and the result is bounded to
+// `[0.0, 60.0)`. The same applies to the integer branches.
+#[allow(clippy::cast_precision_loss)]
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        return format!("{ms}ms");
+    }
+    let total_secs = ms / 1_000;
+    if total_secs < 60 {
+        return format!("{:.1}s", ms as f64 / 1_000.0);
+    }
+    let secs = total_secs % 60;
+    let mins = (total_secs / 60) % 60;
+    let hours = total_secs / 3_600;
+    if hours > 0 {
+        format!("{hours}h {mins}m {secs}s")
+    } else {
+        format!("{mins}m {secs}s")
+    }
+}
+
+/// Render `report` to a `String` so tests can inspect the layout
+/// without capturing stdout. The `println!` wrapper ([`render_usage_report`])
+/// is a one-liner over this.
+fn format_usage_report(report: &UsageReport, style: Style) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    out.push_str(&banner(&format!("usage: {}", report.plan_id), style));
+    if let Some(name) = &report.plan_name {
+        let _ = writeln!(out, "  plan:        {name}");
+    }
+    if let Some(project) = &report.project {
+        let _ = writeln!(out, "  project:     {project}");
+    }
+    if let Some(status) = &report.status {
+        let _ = writeln!(out, "  status:      {status}");
+    }
+    let _ = writeln!(out, "  steps:       {}", report.steps);
+    let _ = writeln!(
+        out,
+        "  total cost:  {}",
+        style.bold(&format!("${:.2}", report.total_cost_usd)),
+    );
+    let _ = writeln!(
+        out,
+        "  tokens:      in {}   out {}",
+        format_tokens_compact(report.input_tokens),
+        format_tokens_compact(report.output_tokens),
+    );
+    let _ = writeln!(
+        out,
+        "  cache:       read {}   creation {}",
+        format_thousands(report.cache_read_tokens),
+        format_thousands(report.cache_creation_tokens),
+    );
+    match report.cache_hit_rate {
+        // One-decimal cache reuse rate per the audit spec.
+        Some(rate) => {
+            let _ = writeln!(out, "  cache reuse: {:.1}%", rate * 100.0);
+        }
+        None => {
+            let _ = writeln!(out, "  cache reuse: {}", style.dim("(no cache activity)"));
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  runtime:     api {}   agent {}",
+        format_duration_ms(report.duration_api_ms),
+        format_duration_ms(report.duration_total_ms),
+    );
+    if let Some(wall) = report.wall_clock_ms {
+        let _ = writeln!(out, "  wall-clock:  {}", format_duration_ms(wall));
+    }
+
+    if !report.model_breakdown.is_empty() {
+        let _ = writeln!(out, "\n{}", style.bold("models:"));
+        for (name, m) in model_rows_by_cost(report) {
+            let _ = writeln!(
+                out,
+                "  {name:<20}  ${cost:>7.2}   in {in_:>8}   out {out:>8}   cache r/c {cr}/{cc}",
+                cost = m.cost_usd,
+                in_ = format_tokens_compact(m.input_tokens),
+                out = format_tokens_compact(m.output_tokens),
+                cr = format_thousands(m.cache_read_tokens),
+                cc = format_thousands(m.cache_creation_tokens),
+            );
+        }
+    }
+    out
+}
+
+fn render_usage_report(report: &UsageReport, style: Style) {
+    print!("{}", format_usage_report(report, style));
 }
 
 /// Token-count formatter that switches to a compact `k` suffix once the
@@ -1029,25 +1399,38 @@ mod tests {
             "metrics": {
                 "input_tokens": 12_400,
                 "output_tokens": 21_300,
-                "cache_creation_input_tokens": 5_000,
-                "cache_read_input_tokens": 18_000,
+                // Both cache totals chosen >9_999 so the test exercises
+                // the compact `k` suffix path in both fields -- summed
+                // rollup numbers are routinely well above that floor.
+                "cache_creation_input_tokens": 50_000,
+                "cache_read_input_tokens": 180_000,
                 "total_cost_usd": 1.42,
                 "duration_ms": 268_100,
                 "duration_api_ms": 24_700,
-            }
+            },
+            "elapsed_ms": 268_100u64,
         });
         let lines = format_finished_rollup(&payload);
         assert_eq!(lines.len(), 2);
-        // 18_000 / (18_000 + 5_000) = 78.26% -> rounds to 78%.
+        // 180_000 / (180_000 + 50_000) = 78.26% -> 78.3% (one-decimal
+        // reuse, not the integer-rounded 78% the old layout collapsed to).
         assert_eq!(
             lines[0],
-            "total: $1.42   in 12.4k   out 21.3k   cache hit-rate 78%   completed 4   failed 1"
+            "total: $1.42   in 12.4k   out 21.3k   cache_read 180.0k   cache_create 50.0k   reuse 78.3%   completed 4   failed 1"
         );
-        assert_eq!(lines[1], "duration: api 24.7s / total 268.1s");
+        // Sequential plan: summed agent runtime ≈ wall-clock elapsed.
+        assert_eq!(
+            lines[1],
+            "runtime sum: api 24.7s   agent 268.1s   elapsed 268.1s"
+        );
     }
 
     #[test]
-    fn format_finished_rollup_omits_cache_hit_rate_when_denominator_zero() {
+    fn format_finished_rollup_omits_cache_segment_when_denominator_zero() {
+        // No cache reads or creates means the reuse rate is undefined;
+        // dropping the cache_read/cache_create/reuse segment is the
+        // honest signal -- a `reuse 0.0%` line would wrongly imply the
+        // agent saw cache traffic.
         let payload = serde_json::json!({
             "status": "completed",
             "step_count": { "completed": 1, "failed": 0 },
@@ -1057,12 +1440,17 @@ mod tests {
                 "total_cost_usd": 0.01,
                 "duration_ms": 500,
                 "duration_api_ms": 400,
-            }
+            },
+            "elapsed_ms": 500u64,
         });
         let lines = format_finished_rollup(&payload);
         assert_eq!(
             lines[0],
             "total: $0.01   in 100   out 50   completed 1   failed 0"
+        );
+        assert_eq!(
+            lines[1],
+            "runtime sum: api 0.4s   agent 0.5s   elapsed 0.5s"
         );
     }
 
@@ -1071,7 +1459,8 @@ mod tests {
         // Plan finished with zero metrics (e.g. cancelled draft) but
         // still carries a step_count block; render the counts and a
         // zero-cost/zero-token block rather than skipping the rollup
-        // entirely.
+        // entirely. With no `elapsed_ms` the runtime line drops the
+        // `elapsed` segment instead of rendering a misleading `0.0s`.
         let payload = serde_json::json!({
             "status": "cancelled",
             "step_count": { "completed": 0, "failed": 0 },
@@ -1082,7 +1471,53 @@ mod tests {
             lines[0],
             "total: $0.00   in 0   out 0   completed 0   failed 0"
         );
-        assert_eq!(lines[1], "duration: api 0.0s / total 0.0s");
+        assert_eq!(lines[1], "runtime sum: api 0.0s   agent 0.0s");
+    }
+
+    #[test]
+    fn format_finished_rollup_distinguishes_summed_runtime_from_wall_clock_for_parallel_steps() {
+        // Regression guard for the parallel-execution case the new
+        // layout exists to surface: two 30-second steps running side
+        // by side report a 60s summed agent runtime even though the
+        // operator only waited ~30s. The pre-rename layout said
+        // `total 60.0s` and silently dropped the wall-clock difference.
+        let payload = serde_json::json!({
+            "status": "completed",
+            "step_count": { "completed": 2, "failed": 0 },
+            "metrics": {
+                "input_tokens": 1_000,
+                "output_tokens": 500,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "total_cost_usd": 0.20,
+                "duration_ms": 60_000,
+                "duration_api_ms": 50_000,
+            },
+            "elapsed_ms": 30_500u64,
+        });
+        let lines = format_finished_rollup(&payload);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "total: $0.20   in 1,000   out 500   completed 2   failed 0"
+        );
+        // Summed `agent 60.0s` is twice `elapsed 30.5s` -- the layout
+        // makes the parallel speed-up visible at a glance.
+        assert_eq!(
+            lines[1],
+            "runtime sum: api 50.0s   agent 60.0s   elapsed 30.5s"
+        );
+    }
+
+    #[test]
+    fn format_one_decimal_percent_keeps_one_fractional_digit() {
+        assert_eq!(format_one_decimal_percent(18_000, 23_000), "78.3%");
+        assert_eq!(format_one_decimal_percent(1, 3), "33.3%");
+        assert_eq!(format_one_decimal_percent(1, 1), "100.0%");
+        assert_eq!(format_one_decimal_percent(0, 100), "0.0%");
+        // Defensive: zero denominator must not divide-by-zero or NaN
+        // its way into the rendered output.
+        assert_eq!(format_one_decimal_percent(0, 0), "0.0%");
     }
 
     #[test]
@@ -1112,5 +1547,443 @@ mod tests {
             parsed[0].answer,
             Answer::Choose { ref option_id } if option_id == "opt-a"
         ));
+    }
+
+    // ---------- usage rollup ----------
+
+    use flowd_core::orchestration::executor::{AgentMetrics, ModelUsage};
+    use flowd_core::orchestration::observer::{PlanEvent, PlanStepCounts};
+
+    fn ts(secs_from_epoch: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(secs_from_epoch, 0).expect("valid timestamp")
+    }
+
+    fn step_event(
+        plan_id: Uuid,
+        step_id: &str,
+        kind_str: &str,
+        metrics: Option<AgentMetrics>,
+        created_at: DateTime<Utc>,
+    ) -> StoredPlanEvent {
+        // Mirror what `event_payload` writes for step variants so tests
+        // exercise the same JSON shape `build_usage_report` reads in
+        // production. Mismatches here would silently mask real bugs.
+        let mut payload = match kind_str {
+            "step_completed" => serde_json::json!({ "output": "ok" }),
+            "step_failed" => serde_json::json!({ "error": "boom" }),
+            other => panic!("step_event helper does not support kind {other}"),
+        };
+        if let Some(m) = metrics {
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("metrics".into(), serde_json::to_value(m).unwrap());
+        }
+        StoredPlanEvent {
+            id: 0,
+            plan_id,
+            project: "demo".into(),
+            kind: kind_str.into(),
+            step_id: Some(step_id.into()),
+            agent_type: Some("claude".into()),
+            payload,
+            created_at,
+        }
+    }
+
+    fn submitted_event(plan_id: Uuid, name: &str, created_at: DateTime<Utc>) -> StoredPlanEvent {
+        StoredPlanEvent {
+            id: 0,
+            plan_id,
+            project: "demo".into(),
+            kind: "submitted".into(),
+            step_id: None,
+            agent_type: None,
+            payload: serde_json::json!({ "name": name }),
+            created_at,
+        }
+    }
+
+    fn finished_event(plan_id: Uuid, status: &str, created_at: DateTime<Utc>) -> StoredPlanEvent {
+        StoredPlanEvent {
+            id: 0,
+            plan_id,
+            project: "demo".into(),
+            kind: "finished".into(),
+            step_id: None,
+            agent_type: None,
+            payload: serde_json::json!({
+                "status": status,
+                "step_count": { "completed": 1, "failed": 0 },
+                "metrics": { "input_tokens": 999, "output_tokens": 999, "total_cost_usd": 9.99 },
+            }),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn format_duration_ms_branches() {
+        assert_eq!(format_duration_ms(0), "0ms");
+        assert_eq!(format_duration_ms(750), "750ms");
+        assert_eq!(format_duration_ms(1_500), "1.5s");
+        assert_eq!(format_duration_ms(59_900), "59.9s");
+        assert_eq!(format_duration_ms(60_000), "1m 0s");
+        assert_eq!(format_duration_ms(125_000), "2m 5s");
+        assert_eq!(format_duration_ms(3_725_000), "1h 2m 5s");
+    }
+
+    #[test]
+    fn build_usage_report_sums_step_metrics_and_skips_finished() {
+        let plan_id = Uuid::new_v4();
+        let mut step_a = AgentMetrics {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_input_tokens: 10,
+            cache_creation_input_tokens: 5,
+            total_cost_usd: 0.0123,
+            duration_ms: 1_000,
+            duration_api_ms: 800,
+            ..AgentMetrics::default()
+        };
+        step_a.model_usage.insert(
+            "sonnet".into(),
+            ModelUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_input_tokens: 10,
+                cache_creation_input_tokens: 5,
+                cost_usd: 0.0123,
+            },
+        );
+        let step_b_failed = AgentMetrics {
+            input_tokens: 30,
+            output_tokens: 0,
+            total_cost_usd: 0.0010,
+            duration_ms: 200,
+            duration_api_ms: 180,
+            ..AgentMetrics::default()
+        };
+        let events = vec![
+            submitted_event(plan_id, "demo plan", ts(1_000_000)),
+            step_event(plan_id, "a", "step_completed", Some(step_a), ts(1_000_010)),
+            step_event(
+                plan_id,
+                "b",
+                "step_failed",
+                Some(step_b_failed),
+                ts(1_000_020),
+            ),
+            // Pre-metrics step row -- payload has no `metrics`. Must be
+            // ignored without poisoning the sums.
+            step_event(plan_id, "legacy", "step_completed", None, ts(1_000_030)),
+            // Finished row with its own metrics; including it would
+            // double-count.
+            finished_event(plan_id, "completed", ts(1_000_040)),
+        ];
+
+        let r = build_usage_report(plan_id, &events);
+        assert_eq!(r.plan_id, plan_id);
+        assert_eq!(r.plan_name.as_deref(), Some("demo plan"));
+        assert_eq!(r.project.as_deref(), Some("demo"));
+        assert_eq!(r.status.as_deref(), Some("completed"));
+        // Two step rows contributed metrics; the legacy row had `metrics: None`
+        // and the finished row is filtered by kind.
+        assert_eq!(r.steps, 2);
+        assert_eq!(r.input_tokens, 130);
+        assert_eq!(r.output_tokens, 50);
+        assert_eq!(r.cache_read_tokens, 10);
+        assert_eq!(r.cache_creation_tokens, 5);
+        assert!((r.total_cost_usd - 0.0133).abs() < 1e-9);
+        assert_eq!(r.duration_api_ms, 980);
+        assert_eq!(r.duration_total_ms, 1_200);
+        assert_eq!(r.wall_clock_ms, Some(40_000));
+        // 10 / (10 + 5) = 0.6666...
+        assert!((r.cache_hit_rate.unwrap() - (10.0 / 15.0)).abs() < 1e-9);
+        // Per-model: only sonnet had a model_usage entry.
+        assert_eq!(r.model_breakdown.len(), 1);
+        let sonnet = r.model_breakdown.get("sonnet").expect("sonnet bucket");
+        assert_eq!(sonnet.input_tokens, 100);
+        assert_eq!(sonnet.output_tokens, 50);
+    }
+
+    #[test]
+    fn build_usage_report_no_metrics_yields_zeros_and_no_cache_rate() {
+        let plan_id = Uuid::new_v4();
+        let events = vec![submitted_event(plan_id, "p", ts(1_000_000))];
+        let r = build_usage_report(plan_id, &events);
+        assert_eq!(r.steps, 0);
+        assert_eq!(r.input_tokens, 0);
+        assert_eq!(r.output_tokens, 0);
+        // Single event -> no wall-clock span (a 0ms wall-clock would
+        // be misleading here).
+        assert_eq!(r.wall_clock_ms, None);
+        assert_eq!(r.cache_hit_rate, None);
+        assert!(r.model_breakdown.is_empty());
+    }
+
+    #[test]
+    fn build_usage_report_cache_hit_rate_is_none_when_no_cache_activity() {
+        let plan_id = Uuid::new_v4();
+        let m = AgentMetrics {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_cost_usd: 0.5,
+            ..AgentMetrics::default()
+        };
+        let events = vec![step_event(
+            plan_id,
+            "a",
+            "step_completed",
+            Some(m),
+            ts(2_000_000),
+        )];
+        let r = build_usage_report(plan_id, &events);
+        assert_eq!(r.cache_hit_rate, None);
+    }
+
+    #[test]
+    fn model_rows_by_cost_orders_descending_with_name_tiebreaker() {
+        let mut report = UsageReport {
+            plan_id: Uuid::nil(),
+            ..UsageReport::default()
+        };
+        report.model_breakdown.insert(
+            "haiku".into(),
+            ModelBreakdown {
+                cost_usd: 0.10,
+                ..ModelBreakdown::default()
+            },
+        );
+        report.model_breakdown.insert(
+            "sonnet".into(),
+            ModelBreakdown {
+                cost_usd: 0.50,
+                ..ModelBreakdown::default()
+            },
+        );
+        report.model_breakdown.insert(
+            "opus".into(),
+            ModelBreakdown {
+                cost_usd: 0.10,
+                ..ModelBreakdown::default()
+            },
+        );
+        let names: Vec<&str> = model_rows_by_cost(&report)
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        // sonnet first (highest cost); opus before haiku as a name tie-break.
+        assert_eq!(names, vec!["sonnet", "haiku", "opus"]);
+    }
+
+    #[test]
+    fn format_usage_report_includes_required_fields() {
+        let mut report = UsageReport {
+            plan_id: Uuid::nil(),
+            plan_name: Some("widget rollout".into()),
+            project: Some("demo".into()),
+            status: Some("completed".into()),
+            steps: 4,
+            total_cost_usd: 1.4231,
+            input_tokens: 12_400,
+            output_tokens: 21_300,
+            cache_read_tokens: 18_000,
+            cache_creation_tokens: 5_000,
+            cache_hit_rate: Some(18_000.0 / 23_000.0),
+            duration_api_ms: 24_700,
+            duration_total_ms: 268_100,
+            wall_clock_ms: Some(310_000),
+            first_event_at: Some(ts(1_000_000)),
+            last_event_at: Some(ts(1_000_310)),
+            ..UsageReport::default()
+        };
+        report.model_breakdown.insert(
+            "sonnet".into(),
+            ModelBreakdown {
+                cost_usd: 1.20,
+                input_tokens: 10_000,
+                output_tokens: 18_000,
+                cache_read_tokens: 16_000,
+                cache_creation_tokens: 4_000,
+            },
+        );
+        let out = format_usage_report(&report, Style::plain());
+
+        assert!(out.contains("=== usage:"));
+        assert!(out.contains("plan:        widget rollout"));
+        assert!(out.contains("project:     demo"));
+        assert!(out.contains("status:      completed"));
+        assert!(out.contains("steps:       4"));
+        // Two-decimal cost rounding.
+        assert!(out.contains("total cost:  $1.42"), "got:\n{out}");
+        // Token compaction kicks in above 9_999.
+        assert!(out.contains("tokens:      in 12.4k   out 21.3k"));
+        // Raw cache totals with thousands separators.
+        assert!(out.contains("cache:       read 18,000   creation 5,000"));
+        // One-decimal cache reuse rate.
+        assert!(out.contains("cache reuse: 78.3%"), "got:\n{out}");
+        // Both runtime sums rendered.
+        assert!(out.contains("runtime:     api 24.7s   agent 4m 28s"));
+        assert!(out.contains("wall-clock:  5m 10s"));
+        assert!(out.contains("models:"));
+        assert!(out.contains("sonnet"));
+    }
+
+    #[test]
+    fn format_usage_report_marks_no_cache_activity_when_rate_absent() {
+        let report = UsageReport {
+            plan_id: Uuid::nil(),
+            steps: 1,
+            total_cost_usd: 0.01,
+            input_tokens: 10,
+            output_tokens: 5,
+            ..UsageReport::default()
+        };
+        let out = format_usage_report(&report, Style::plain());
+        assert!(out.contains("cache reuse: (no cache activity)"));
+        // No "models:" section when the breakdown is empty -- the
+        // operator would otherwise see a dangling header.
+        assert!(!out.contains("models:"));
+        // No wall-clock line either.
+        assert!(!out.contains("wall-clock:"));
+    }
+
+    #[test]
+    fn usage_report_json_omits_optional_fields_when_absent() {
+        // Empty rollup must not serialise `cache_hit_rate: null` or
+        // `wall_clock_ms: null` -- callers should distinguish "unset"
+        // from "explicitly zero" and we lean on `Option`-elision.
+        let report = UsageReport {
+            plan_id: Uuid::nil(),
+            steps: 1,
+            total_cost_usd: 0.01,
+            input_tokens: 10,
+            output_tokens: 5,
+            ..UsageReport::default()
+        };
+        let s = serde_json::to_string(&report).unwrap();
+        assert!(!s.contains("cache_hit_rate"));
+        assert!(!s.contains("wall_clock_ms"));
+        assert!(!s.contains("plan_name"));
+        assert!(!s.contains("project"));
+        assert!(!s.contains("status"));
+        // Required scalars are always present.
+        assert!(s.contains("\"plan_id\""));
+        assert!(s.contains("\"steps\":1"));
+        assert!(s.contains("\"total_cost_usd\":0.01"));
+    }
+
+    #[tokio::test]
+    async fn usage_command_reads_recorded_events_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("flowd-plan-usage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = FlowdPaths::with_home(dir.clone());
+
+        // SqlitePlanEventStore::open writes to the same path the CLI
+        // command will subsequently read from.
+        let db_path = paths.db_file();
+        let store = SqlitePlanEventStore::open(&db_path).expect("open store");
+
+        let plan_id = Uuid::new_v4();
+        let metrics = AgentMetrics {
+            input_tokens: 200,
+            output_tokens: 80,
+            cache_read_input_tokens: 50,
+            cache_creation_input_tokens: 50,
+            total_cost_usd: 0.42,
+            duration_ms: 12_000,
+            duration_api_ms: 9_500,
+            ..AgentMetrics::default()
+        };
+        store
+            .record(&PlanEvent::Submitted {
+                plan_id,
+                name: "rollout".into(),
+                project: "demo".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .record(&PlanEvent::StepCompleted {
+                plan_id,
+                project: "demo".into(),
+                step_id: "build".into(),
+                agent_type: "claude".into(),
+                output: "ok".into(),
+                metrics: Some(metrics),
+            })
+            .await
+            .unwrap();
+        store
+            .record(&PlanEvent::Finished {
+                plan_id,
+                project: "demo".into(),
+                status: PlanStatus::Completed,
+                total_metrics: None,
+                step_count: PlanStepCounts {
+                    completed: 1,
+                    failed: 0,
+                },
+                elapsed_ms: None,
+            })
+            .await
+            .unwrap();
+
+        let report = prepare_usage_report(&paths, plan_id)
+            .await
+            .expect("prepare_usage_report");
+        assert_eq!(report.steps, 1);
+        assert_eq!(report.input_tokens, 200);
+        assert_eq!(report.output_tokens, 80);
+        assert_eq!(report.cache_read_tokens, 50);
+        assert_eq!(report.cache_creation_tokens, 50);
+        assert!((report.total_cost_usd - 0.42).abs() < 1e-9);
+        assert_eq!(report.duration_total_ms, 12_000);
+        assert_eq!(report.duration_api_ms, 9_500);
+        // 50 / (50 + 50) = 0.5 -> renders 50.0%.
+        assert!((report.cache_hit_rate.unwrap() - 0.5).abs() < 1e-9);
+        assert_eq!(report.plan_name.as_deref(), Some("rollout"));
+        assert_eq!(report.status.as_deref(), Some("completed"));
+
+        // Run the user-facing entry point as well to make sure the
+        // dispatch path doesn't regress (output goes to stdout; we just
+        // assert the call resolves).
+        usage(&paths, Style::plain(), plan_id.to_string(), false)
+            .await
+            .expect("usage human");
+        usage(&paths, Style::plain(), plan_id.to_string(), true)
+            .await
+            .expect("usage json");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn usage_command_errors_when_plan_has_no_events() {
+        let dir =
+            std::env::temp_dir().join(format!("flowd-plan-usage-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = FlowdPaths::with_home(dir.clone());
+        // Initialise the schema by opening the store without writing.
+        let _ = SqlitePlanEventStore::open(&paths.db_file()).expect("open store");
+
+        let err = prepare_usage_report(&paths, Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no events recorded"), "{err:#}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn usage_command_errors_when_db_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("flowd-plan-usage-nodb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = FlowdPaths::with_home(dir.clone());
+        let err = prepare_usage_report(&paths, Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no flowd database"), "{err:#}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

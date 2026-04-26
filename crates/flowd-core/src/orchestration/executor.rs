@@ -143,6 +143,13 @@ pub struct AgentSpawnContext {
     pub project: String,
     pub plan_parallel: bool,
     pub layer_width: usize,
+    /// Absolute filesystem root of the workspace this plan operates on.
+    /// Captured on [`super::Plan::project_root`] at submission time and
+    /// threaded verbatim into every spawn so the agent inherits the
+    /// plan's workspace instead of whatever directory the daemon process
+    /// happens to live in. `None` only for legacy plans persisted before
+    /// the field existed; spawners fall back to their own cwd then.
+    pub project_root: Option<std::path::PathBuf>,
 }
 
 /// Strategy for invoking a single plan step.
@@ -353,6 +360,9 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
                         status: PlanStatus::Interrupted,
                         total_metrics: None,
                         step_count,
+                        // Wall-clock would span the daemon restart -- not a
+                        // meaningful runtime number for the operator.
+                        elapsed_ms: None,
                     });
 
                     let runtime = PlanRuntime {
@@ -496,9 +506,10 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
             PlanStatus::Completed
         };
 
+        let completed_at = Utc::now();
         self.with_plan_mut(plan_id, |runtime| {
             runtime.plan.status = final_status;
-            runtime.plan.completed_at = Some(Utc::now());
+            runtime.plan.completed_at = Some(completed_at);
             runtime.plan.steps.clone_from(&plan.steps);
             runtime.in_flight.clear();
         })?;
@@ -513,12 +524,21 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
         } else {
             Some(total_metrics)
         };
+        // Wall-clock from start_execution's `started_at` to the moment
+        // we wrote `completed_at`. With parallel steps the sum of
+        // per-step `duration_ms` can exceed this; the renderer surfaces
+        // both so operators can see the speed-up.
+        let elapsed_ms = plan.started_at.and_then(|s| {
+            let delta = completed_at.signed_duration_since(s).num_milliseconds();
+            u64::try_from(delta).ok()
+        });
         self.emit(PlanEvent::Finished {
             plan_id,
             project: plan.project.clone(),
             status: final_status,
             total_metrics,
             step_count,
+            elapsed_ms,
         });
         Ok(())
     }
@@ -723,6 +743,9 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
                     status: PlanStatus::Cancelled,
                     total_metrics: None,
                     step_count: PlanStepCounts::default(),
+                    // Cancelled before `start_execution` ever ran, so
+                    // there is no wall-clock to report.
+                    elapsed_ms: None,
                 });
                 Ok(())
             }
@@ -1020,6 +1043,26 @@ mod tests {
         }
     }
 
+    /// Spawner that records the `project_root` field of every
+    /// [`AgentSpawnContext`] it sees. The point is to pin that
+    /// `LayerRunner` actually copies `Plan::project_root` onto the
+    /// per-step context: if the wiring regresses, every spawn falls
+    /// back to the daemon-process cwd and parallel runs land in the
+    /// wrong workspace without anything erroring.
+    struct ProjectRootCapturingSpawner {
+        captured: Arc<Mutex<Vec<Option<std::path::PathBuf>>>>,
+    }
+
+    impl AgentSpawner for ProjectRootCapturingSpawner {
+        async fn spawn(&self, ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
+            self.captured
+                .lock()
+                .expect("captured poisoned")
+                .push(ctx.project_root.clone());
+            Ok(AgentOutput::success(format!("ran:{}", step.id)))
+        }
+    }
+
     /// Spawner whose output is the exact prompt it received. Lets tests
     /// assert that `{{steps.<id>.output}}` substitution happened before the
     /// spawner saw the prompt.
@@ -1143,6 +1186,73 @@ mod tests {
             );
             assert_eq!(invocations.load(Ordering::SeqCst), 3);
         });
+    }
+
+    /// `Plan::project_root` is the only signal the spawner has for the
+    /// workspace the plan was authored against; if `LayerRunner` ever
+    /// stops forwarding it, the spawner silently anchors every step to
+    /// the daemon's process cwd. Pin the threading end-to-end:
+    /// authored value -> persisted plan -> per-step
+    /// `AgentSpawnContext.project_root` seen by the spawner.
+    #[test]
+    fn executor_threads_plan_project_root_into_spawn_context() {
+        let captured: Arc<Mutex<Vec<Option<std::path::PathBuf>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let exec = InMemoryPlanExecutor::new(ProjectRootCapturingSpawner {
+            captured: Arc::clone(&captured),
+        });
+
+        let plan = Plan::new("p", "proj", vec![step("a", &[]), step("b", &["a"])])
+            .with_project_root("/abs/plan/workspace");
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            exec.execute(id).await.unwrap();
+        });
+
+        let seen = captured.lock().unwrap();
+        assert_eq!(seen.len(), 2, "both steps must spawn");
+        for (i, entry) in seen.iter().enumerate() {
+            assert_eq!(
+                entry.as_deref(),
+                Some(std::path::Path::new("/abs/plan/workspace")),
+                "step {i} saw ctx.project_root = {entry:?}; \
+                 expected the plan's persisted /abs/plan/workspace",
+            );
+        }
+    }
+
+    /// Mirror image of the threading test: a plan WITHOUT a
+    /// `project_root` (the legacy / pre-HL-PROJECT_ROOT shape) must
+    /// surface as `None` on the context so the spawner can knowingly
+    /// fall back. Pinning the negative case prevents a future change
+    /// from defaulting `project_root` to `current_dir()` -- which
+    /// would re-introduce the silent-daemon-cwd bug for legacy plans.
+    #[test]
+    fn executor_propagates_none_project_root_for_legacy_plans() {
+        let captured: Arc<Mutex<Vec<Option<std::path::PathBuf>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let exec = InMemoryPlanExecutor::new(ProjectRootCapturingSpawner {
+            captured: Arc::clone(&captured),
+        });
+
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        assert!(plan.project_root.is_none(), "test precondition");
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            exec.execute(id).await.unwrap();
+        });
+
+        let seen = captured.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(
+            seen[0].is_none(),
+            "ctx.project_root must be None for a plan with no project_root, got {:?}",
+            seen[0]
+        );
     }
 
     #[test]

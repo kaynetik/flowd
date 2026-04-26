@@ -9,6 +9,7 @@
 //! `idx_plan_events_plan` covering index defined in
 //! [`crate::migrations`].
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -75,6 +76,71 @@ pub struct UsageTotals {
     pub step_events: u64,
 }
 
+impl UsageTotals {
+    /// Cache-hit ratio over the input-side cache counters:
+    /// `cache_read / (cache_read + cache_creation)`.
+    ///
+    /// Returns `None` when both counters are zero. Callers should
+    /// suppress the metric in that case rather than render `NaN` or a
+    /// misleading `0.00` -- there was simply no cache activity to
+    /// report a ratio over.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        let denom = self.cache_read_tokens + self.cache_creation_tokens;
+        if denom == 0 {
+            return None;
+        }
+        Some(self.cache_read_tokens as f64 / denom as f64)
+    }
+}
+
+/// Per-model rollup of token + cost usage, derived from the
+/// `metrics.model_usage` map embedded in step-event payloads. Field
+/// names mirror the storage keys (`cache_read_input_tokens` etc. on
+/// `ModelUsage`) but expose the shorter, ratio-friendly aliases used
+/// elsewhere in this module.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// Shared SELECT clause for [`UsageTotals`] aggregation. Callers
+/// append a `WHERE` clause and any extra parameters; the column order
+/// must stay aligned with [`row_to_usage_totals`].
+const USAGE_SELECT: &str = "SELECT
+    COALESCE(SUM(json_extract(payload, '$.metrics.input_tokens')), 0),
+    COALESCE(SUM(json_extract(payload, '$.metrics.output_tokens')), 0),
+    COALESCE(SUM(json_extract(payload, '$.metrics.cache_read_input_tokens')), 0),
+    COALESCE(SUM(json_extract(payload, '$.metrics.cache_creation_input_tokens')), 0),
+    COALESCE(SUM(json_extract(payload, '$.metrics.total_cost_usd')), 0.0),
+    COUNT(*)
+ FROM plan_events";
+
+/// Predicate every usage aggregate shares: only step-outcome rows
+/// (failed steps still cost money, so they stay in), and only rows
+/// that actually carry a `metrics` block. The `kind IN (...)` clause
+/// is what keeps `finished` rows out, so their `total_metrics` --
+/// itself a sum of these step rows -- never gets double-counted.
+const USAGE_BASE_WHERE: &str = "kind IN ('step_completed', 'step_failed')
+       AND json_extract(payload, '$.metrics') IS NOT NULL";
+
+fn row_to_usage_totals(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageTotals> {
+    let to_u64 = |v: i64| u64::try_from(v).unwrap_or(0);
+    Ok(UsageTotals {
+        input_tokens: to_u64(row.get::<_, i64>(0)?),
+        output_tokens: to_u64(row.get::<_, i64>(1)?),
+        cache_read_tokens: to_u64(row.get::<_, i64>(2)?),
+        cache_creation_tokens: to_u64(row.get::<_, i64>(3)?),
+        total_cost_usd: row.get::<_, f64>(4)?,
+        step_events: to_u64(row.get::<_, i64>(5)?),
+    })
+}
+
 impl SqlitePlanEventStore {
     /// Aggregate token + cost totals across all persisted step events.
     ///
@@ -89,31 +155,129 @@ impl SqlitePlanEventStore {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().map_err(storage_err)?;
+            let sql = format!("{USAGE_SELECT}\n WHERE {USAGE_BASE_WHERE}");
+            conn.query_row(&sql, [], row_to_usage_totals)
+                .map_err(storage_err)
+        })
+        .await
+        .map_err(|e| FlowdError::Storage(format!("spawn_blocking panicked: {e}")))?
+    }
+
+    /// Aggregate token + cost totals for a single plan.
+    ///
+    /// Same shape and exclusions as [`Self::usage_totals`]; returns
+    /// `UsageTotals::default()` when the plan has no metrics-bearing
+    /// step events (or doesn't exist).
+    ///
+    /// # Errors
+    /// Returns `FlowdError::Storage` on `SQLite` or mutex failures.
+    pub async fn usage_totals_for_plan(&self, plan_id: Uuid) -> Result<UsageTotals> {
+        let conn = Arc::clone(&self.conn);
+        let plan_id_str = plan_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(storage_err)?;
+            let sql = format!("{USAGE_SELECT}\n WHERE {USAGE_BASE_WHERE}\n   AND plan_id = ?1");
+            conn.query_row(&sql, rusqlite::params![&plan_id_str], row_to_usage_totals)
+                .map_err(storage_err)
+        })
+        .await
+        .map_err(|e| FlowdError::Storage(format!("spawn_blocking panicked: {e}")))?
+    }
+
+    /// Aggregate token + cost totals for events recorded in the
+    /// half-open interval `[start, end)`, suitable for daily / weekly /
+    /// monthly status reports.
+    ///
+    /// The query ranges over the persisted `created_at` column rather
+    /// than any payload-internal timestamp, so it sees exactly what the
+    /// audit log saw. Inputs are normalised through `datetime()` so the
+    /// comparison works regardless of whether a row was written by
+    /// `datetime('now')` (`YYYY-MM-DD HH:MM:SS`) or by a caller that
+    /// stamped an explicit RFC-3339 string.
+    ///
+    /// # Errors
+    /// Returns `FlowdError::Storage` on `SQLite` or mutex failures.
+    pub async fn usage_totals_for_period(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<UsageTotals> {
+        let conn = Arc::clone(&self.conn);
+        let start_s = start.to_rfc3339();
+        let end_s = end.to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(storage_err)?;
+            let sql = format!(
+                "{USAGE_SELECT}\n WHERE {USAGE_BASE_WHERE}\n   \
+                 AND datetime(created_at) >= datetime(?1)\n   \
+                 AND datetime(created_at) <  datetime(?2)"
+            );
             conn.query_row(
-                "SELECT
-                    COALESCE(SUM(json_extract(payload, '$.metrics.input_tokens')), 0),
-                    COALESCE(SUM(json_extract(payload, '$.metrics.output_tokens')), 0),
-                    COALESCE(SUM(json_extract(payload, '$.metrics.cache_read_input_tokens')), 0),
-                    COALESCE(SUM(json_extract(payload, '$.metrics.cache_creation_input_tokens')), 0),
-                    COALESCE(SUM(json_extract(payload, '$.metrics.total_cost_usd')), 0.0),
-                    COUNT(*)
-                 FROM plan_events
-                 WHERE kind IN ('step_completed', 'step_failed')
-                   AND json_extract(payload, '$.metrics') IS NOT NULL",
-                [],
-                |row| {
-                    let to_u64 = |v: i64| u64::try_from(v).unwrap_or(0);
-                    Ok(UsageTotals {
-                        input_tokens: to_u64(row.get::<_, i64>(0)?),
-                        output_tokens: to_u64(row.get::<_, i64>(1)?),
-                        cache_read_tokens: to_u64(row.get::<_, i64>(2)?),
-                        cache_creation_tokens: to_u64(row.get::<_, i64>(3)?),
-                        total_cost_usd: row.get::<_, f64>(4)?,
-                        step_events: to_u64(row.get::<_, i64>(5)?),
-                    })
-                },
+                &sql,
+                rusqlite::params![&start_s, &end_s],
+                row_to_usage_totals,
             )
             .map_err(storage_err)
+        })
+        .await
+        .map_err(|e| FlowdError::Storage(format!("spawn_blocking panicked: {e}")))?
+    }
+
+    /// Per-model rollup across all step-outcome events that reported
+    /// a `metrics.model_usage` map. Events with no `model_usage`
+    /// (or an empty map) drop out of the aggregate naturally because
+    /// `json_each` produces zero rows for them; the resulting
+    /// `BTreeMap` is empty when nothing in the database has a
+    /// per-model breakdown.
+    ///
+    /// We deliberately do not synthesise model splits from top-level
+    /// `metrics.input_tokens` etc. -- the spawner is the only place
+    /// that knows which model handled what, and inferring otherwise
+    /// would require provider-specific rate-card logic this module
+    /// avoids.
+    ///
+    /// # Errors
+    /// Returns `FlowdError::Storage` on `SQLite` or mutex failures.
+    pub async fn model_usage_totals(&self) -> Result<BTreeMap<String, ModelTotals>> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(storage_err)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        je.key,
+                        COALESCE(SUM(json_extract(je.value, '$.input_tokens')), 0),
+                        COALESCE(SUM(json_extract(je.value, '$.output_tokens')), 0),
+                        COALESCE(SUM(json_extract(je.value, '$.cache_read_input_tokens')), 0),
+                        COALESCE(SUM(json_extract(je.value, '$.cache_creation_input_tokens')), 0),
+                        COALESCE(SUM(json_extract(je.value, '$.cost_usd')), 0.0)
+                     FROM plan_events,
+                          json_each(json_extract(payload, '$.metrics.model_usage')) AS je
+                     WHERE kind IN ('step_completed', 'step_failed')
+                       AND json_extract(payload, '$.metrics.model_usage') IS NOT NULL
+                     GROUP BY je.key",
+                )
+                .map_err(storage_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let to_u64 = |v: i64| u64::try_from(v).unwrap_or(0);
+                    let model: String = row.get(0)?;
+                    let totals = ModelTotals {
+                        input_tokens: to_u64(row.get::<_, i64>(1)?),
+                        output_tokens: to_u64(row.get::<_, i64>(2)?),
+                        cache_read_tokens: to_u64(row.get::<_, i64>(3)?),
+                        cache_creation_tokens: to_u64(row.get::<_, i64>(4)?),
+                        cost_usd: row.get::<_, f64>(5)?,
+                    };
+                    Ok((model, totals))
+                })
+                .map_err(storage_err)?;
+            let mut out = BTreeMap::new();
+            for r in rows {
+                let (k, v) = r.map_err(storage_err)?;
+                out.insert(k, v);
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| FlowdError::Storage(format!("spawn_blocking panicked: {e}")))?
@@ -289,6 +453,7 @@ mod tests {
                 status: PlanStatus::Completed,
                 total_metrics: None,
                 step_count: flowd_core::orchestration::observer::PlanStepCounts::default(),
+                elapsed_ms: None,
             },
         ];
         for e in &events {
@@ -494,6 +659,7 @@ mod tests {
                 status: PlanStatus::Completed,
                 total_metrics: Some(total),
                 step_count: flowd_core::orchestration::observer::PlanStepCounts::default(),
+                elapsed_ms: None,
             },
         ];
         for e in &events {
@@ -517,6 +683,353 @@ mod tests {
         let store = store();
         let totals = store.usage_totals().await.expect("usage_totals");
         assert_eq!(totals, UsageTotals::default());
+    }
+
+    #[tokio::test]
+    async fn usage_totals_excludes_finished_rows_with_no_step_events() {
+        // A `finished` row carrying its own `total_metrics` is the
+        // shape that would double-count if our `kind IN (...)` filter
+        // ever regressed: there are no step rows here, so any non-zero
+        // total can only come from the finished row leaking in.
+        use flowd_core::orchestration::executor::AgentMetrics;
+
+        let store = store();
+        let plan_id = Uuid::new_v4();
+        let total = AgentMetrics {
+            input_tokens: 999,
+            output_tokens: 999,
+            total_cost_usd: 9.99,
+            ..AgentMetrics::default()
+        };
+        store
+            .record(&PlanEvent::Finished {
+                plan_id,
+                project: "demo".into(),
+                status: PlanStatus::Completed,
+                total_metrics: Some(total),
+                step_count: flowd_core::orchestration::observer::PlanStepCounts::default(),
+                elapsed_ms: None,
+            })
+            .await
+            .unwrap();
+
+        let totals = store.usage_totals().await.expect("usage_totals");
+        assert_eq!(totals, UsageTotals::default());
+    }
+
+    #[tokio::test]
+    async fn usage_totals_for_plan_scopes_to_one_plan() {
+        use flowd_core::orchestration::executor::AgentMetrics;
+
+        let store = store();
+        let plan_a = Uuid::new_v4();
+        let plan_b = Uuid::new_v4();
+        let metrics_a = AgentMetrics {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_cost_usd: 0.01,
+            ..AgentMetrics::default()
+        };
+        let metrics_b = AgentMetrics {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            total_cost_usd: 1.00,
+            ..AgentMetrics::default()
+        };
+        store
+            .record(&PlanEvent::StepCompleted {
+                plan_id: plan_a,
+                project: "demo".into(),
+                step_id: "a".into(),
+                agent_type: "claude".into(),
+                output: "ok".into(),
+                metrics: Some(metrics_a),
+            })
+            .await
+            .unwrap();
+        store
+            .record(&PlanEvent::StepCompleted {
+                plan_id: plan_b,
+                project: "demo".into(),
+                step_id: "b".into(),
+                agent_type: "claude".into(),
+                output: "ok".into(),
+                metrics: Some(metrics_b),
+            })
+            .await
+            .unwrap();
+
+        let only_a = store
+            .usage_totals_for_plan(plan_a)
+            .await
+            .expect("usage_totals_for_plan");
+        assert_eq!(only_a.input_tokens, 10);
+        assert_eq!(only_a.output_tokens, 5);
+        assert_eq!(only_a.step_events, 1);
+        assert!((only_a.total_cost_usd - 0.01).abs() < 1e-9);
+
+        let unknown = store
+            .usage_totals_for_plan(Uuid::new_v4())
+            .await
+            .expect("usage_totals_for_plan");
+        assert_eq!(unknown, UsageTotals::default());
+    }
+
+    #[tokio::test]
+    async fn usage_totals_for_plan_includes_failed_step_cost() {
+        use flowd_core::orchestration::executor::AgentMetrics;
+
+        let store = store();
+        let plan_id = Uuid::new_v4();
+        let succeeded = AgentMetrics {
+            input_tokens: 50,
+            total_cost_usd: 0.05,
+            ..AgentMetrics::default()
+        };
+        let failed = AgentMetrics {
+            input_tokens: 20,
+            total_cost_usd: 0.02,
+            ..AgentMetrics::default()
+        };
+        store
+            .record(&PlanEvent::StepCompleted {
+                plan_id,
+                project: "demo".into(),
+                step_id: "ok".into(),
+                agent_type: "claude".into(),
+                output: "ok".into(),
+                metrics: Some(succeeded),
+            })
+            .await
+            .unwrap();
+        store
+            .record(&PlanEvent::StepFailed {
+                plan_id,
+                project: "demo".into(),
+                step_id: "boom".into(),
+                agent_type: "claude".into(),
+                error: "rate limited".into(),
+                metrics: Some(failed),
+            })
+            .await
+            .unwrap();
+
+        let totals = store
+            .usage_totals_for_plan(plan_id)
+            .await
+            .expect("usage_totals_for_plan");
+        assert_eq!(totals.input_tokens, 70);
+        assert_eq!(totals.step_events, 2);
+        assert!((totals.total_cost_usd - 0.07).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn usage_totals_for_period_filters_by_created_at() {
+        use chrono::Duration;
+        use flowd_core::orchestration::executor::AgentMetrics;
+
+        let store = store();
+        let plan_id = Uuid::new_v4();
+        let metrics = AgentMetrics {
+            input_tokens: 42,
+            total_cost_usd: 0.42,
+            ..AgentMetrics::default()
+        };
+        store
+            .record(&PlanEvent::StepCompleted {
+                plan_id,
+                project: "demo".into(),
+                step_id: "a".into(),
+                agent_type: "claude".into(),
+                output: "ok".into(),
+                metrics: Some(metrics),
+            })
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let in_window = store
+            .usage_totals_for_period(now - Duration::minutes(5), now + Duration::minutes(5))
+            .await
+            .expect("usage_totals_for_period");
+        assert_eq!(in_window.input_tokens, 42);
+        assert_eq!(in_window.step_events, 1);
+
+        let future = store
+            .usage_totals_for_period(now + Duration::hours(1), now + Duration::hours(2))
+            .await
+            .expect("usage_totals_for_period");
+        assert_eq!(future, UsageTotals::default());
+    }
+
+    #[tokio::test]
+    async fn model_usage_totals_sums_per_model_and_excludes_finished() {
+        use flowd_core::orchestration::executor::{AgentMetrics, ModelUsage};
+
+        let store = store();
+        let plan_id = Uuid::new_v4();
+
+        let mut step_one = AgentMetrics {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_cost_usd: 0.01,
+            ..AgentMetrics::default()
+        };
+        step_one.model_usage.insert(
+            "sonnet".into(),
+            ModelUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cost_usd: 0.01,
+                ..Default::default()
+            },
+        );
+
+        let mut step_two = AgentMetrics {
+            input_tokens: 7,
+            output_tokens: 3,
+            total_cost_usd: 0.007,
+            ..AgentMetrics::default()
+        };
+        step_two.model_usage.insert(
+            "sonnet".into(),
+            ModelUsage {
+                input_tokens: 4,
+                output_tokens: 1,
+                cache_read_input_tokens: 2,
+                cost_usd: 0.004,
+                ..Default::default()
+            },
+        );
+        step_two.model_usage.insert(
+            "haiku".into(),
+            ModelUsage {
+                input_tokens: 3,
+                output_tokens: 2,
+                cost_usd: 0.003,
+                ..Default::default()
+            },
+        );
+
+        let mut total = AgentMetrics::default();
+        total.merge(&step_one);
+        total.merge(&step_two);
+
+        let events = [
+            PlanEvent::StepCompleted {
+                plan_id,
+                project: "demo".into(),
+                step_id: "a".into(),
+                agent_type: "claude".into(),
+                output: "ok".into(),
+                metrics: Some(step_one),
+            },
+            PlanEvent::StepCompleted {
+                plan_id,
+                project: "demo".into(),
+                step_id: "b".into(),
+                agent_type: "claude".into(),
+                output: "ok".into(),
+                metrics: Some(step_two),
+            },
+            // Finished carries the same models in `total_metrics`. If the
+            // aggregate ever forgot to filter `kind`, sonnet/haiku would
+            // double-count off this row.
+            PlanEvent::Finished {
+                plan_id,
+                project: "demo".into(),
+                status: PlanStatus::Completed,
+                total_metrics: Some(total),
+                step_count: flowd_core::orchestration::observer::PlanStepCounts::default(),
+                elapsed_ms: None,
+            },
+        ];
+        for e in &events {
+            store.record(e).await.expect("record");
+        }
+
+        let by_model = store
+            .model_usage_totals()
+            .await
+            .expect("model_usage_totals");
+        assert_eq!(by_model.len(), 2);
+
+        let sonnet = by_model.get("sonnet").expect("sonnet bucket");
+        assert_eq!(sonnet.input_tokens, 14);
+        assert_eq!(sonnet.output_tokens, 6);
+        assert_eq!(sonnet.cache_read_tokens, 2);
+        assert!((sonnet.cost_usd - 0.014).abs() < 1e-9);
+
+        let haiku = by_model.get("haiku").expect("haiku bucket");
+        assert_eq!(haiku.input_tokens, 3);
+        assert_eq!(haiku.output_tokens, 2);
+        assert!((haiku.cost_usd - 0.003).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn model_usage_totals_returns_empty_when_no_model_usage_present() {
+        use flowd_core::orchestration::executor::AgentMetrics;
+
+        let store = store();
+        let plan_id = Uuid::new_v4();
+        // Metrics present, but no per-model breakdown -- common for
+        // spawners that don't differentiate.
+        store
+            .record(&PlanEvent::StepCompleted {
+                plan_id,
+                project: "demo".into(),
+                step_id: "a".into(),
+                agent_type: "echo".into(),
+                output: "ok".into(),
+                metrics: Some(AgentMetrics {
+                    input_tokens: 1,
+                    total_cost_usd: 0.001,
+                    ..AgentMetrics::default()
+                }),
+            })
+            .await
+            .unwrap();
+
+        let by_model = store
+            .model_usage_totals()
+            .await
+            .expect("model_usage_totals");
+        assert!(by_model.is_empty());
+    }
+
+    #[test]
+    fn cache_hit_rate_returns_none_when_denominator_zero() {
+        // No cache activity at all -- the rate would be 0/0. Suppress
+        // it instead of rendering NaN or a misleading 0.0.
+        let totals = UsageTotals {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_cost_usd: 0.5,
+            step_events: 1,
+            ..UsageTotals::default()
+        };
+        assert_eq!(totals.cache_hit_rate(), None);
+    }
+
+    #[test]
+    fn cache_hit_rate_computes_when_cache_creation_present() {
+        // 0 hits out of 100 created tokens = 0% hit rate. The
+        // denominator is non-zero, so we report the ratio rather than
+        // suppressing it.
+        let totals = UsageTotals {
+            cache_creation_tokens: 100,
+            ..UsageTotals::default()
+        };
+        let rate = totals.cache_hit_rate().expect("denominator non-zero");
+        assert!(rate.abs() < 1e-9);
+
+        let totals = UsageTotals {
+            cache_read_tokens: 75,
+            cache_creation_tokens: 25,
+            ..UsageTotals::default()
+        };
+        let rate = totals.cache_hit_rate().expect("denominator non-zero");
+        assert!((rate - 0.75).abs() < 1e-9);
     }
 
     #[test]

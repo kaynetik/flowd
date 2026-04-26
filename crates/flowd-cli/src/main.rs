@@ -93,6 +93,9 @@ async fn main() -> Result<()> {
                 file,
             } => commands::plan::refine(&paths, style, plan_id, feedback, file).await,
             PlanAction::Cancel { plan_id } => commands::plan::cancel(&paths, style, plan_id).await,
+            PlanAction::Usage { plan_id, json } => {
+                commands::plan::usage(&paths, style, plan_id, json).await
+            }
         },
         Command::Rules { action } => match action {
             RulesAction::List { project, file } => {

@@ -14,6 +14,8 @@ Local-first memory, orchestration, and rules engine for AI coding agents. Expose
     - [Workspace and project scoping](#workspace-and-project-scoping)
   - [4. Observe out-of-band](#4-observe-out-of-band)
   - [5. Inspect](#5-inspect)
+    - [Plan event log](#plan-event-log)
+    - [Plan usage rollup](#plan-usage-rollup)
   - [6. Shut down](#6-shut-down)
 - [Recommendations](#recommendations)
 - [Development](#development)
@@ -115,7 +117,21 @@ Pin tags explicitly. Floating tags like `v1.17` or `latest` make "it worked yest
 flowd status
 ```
 
-Reports the flowd home layout, daemon liveness, and row counts per memory tier. A fresh install shows zero rows and no PID.
+Reports the flowd home layout, daemon liveness, row counts per memory tier, and a `tokens:` block summing plan-event spend across four windows: today, this week (Monday-anchored), this month, and all-time. Boundaries are UTC half-open (`[start, end)`) so they line up with the `created_at` column `SQLite` writes. Costs round to two decimals here -- the per-step `flowd plan events` view keeps four-decimal precision for spot checks. Token splits (input / output / cache_read / cache_creation) are shown for the all-time totals only; per-period token splits would dilute the spend signal without changing operator decisions:
+
+```text
+tokens:
+  this week:      $4.21  (132 step events)
+  today:          $0.87
+  this month:     $18.04
+  all-time:       $42.19  (1,420 step events)
+  input:          1,204,310
+  output:         812,005
+  cache_read:     8,942,118
+  cache_creation: 1,041,772
+```
+
+A fresh install shows zero rows, no PID, and a `none -- no metrics-bearing step events yet` line in place of the block above.
 
 ### 2. Wire your agent
 
@@ -319,7 +335,7 @@ All read commands hit `SQLite` directly. `SQLite` WAL mode makes this safe while
 
 #### Plan event log
 
-`flowd plan events <plan_id>` replays the persisted lifecycle log for one plan. Per-step rows carry the cost and token block mined from the agent's own JSON envelope (success *and* failure paths -- expensive refusals are not silently dropped). The trailing `finished` row carries a per-plan rollup with total spend, compact token counts, cache hit-rate, and per-outcome step counts:
+`flowd plan events <plan_id>` replays the persisted lifecycle log for one plan. Per-step rows carry the cost and token block mined from the agent's own JSON envelope (success *and* failure paths -- expensive refusals are not silently dropped). The trailing `finished` row carries a per-plan rollup with total spend, compact token counts, cache read/create totals with a one-decimal reuse rate, and per-outcome step counts. The runtime line splits explicitly summed agent / API durations from wall-clock elapsed -- with parallel layers the sum exceeds elapsed, and the layout makes that visible:
 
 ```text
 events: 8e2f1c9a-3b4d-4e07-9c11-1a2b3c4d5e6f
@@ -332,11 +348,47 @@ events: 8e2f1c9a-3b4d-4e07-9c11-1a2b3c4d5e6f
     cost: $0.4231   tokens: in 2,148   out 8,392   cache_read 15,820   cache_creation 4,216
     duration: api 4.1s / total 4.5s
   2026-04-24 14:05:51Z  finished  status=completed
-    total: $1.42   in 12.4k   out 21.3k   cache hit-rate 78%   completed 4   failed 1
-    duration: api 24.7s / total 268.1s
+    total: $1.42   in 12.4k   out 21.3k   cache_read 180.0k   cache_create 50.0k   reuse 78.3%   completed 4   failed 1
+    runtime sum: api 24.7s   agent 268.1s   elapsed 258.0s
 ```
 
 Filter by event kind with `--kind step_failed,finished` and cap rows with `--limit`. Older plans recorded before metrics capture render without the cost lines rather than as `$0.0000` placeholders.
+
+What the cache columns mean:
+
+- **`cache_read`** is the number of input tokens served from a previously-created prompt cache (cheap; ~10% of the input rate on Anthropic's card).
+- **`cache_creation`** is the number of input tokens written into the cache on this turn (more expensive than uncached input; pays off only if subsequent turns hit them).
+- **`reuse`** is `cache_read / (cache_read + cache_creation)`, rendered with one decimal -- the integer-rounded `78%` would hide the difference between 78.1% and 78.9%, which is meaningful when you're tuning prompt structure for cache hits. `reuse` is omitted when both counters are zero.
+
+What the runtime line means:
+
+- **`api`** is the sum of `duration_api_ms` across step events -- time the agent spent inside provider HTTP calls.
+- **`agent`** is the sum of `duration_ms` across step events -- total agent runtime, including local tool calls and orchestration overhead between API hops.
+- **`elapsed`** is wall-clock from `Plan.started_at` to `completed_at`. For a sequential plan, `agent ≈ elapsed`. For a plan with parallel layers, `agent` is the sum of concurrent step durations and routinely *exceeds* `elapsed` -- the explicit-sum-vs-wall-clock split is what makes that visible. Plans that never executed (cancel from `Draft`, rehydrate-as-`Interrupted`) and pre-rollup events drop the `elapsed` segment rather than rendering a misleading `0.0s`.
+
+#### Plan usage rollup
+
+`flowd plan usage <plan_id>` is the single-plan audit view: total cost, raw cache read/create totals, the same one-decimal cache reuse rate, input/output tokens, summed API and agent runtime, the wall-clock span between the first and last persisted event, step count, and a per-model breakdown sorted by descending cost. It reads the persisted event log (WAL-safe against a live daemon) without going through the executor:
+
+```text
+usage: 8e2f1c9a-3b4d-4e07-9c11-1a2b3c4d5e6f
+  plan:        refactor-auth
+  project:     my-repo
+  status:      completed
+  steps:       5
+  total cost:  $1.42
+  tokens:      in 12.4k   out 21.3k
+  cache:       read 180,000   creation 50,000
+  cache reuse: 78.3%
+  runtime:     api 24.7s   agent 4m 28s
+  wall-clock:  4m 18s
+
+models:
+  claude-sonnet-4-5      $1.10   in    9.2k   out   16.4k   cache r/c 140,000/38,000
+  claude-haiku-4-5       $0.32   in    3.2k   out    4.9k   cache r/c  40,000/12,000
+```
+
+`--json` emits the same `UsageReport` struct as machine-readable JSON (field names mirror the on-disk metric keys) so dashboards and scripts share a schema with the human view; `cache_hit_rate` and `wall_clock_ms` are omitted from the JSON when they would otherwise be `null` (no cache activity, single-event plan). Plans with no recorded events fail loudly rather than rendering a zero-filled report.
 
 ### 6. Shut down
 

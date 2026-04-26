@@ -53,7 +53,7 @@ use crate::config::{FlowdConfig, LlmConfig, LlmProvider};
 use crate::daemon::PidFile;
 use crate::output::Style;
 use crate::paths::FlowdPaths;
-use crate::plan_compiler::DaemonPlanCompiler;
+use crate::plan_compiler::{DaemonPlanCompiler, ProjectScopedPlanCompiler};
 use crate::spawner::BoxedSpawner;
 use flowd_mcp::ClaudeCliCallback;
 use flowd_mcp::ClaudeCliConfig as McpClaudeCliConfig;
@@ -166,11 +166,16 @@ pub async fn run(
     //                    init failure, unsupported provider); the
     //                    daemon refuses to start in that case so the
     //                    operator notices before requests pile up.
-    let plan_compiler = Arc::new(
+    let default_compiler = Arc::new(
         DaemonPlanCompiler::from_selection(config.plan.compiler, &config.plan.llm)
             .map_err(|e| anyhow::anyhow!("instantiate plan compiler: {e}"))?,
     );
-    log_llm_router(style, &plan_compiler);
+    log_llm_router(style, &default_compiler);
+    // Project-scoped wrapper: per-request plan_create dispatches through
+    // `<project_root>/.flowd/flowd.toml` instead of the global config we
+    // just loaded, which is reserved for requests that arrive without a
+    // workspace hint.
+    let plan_compiler = Arc::new(ProjectScopedPlanCompiler::new(default_compiler));
 
     let handlers = Arc::new(
         FlowdHandlers::new(memory_service, Arc::clone(&executor), plan_compiler, rules)

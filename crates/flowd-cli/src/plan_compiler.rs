@@ -31,7 +31,8 @@
 //! eagerly to back the `compiler_override` field on `plan_create`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use flowd_core::error::{FlowdError, Result};
@@ -42,8 +43,8 @@ use flowd_mcp::{
 };
 
 use crate::config::{
-    ClaudeCliConfig, ClaudeHttpConfig, CompilerSelection, LlmConfig, LlmProvider, MlxConfig,
-    RefineConfig,
+    ClaudeCliConfig, ClaudeHttpConfig, CompilerSelection, FlowdConfig, LlmConfig, LlmProvider,
+    MlxConfig, RefineConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -505,6 +506,192 @@ impl PlanCompiler for DaemonPlanCompiler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ProjectScopedPlanCompiler -- per-project config dispatch.
+// ---------------------------------------------------------------------------
+
+/// Wrap a default [`DaemonPlanCompiler`] with project-scoped dispatch.
+///
+/// On every prose-first compile call the daemon now consults
+/// `<project_root>/.flowd/flowd.toml` (via [`FlowdConfig::resolve`]) and
+/// builds a project-effective compiler the first time it sees that root,
+/// caching the result so subsequent calls in the same project are O(1).
+/// When the resolver returns a config that differs from the daemon's
+/// `default_inner`, the project's `[plan].compiler` and `[plan.llm]`
+/// settings drive the request -- not the daemon's `$FLOWD_HOME/flowd.toml`,
+/// which only feeds `default_inner` and is reserved for requests that
+/// arrive without a workspace hint.
+///
+/// The cache key is the *raw* project root the MCP layer handed us. The
+/// trusted resolver in `flowd-core::orchestration::resolve_workspace_root`
+/// already canonicalises symlinks and `..` segments, and the `flowd mcp`
+/// proxy injects a canonical path, so distinct keys correspond to
+/// distinct projects without us re-canonicalising here.
+///
+/// A project file that is present but malformed surfaces as an error on
+/// the first request that touches it -- matching `FlowdConfig::load`'s
+/// loud-validation policy. We do *not* cache failures: a follow-up edit
+/// that fixes the file lets the next call recover without restarting the
+/// daemon. Successful builds are cached for the daemon's lifetime; an
+/// operator who wants to reload an updated project config bounces the
+/// daemon (the same coarse policy `$FLOWD_HOME/flowd.toml` already has).
+pub struct ProjectScopedPlanCompiler {
+    /// Compiler used when no `project_root` is supplied. Built from
+    /// `$FLOWD_HOME/flowd.toml` at daemon startup, so legacy clients
+    /// that do not inject `project_root` keep their old behaviour.
+    default_inner: Arc<DaemonPlanCompiler>,
+    /// Per-project effective compilers, keyed by the project root the
+    /// handler passed in. `RwLock` rather than `Mutex` so concurrent
+    /// reads to already-warm projects don't serialise on the cold path.
+    cache: RwLock<HashMap<PathBuf, Arc<DaemonPlanCompiler>>>,
+}
+
+impl std::fmt::Debug for ProjectScopedPlanCompiler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // poisoned RwLock: surface as a sentinel for tracing.
+        let cached = self.cache.read().map_or(usize::MAX, |c| c.len());
+        f.debug_struct("ProjectScopedPlanCompiler")
+            .field("default_inner", &self.default_inner)
+            .field("cached_projects", &cached)
+            .finish()
+    }
+}
+
+impl ProjectScopedPlanCompiler {
+    /// Build a new project-scoped wrapper around `default_inner`.
+    #[must_use]
+    pub fn new(default_inner: Arc<DaemonPlanCompiler>) -> Self {
+        Self {
+            default_inner,
+            cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Number of projects the cache currently holds. Test-only knob.
+    #[cfg(test)]
+    fn cached_project_count(&self) -> usize {
+        self.cache
+            .read()
+            .expect("project compiler cache rwlock not poisoned")
+            .len()
+    }
+
+    /// Look up (or build) the compiler that should service requests for
+    /// `project_root`. Returns the cached default when no root is given.
+    fn compiler_for(&self, project_root: Option<&Path>) -> Result<Arc<DaemonPlanCompiler>> {
+        let Some(root) = project_root else {
+            return Ok(Arc::clone(&self.default_inner));
+        };
+
+        // Fast path: read-side cache hit. Held only across the lookup so
+        // a build below can take the write lock without contention.
+        if let Some(c) = self
+            .cache
+            .read()
+            .expect("project compiler cache rwlock not poisoned")
+            .get(root)
+        {
+            return Ok(Arc::clone(c));
+        }
+
+        // Resolve the project's effective config. `FlowdConfig::resolve`
+        // returns defaults when the project has no `.flowd/flowd.toml`,
+        // so the daemon's `$FLOWD_HOME/flowd.toml` is *not* layered in --
+        // matching the contract for project-scoped resolution.
+        let resolved = FlowdConfig::resolve(Some(root)).map_err(|e| {
+            FlowdError::Internal(format!(
+                "resolve project config at {}: {e:#}",
+                root.display()
+            ))
+        })?;
+        let inner = DaemonPlanCompiler::from_selection(resolved.plan.compiler, &resolved.plan.llm)?;
+        let inner = Arc::new(inner);
+
+        // Race-safe insert: another caller may have populated this key
+        // between our read-side miss and the write-side acquire. The
+        // `entry` API resolves both arms to a single `Arc` value.
+        let mut cache = self
+            .cache
+            .write()
+            .expect("project compiler cache rwlock not poisoned");
+        let entry = cache
+            .entry(root.to_path_buf())
+            .or_insert_with(|| Arc::clone(&inner));
+        Ok(Arc::clone(entry))
+    }
+}
+
+impl PlanCompiler for ProjectScopedPlanCompiler {
+    async fn compile_prose(&self, prose: String, project: String) -> Result<CompileOutput> {
+        // No project context => default. The handler always calls the
+        // `_in_project` variant in the daemon today; this arm exists for
+        // callers that hold the wrapper directly.
+        self.default_inner.compile_prose(prose, project).await
+    }
+
+    async fn apply_answers(
+        &self,
+        snapshot: PlanDraftSnapshot,
+        answers: Vec<(String, Answer)>,
+        defer_remaining: bool,
+    ) -> Result<CompileOutput> {
+        self.default_inner
+            .apply_answers(snapshot, answers, defer_remaining)
+            .await
+    }
+
+    async fn refine(&self, snapshot: PlanDraftSnapshot, feedback: String) -> Result<CompileOutput> {
+        self.default_inner.refine(snapshot, feedback).await
+    }
+
+    async fn compile_prose_with_override(
+        &self,
+        prose: String,
+        project: String,
+        compiler_override: Option<String>,
+    ) -> Result<CompileOutput> {
+        self.default_inner
+            .compile_prose_with_override(prose, project, compiler_override)
+            .await
+    }
+
+    async fn compile_prose_in_project(
+        &self,
+        prose: String,
+        project: String,
+        project_root: Option<String>,
+        compiler_override: Option<String>,
+    ) -> Result<CompileOutput> {
+        let inner = self.compiler_for(project_root.as_deref().map(Path::new))?;
+        inner
+            .compile_prose_with_override(prose, project, compiler_override)
+            .await
+    }
+
+    async fn apply_answers_in_project(
+        &self,
+        snapshot: PlanDraftSnapshot,
+        answers: Vec<(String, Answer)>,
+        defer_remaining: bool,
+        project_root: Option<String>,
+    ) -> Result<CompileOutput> {
+        let inner = self.compiler_for(project_root.as_deref().map(Path::new))?;
+        inner
+            .apply_answers(snapshot, answers, defer_remaining)
+            .await
+    }
+
+    async fn refine_in_project(
+        &self,
+        snapshot: PlanDraftSnapshot,
+        feedback: String,
+        project_root: Option<String>,
+    ) -> Result<CompileOutput> {
+        let inner = self.compiler_for(project_root.as_deref().map(Path::new))?;
+        inner.refine(snapshot, feedback).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +848,236 @@ mod tests {
             LlmProvider::Mlx
         );
         assert!(parse_provider_wire_name("openai").is_err());
+    }
+
+    // -------- ProjectScopedPlanCompiler -- per-project dispatch ---------
+    //
+    // The wrapper holds a Stub default and looks at
+    // `<project_root>/.flowd/flowd.toml` per request. We use the
+    // `Rejecting` compiler as the contrasting "project override" so a
+    // `compile_prose` call has a binary-distinguishable behaviour
+    // (Stub returns `definition.is_some()`, Rejecting errors with the
+    // documented "disabled" string) without needing to touch any LLM
+    // transports. Each test gets its own `tempfile::TempDir` so they
+    // run on parallel cargo workers without sharing state.
+    mod project_scoped {
+        use super::*;
+        use std::path::Path;
+
+        fn default_stub_compiler() -> Arc<DaemonPlanCompiler> {
+            Arc::new(
+                DaemonPlanCompiler::from_selection(CompilerSelection::Stub, &default_llm_cfg())
+                    .expect("stub compiler is infallible"),
+            )
+        }
+
+        fn write_project_config(root: &Path, body: &str) {
+            let dir = root.join(".flowd");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("flowd.toml"), body).unwrap();
+        }
+
+        #[tokio::test]
+        async fn no_project_root_falls_back_to_default_compiler() {
+            // Wrapping a Stub: `compile_prose_in_project(None, ...)` must
+            // route through the default and produce a valid DAG.
+            let wrap = ProjectScopedPlanCompiler::new(default_stub_compiler());
+            let out = wrap
+                .compile_prose_in_project(
+                    "## a [agent: echo]\nhi\n".into(),
+                    "proj".into(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(out.definition.is_some());
+            assert_eq!(wrap.cached_project_count(), 0);
+        }
+
+        #[tokio::test]
+        async fn project_without_flowd_toml_uses_resolver_defaults() {
+            // No `.flowd/flowd.toml` => FlowdConfig::resolve returns
+            // FlowdConfig::default(), which selects the Stub compiler.
+            // The wrapper must still build a project-effective compiler
+            // and cache it under the project root.
+            let project = tempfile::tempdir().unwrap();
+            let wrap = ProjectScopedPlanCompiler::new(default_stub_compiler());
+            let out = wrap
+                .compile_prose_in_project(
+                    "## a [agent: echo]\nhi\n".into(),
+                    "proj".into(),
+                    Some(project.path().to_string_lossy().into_owned()),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(out.definition.is_some());
+            assert_eq!(wrap.cached_project_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn project_flowd_toml_drives_compiler_selection() {
+            // The default (`$FLOWD_HOME` / wrapper default) is Stub --
+            // `compile_prose` succeeds. The project file flips the
+            // compiler to `rejecting`, which must error with the
+            // documented "disabled" message. If the wrapper ever falls
+            // back to `default_inner` it would silently succeed and
+            // hide the bug.
+            let project = tempfile::tempdir().unwrap();
+            write_project_config(project.path(), "[plan]\ncompiler = \"rejecting\"\n");
+
+            let wrap = ProjectScopedPlanCompiler::new(default_stub_compiler());
+            let err = wrap
+                .compile_prose_in_project(
+                    "anything".into(),
+                    "proj".into(),
+                    Some(project.path().to_string_lossy().into_owned()),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&err, FlowdError::PlanValidation(m) if m.contains("disabled")));
+        }
+
+        #[tokio::test]
+        async fn malformed_project_file_surfaces_loud_error() {
+            // A typo in the project's flowd.toml must not silently fall
+            // back to defaults: the operator's intent (override the
+            // compiler) is otherwise lost.
+            let project = tempfile::tempdir().unwrap();
+            write_project_config(project.path(), "[plan]\ncompiler = \"gpt\"\n");
+
+            let wrap = ProjectScopedPlanCompiler::new(default_stub_compiler());
+            let err = wrap
+                .compile_prose_in_project(
+                    "x".into(),
+                    "proj".into(),
+                    Some(project.path().to_string_lossy().into_owned()),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("not a known compiler"), "{msg}");
+        }
+
+        #[tokio::test]
+        async fn repeated_calls_for_same_project_share_cached_compiler() {
+            // The cache is keyed by the project root path; calls for the
+            // same root must not rebuild a compiler each time. Verifying
+            // count == 1 after two calls catches a cache miss.
+            let project = tempfile::tempdir().unwrap();
+            let wrap = ProjectScopedPlanCompiler::new(default_stub_compiler());
+            let root = project.path().to_string_lossy().into_owned();
+            for _ in 0..2 {
+                wrap.compile_prose_in_project(
+                    "## a [agent: echo]\nhi\n".into(),
+                    "proj".into(),
+                    Some(root.clone()),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(wrap.cached_project_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn distinct_project_roots_get_independent_compilers() {
+            // Two projects with different `.flowd/flowd.toml` selections
+            // must produce different per-call behaviour through the same
+            // wrapper. This is the core "project_root drives effective
+            // config" invariant.
+            let stub_proj = tempfile::tempdir().unwrap();
+            let reject_proj = tempfile::tempdir().unwrap();
+            // Leave stub_proj empty (resolver returns defaults => Stub).
+            write_project_config(reject_proj.path(), "[plan]\ncompiler = \"rejecting\"\n");
+
+            let wrap = ProjectScopedPlanCompiler::new(default_stub_compiler());
+
+            let stub_out = wrap
+                .compile_prose_in_project(
+                    "## a [agent: echo]\nhi\n".into(),
+                    "proj".into(),
+                    Some(stub_proj.path().to_string_lossy().into_owned()),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(stub_out.definition.is_some());
+
+            let reject_err = wrap
+                .compile_prose_in_project(
+                    "anything".into(),
+                    "proj".into(),
+                    Some(reject_proj.path().to_string_lossy().into_owned()),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&reject_err, FlowdError::PlanValidation(_)));
+            assert_eq!(wrap.cached_project_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn apply_answers_in_project_dispatches_through_project_config() {
+            // Refine / apply_answers must use the same project_root
+            // dispatch as compile_prose: a Draft plan persisted with
+            // project_root = <reject_proj> should error on its
+            // follow-up apply_answers call even though the wrapper's
+            // default is the permissive Stub.
+            let project = tempfile::tempdir().unwrap();
+            write_project_config(project.path(), "[plan]\ncompiler = \"rejecting\"\n");
+            let wrap = ProjectScopedPlanCompiler::new(default_stub_compiler());
+            let err = wrap
+                .apply_answers_in_project(
+                    snapshot(),
+                    Vec::new(),
+                    true,
+                    Some(project.path().to_string_lossy().into_owned()),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&err, FlowdError::PlanValidation(_)));
+        }
+
+        #[tokio::test]
+        async fn refine_in_project_dispatches_through_project_config() {
+            let project = tempfile::tempdir().unwrap();
+            write_project_config(project.path(), "[plan]\ncompiler = \"rejecting\"\n");
+            let wrap = ProjectScopedPlanCompiler::new(default_stub_compiler());
+            let err = wrap
+                .refine_in_project(
+                    snapshot(),
+                    "feedback".into(),
+                    Some(project.path().to_string_lossy().into_owned()),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&err, FlowdError::PlanValidation(_)));
+        }
+
+        #[tokio::test]
+        async fn non_project_methods_use_default_inner() {
+            // The plain `compile_prose` (without `_in_project`) is the
+            // path direct callers of the wrapper hit. It must always
+            // route through `default_inner` -- a subtle bug here would
+            // be the wrapper accidentally consulting some "current
+            // project" state, which the trait method has no way to know.
+            let project = tempfile::tempdir().unwrap();
+            write_project_config(project.path(), "[plan]\ncompiler = \"rejecting\"\n");
+
+            // The wrapper's default is Stub. Even with a hostile project
+            // file sitting on disk, `compile_prose` (non-project variant)
+            // must succeed -- it cannot see `project`.
+            let wrap = ProjectScopedPlanCompiler::new(default_stub_compiler());
+            let out = wrap
+                .compile_prose("## a [agent: echo]\nhi\n".into(), "proj".into())
+                .await
+                .unwrap();
+            assert!(out.definition.is_some());
+            assert_eq!(wrap.cached_project_count(), 0);
+        }
     }
 }
