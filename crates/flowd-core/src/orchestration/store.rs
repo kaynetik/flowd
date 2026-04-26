@@ -23,6 +23,11 @@ pub struct PlanSummary {
     pub created_at: DateTime<Utc>,
     /// Required project namespace (matches [`crate::orchestration::Plan::project`]).
     pub project: String,
+    /// Canonical execution root captured at plan creation, if known.
+    /// Mirrors [`crate::orchestration::Plan::project_root`]; legacy rows
+    /// surface as `None`.
+    #[serde(default)]
+    pub project_root: Option<String>,
 }
 
 /// Persists orchestration [`Plan`] snapshots so the daemon can rehydrate

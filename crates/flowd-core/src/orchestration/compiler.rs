@@ -104,6 +104,7 @@ fn plan_to_definition(plan: &Plan) -> PlanDefinition {
     PlanDefinition {
         name: plan.name.clone(),
         project: Some(plan.project.clone()),
+        project_root: plan.project_root.clone(),
         steps: plan
             .steps
             .iter()
@@ -355,6 +356,7 @@ mod tests {
         PlanDefinition {
             name: "p".into(),
             project: Some("proj".into()),
+            project_root: None,
             steps: vec![StepDefinition {
                 id: "a".into(),
                 agent_type: "echo".into(),

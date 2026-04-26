@@ -10,6 +10,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_003,
     MIGRATION_004,
     MIGRATION_005,
+    MIGRATION_006,
 ];
 
 const MIGRATION_001: &str = r"
@@ -181,6 +182,21 @@ ALTER TABLE plans ADD COLUMN source_doc TEXT;
 ALTER TABLE plans ADD COLUMN open_questions_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE plans ADD COLUMN decisions_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE plans ADD COLUMN definition_dirty INTEGER NOT NULL DEFAULT 0;
+";
+
+// Plan-level execution root. Distinct from `project` (the namespace
+// label, which stays NOT NULL with the '__legacy__' default from
+// MIGRATION_003): `project_root` holds the canonical filesystem path
+// the plan was submitted from, captured at plan creation time so
+// resume / list / show paths know where the plan was meant to run
+// even when the daemon's CWD has since drifted.
+//
+// Nullable because pre-MIGRATION_006 rows have no value to recover
+// (the field didn't exist before this migration); the load path
+// preserves NULL as `Plan::project_root = None` and downstream
+// callers fall back to per-call discovery.
+const MIGRATION_006: &str = r"
+ALTER TABLE plans ADD COLUMN project_root TEXT;
 ";
 
 /// Run all pending migrations.

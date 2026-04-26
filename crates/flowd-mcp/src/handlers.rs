@@ -46,7 +46,7 @@ use flowd_core::memory::{EmbeddingProvider, MemoryBackend, VectorIndex};
 use flowd_core::orchestration::observer::{PlanEvent, SharedPlanObserver};
 use flowd_core::orchestration::{
     Answer, Plan, PlanCompiler, PlanDraftSnapshot, PlanExecutor, PlanStatus, PlanSummary,
-    loader::PlanDefinition,
+    loader::PlanDefinition, resolve_workspace_root,
 };
 use flowd_core::rules::{ProposedAction, RuleEvaluator};
 use flowd_core::types::SearchQuery;
@@ -576,11 +576,17 @@ where
                             .into(),
                     ));
                 }
-                self.plan_create_definition(p.project, definition).await
+                self.plan_create_definition(p.project, definition, p.project_root.as_deref())
+                    .await
             }
             (None, Some(prose)) => {
-                self.plan_create_prose(p.project, prose, p.compiler_override)
-                    .await
+                self.plan_create_prose(
+                    p.project,
+                    prose,
+                    p.compiler_override,
+                    p.project_root.as_deref(),
+                )
+                .await
             }
         }
     }
@@ -887,13 +893,30 @@ where
     R: RuleEvaluator + 'static,
 {
     /// Legacy DAG-first path: caller hands us a structured `PlanDefinition`.
-    async fn plan_create_definition(&self, project: String, definition: Value) -> Result<Value> {
+    ///
+    /// `client_root_hint` is the optional `project_root` field from
+    /// [`PlanCreateParams`]: typically the workspace path the MCP
+    /// client (or `flowd mcp` proxy) was launched in. The resolution
+    /// chain (hint -> `FLOWD_WORKSPACE_ROOT` -> daemon cwd) lives in
+    /// [`resolve_workspace_root`]; an explicit `project_root` embedded
+    /// in the on-disk `definition` always wins because operators
+    /// authoring a plan file are expected to know what they wrote.
+    async fn plan_create_definition(
+        &self,
+        project: String,
+        definition: Value,
+        client_root_hint: Option<&str>,
+    ) -> Result<Value> {
         let def: PlanDefinition = serde_json::from_value(definition)
             .map_err(|e| FlowdError::PlanValidation(format!("invalid PlanDefinition: {e}")))?;
         // Top-level `project` is authoritative: it overrides any value the
         // caller embedded in the definition payload, so the trusted handler
         // is the single source of truth for project scoping.
-        let plan = def.into_plan_with_project(project);
+        let project_root = match def.project_root.clone() {
+            Some(explicit) => Some(explicit),
+            None => Some(resolve_workspace_root(client_root_hint)?.0),
+        };
+        let plan = def.into_plan_with_project_and_root(project, project_root);
         let preview = self.executor.preview(&plan)?;
         let plan_id = self.executor.submit(plan).await?;
         Ok(json!({
@@ -916,12 +939,18 @@ where
         project: String,
         prose: String,
         compiler_override: Option<String>,
+        client_root_hint: Option<&str>,
     ) -> Result<Value> {
         if prose.trim().is_empty() {
             return Err(FlowdError::PlanValidation(
                 "plan_create: `prose` must be a non-empty string".into(),
             ));
         }
+        // Resolve the workspace root *before* invoking the compiler so a
+        // missing/garbage workspace fails fast and we don't burn an LLM
+        // round on a plan that will never persist a useful project_root.
+        let (resolved_root, _src) = resolve_workspace_root(client_root_hint)?;
+
         let derived_name = derive_plan_name(&prose);
         let output = self
             .compiler
@@ -933,8 +962,12 @@ where
         // apply_compile_output for symmetry: that way the only place
         // PlanDefinition -> PlanStep conversion happens is in
         // Plan::apply_compile_output, and source_doc / open_questions /
-        // decisions live in exactly one update path.
-        let mut plan = Plan::new(derived_name, project.clone(), Vec::new());
+        // decisions live in exactly one update path. The execution root
+        // captured above is stamped onto the Draft now so resume / list
+        // / show paths can reach the original workspace even after the
+        // daemon's CWD drifts.
+        let mut plan =
+            Plan::new(derived_name, project.clone(), Vec::new()).with_project_root(resolved_root);
         let new_question_ids: Vec<String> =
             output.open_questions.iter().map(|q| q.id.clone()).collect();
         let new_decision_ids: Vec<String> = output

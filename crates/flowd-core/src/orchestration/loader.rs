@@ -48,6 +48,13 @@ pub struct PlanDefinition {
     /// it to be present at materialisation time.
     #[serde(default)]
     pub project: Option<String>,
+    /// Optional execution root override. When omitted the materialised
+    /// [`Plan::project_root`] is left unset so the trusted handler can
+    /// inject the canonical workspace path via
+    /// [`Self::into_plan_with_project_and_root`] /
+    /// [`super::Plan::with_project_root`].
+    #[serde(default)]
+    pub project_root: Option<String>,
     pub steps: Vec<StepDefinition>,
 }
 
@@ -85,9 +92,37 @@ impl PlanDefinition {
     /// Materialise the authored definition with an externally-supplied
     /// project. Any `project` field embedded in the definition is
     /// overridden by the explicit argument so the call site (typically a
-    /// trusted handler) is the source of truth.
+    /// trusted handler) is the source of truth. The execution root, if
+    /// any, is taken from the definition itself; use
+    /// [`Self::into_plan_with_project_and_root`] to override both.
     #[must_use]
     pub fn into_plan_with_project(self, project: impl Into<String>) -> Plan {
+        let project_root = self.project_root.clone();
+        let plan = self.into_plan_inner(project);
+        match project_root {
+            Some(root) => plan.with_project_root(root),
+            None => plan,
+        }
+    }
+
+    /// Materialise with both `project` and `project_root` overridden by
+    /// the call site. Used by trusted handlers (MCP `plan_create`, the
+    /// CLI plan loader) that have already resolved the canonical
+    /// workspace path and don't want to trust the on-disk shape.
+    #[must_use]
+    pub fn into_plan_with_project_and_root(
+        self,
+        project: impl Into<String>,
+        project_root: Option<String>,
+    ) -> Plan {
+        let plan = self.into_plan_inner(project);
+        match project_root {
+            Some(root) => plan.with_project_root(root),
+            None => plan,
+        }
+    }
+
+    fn into_plan_inner(self, project: impl Into<String>) -> Plan {
         let steps = self
             .steps
             .into_iter()
@@ -223,6 +258,7 @@ steps:
         let def = PlanDefinition {
             name: "p".into(),
             project: Some("demo".into()),
+            project_root: None,
             steps: vec![StepDefinition {
                 id: "a".into(),
                 agent_type: "echo".into(),
@@ -243,6 +279,7 @@ steps:
         let def = PlanDefinition {
             name: "p".into(),
             project: None,
+            project_root: None,
             steps: vec![StepDefinition {
                 id: "a".into(),
                 agent_type: "echo".into(),
@@ -261,6 +298,7 @@ steps:
         let def = PlanDefinition {
             name: "p".into(),
             project: Some("ignored".into()),
+            project_root: None,
             steps: vec![StepDefinition {
                 id: "a".into(),
                 agent_type: "echo".into(),

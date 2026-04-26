@@ -196,6 +196,7 @@ fn echo_def(name: &str) -> flowd_core::orchestration::loader::PlanDefinition {
     flowd_core::orchestration::loader::PlanDefinition {
         name: name.into(),
         project: Some("rnd".into()),
+        project_root: None,
         steps: vec![StepDefinition {
             id: "a".into(),
             agent_type: "echo".into(),
@@ -224,6 +225,7 @@ async fn plan_create_with_definition_keeps_legacy_behaviour() {
             })),
             prose: None,
             compiler_override: None,
+            project_root: None,
         })
         .await
         .expect("plan_create with definition succeeds");
@@ -241,6 +243,7 @@ async fn plan_create_rejects_both_definition_and_prose() {
             definition: Some(json!({"name": "x", "steps": []})),
             prose: Some("do a thing".into()),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .unwrap_err();
@@ -264,6 +267,7 @@ async fn plan_create_rejects_compiler_override_on_definition_path() {
             })),
             prose: None,
             compiler_override: Some("claude-cli".into()),
+            project_root: None,
         })
         .await
         .unwrap_err();
@@ -286,6 +290,7 @@ async fn plan_create_with_compiler_override_on_prose_routes_through_default_comp
             definition: None,
             prose: Some("# Title".into()),
             compiler_override: Some("mlx".into()),
+            project_root: None,
         })
         .await
         .expect("override is no-op for single-backend compilers");
@@ -303,6 +308,7 @@ async fn plan_create_rejects_when_neither_definition_nor_prose_provided() {
             definition: None,
             prose: None,
             compiler_override: None,
+            project_root: None,
         })
         .await
         .unwrap_err();
@@ -337,6 +343,7 @@ async fn prose_loop_runs_create_answer_confirm_and_emits_events() {
             definition: None,
             prose: Some("# Refactor auth\nMake it secure.".into()),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .expect("plan_create(prose)");
@@ -437,6 +444,7 @@ async fn plan_refine_emits_refinement_applied_and_clarification_deltas() {
             definition: None,
             prose: Some("seed".into()),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .unwrap();
@@ -471,6 +479,71 @@ async fn plan_refine_emits_refinement_applied_and_clarification_deltas() {
     // RefinementApplied must come before the ClarificationOpened it
     // produced so audit consumers can correlate trigger -> effect.
     assert_eq!(ev_kinds, vec!["refinement_applied", "clarification_opened"]);
+}
+
+#[tokio::test]
+async fn plan_refine_preserves_authored_timeout_secs_per_step() {
+    // Regression: a refined plan must keep the per-step `timeout_secs`
+    // the operator authored on the prior round. Before the fix the
+    // structured-markdown stub (and an LLM compiler that re-renders the
+    // plan without the field) emitted `None`, silently dropping the
+    // step back to the daemon-wide default. Here the second compile
+    // output mimics that behaviour and we assert the prior deadline
+    // survives.
+    let mut authored = echo_def("with-timeout");
+    authored.steps[0].timeout_secs = Some(120);
+
+    let mut refined = echo_def("with-timeout");
+    refined.steps[0].timeout_secs = None; // compiler dropped it on refine
+
+    let h = build_harness(vec![
+        CompileOutput::ready("# round-zero", authored),
+        CompileOutput::ready("# refined", refined),
+    ]);
+
+    let created = h
+        .handlers
+        .plan_create(PlanCreateParams {
+            project: "rnd".into(),
+            definition: None,
+            prose: Some("seed".into()),
+            compiler_override: None,
+            project_root: None,
+        })
+        .await
+        .unwrap();
+    let plan_id = created["plan_id"].as_str().unwrap().to_owned();
+
+    let status_before = h
+        .handlers
+        .plan_status(PlanStatusParams {
+            plan_id: plan_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        status_before["steps"][0]["timeout_secs"], 120,
+        "first compile records the authored deadline"
+    );
+
+    h.handlers
+        .plan_refine(PlanRefineParams {
+            plan_id: plan_id.clone(),
+            feedback: "tighten failure path".into(),
+        })
+        .await
+        .expect("plan_refine");
+
+    let status_after = h
+        .handlers
+        .plan_status(PlanStatusParams { plan_id })
+        .await
+        .unwrap();
+    assert_eq!(
+        status_after["steps"][0]["timeout_secs"], 120,
+        "refined plan keeps per-step timeout_secs rather than \
+         falling back to the daemon default"
+    );
 }
 
 #[tokio::test]
@@ -511,6 +584,7 @@ async fn plan_answer_overwriting_a_decision_invalidates_dependent_chain() {
             definition: None,
             prose: Some("# Title".into()),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .unwrap();
@@ -573,6 +647,7 @@ async fn plan_cancel_terminates_a_draft_plan_idempotently() {
             definition: None,
             prose: Some("anything".into()),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .unwrap();
@@ -613,6 +688,7 @@ async fn plan_refine_sets_clarification_reopened_flag_when_introducing_questions
             definition: None,
             prose: Some("seed".into()),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .unwrap();
@@ -646,6 +722,7 @@ async fn plan_refine_clarification_reopened_is_false_when_dag_compiled_cleanly()
             definition: None,
             prose: Some("seed".into()),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .unwrap();
@@ -700,6 +777,7 @@ async fn plan_answer_emits_budget_exceeded_warning_when_load_overflows() {
             definition: None,
             prose: Some("anything".into()),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .unwrap();
@@ -769,6 +847,7 @@ async fn no_warnings_emitted_when_budget_is_unset() {
             definition: None,
             prose: Some("anything".into()),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .unwrap();

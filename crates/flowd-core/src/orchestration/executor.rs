@@ -986,6 +986,7 @@ mod tests {
                         status: p.status,
                         created_at: p.created_at,
                         project: p.project.clone(),
+                        project_root: p.project_root.clone(),
                     })
                     .collect();
                 out.sort_by_key(|s| std::cmp::Reverse(s.created_at));
@@ -1658,6 +1659,7 @@ mod tests {
         PlanDefinition {
             name: "p".into(),
             project: Some("proj".into()),
+            project_root: None,
             steps: vec![StepDefinition {
                 id: id.into(),
                 agent_type: "echo".into(),

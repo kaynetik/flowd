@@ -84,6 +84,18 @@ pub struct PlanCreateParams {
     /// has a stable compiler identity for its whole lifetime.
     #[serde(default)]
     pub compiler_override: Option<String>,
+    /// Workspace root hint forwarded by the MCP client (or the
+    /// `flowd mcp` proxy speaking on its behalf). The handler routes
+    /// this through
+    /// [`flowd_core::orchestration::resolve_workspace_root`] so the
+    /// resulting [`flowd_core::orchestration::Plan::project_root`]
+    /// reflects the *invoking* workspace, not the daemon process's
+    /// `current_dir()`. The resolver still falls through to
+    /// `FLOWD_WORKSPACE_ROOT` and the daemon's cwd when the field is
+    /// absent or doesn't resolve to a git-tracked directory, so older
+    /// clients keep working unchanged.
+    #[serde(default)]
+    pub project_root: Option<String>,
 }
 
 /// Parameters for `plan_answer`: the user submits answers to one or more
@@ -340,6 +352,14 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
                                         named provider must also be configured in flowd.toml. Follow-up \
                                         plan_answer / plan_refine calls ignore this field and use the \
                                         daemon's configured primary / refine tiers."
+                    },
+                    "project_root": {
+                        "type": "string",
+                        "description": "Absolute path to the invoking workspace; the daemon canonicalises it, \
+                                        verifies a `.git` ancestor, and stores it as the plan's project_root. \
+                                        Optional: when omitted the daemon falls back to FLOWD_WORKSPACE_ROOT, \
+                                        then its own current_dir(). The flowd `mcp` proxy populates this \
+                                        automatically from the workspace it was launched in."
                     }
                 },
                 "oneOf": [

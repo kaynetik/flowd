@@ -54,6 +54,16 @@ Restart Cursor. The agent's tools panel should list: `memory_store`, `memory_sea
 
 Cursor does not expose session hooks, so observation recording happens exclusively through `memory_store` calls the agent makes during a task.
 
+## Workspace inference
+
+Both integrations rely on the same mechanism to tell the daemon *which* repository a `plan_create` call is targeting:
+
+- The IDE spawns `flowd mcp` (the stdio-to-socket proxy) inside the workspace it has open. The proxy probes its own cwd, and if it sits inside a git checkout, splices that path into outbound `plan_create` requests as `project_root`. The daemon -- whose cwd is wherever `flowd start` was launched -- then canonicalises and verifies it.
+- If the proxy can't infer a workspace (cwd is not in a git repo, or `flowd mcp` is launched outside the IDE), it forwards the request unchanged and the daemon falls back to `FLOWD_WORKSPACE_ROOT` and finally its own cwd.
+- Set `FLOWD_WORKSPACE_ROOT` on either the proxy process *or* the daemon when neither cwd is the right answer (e.g. running `flowd start` under systemd, or wiring a non-IDE MCP client).
+
+`project` (the namespace label used by rules and `flowd history`) is *not* the same as `project_root` (the absolute filesystem path agents run against). The README's [Workspace and project scoping](../README.md#workspace-and-project-scoping) section is the canonical reference for resolution order, the wrong-repo guard, and the recovery rule for plans rooted in the wrong repository.
+
 ## Verifying
 
 After setup:

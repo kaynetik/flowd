@@ -45,6 +45,13 @@ fn storage_err(e: impl std::fmt::Display) -> FlowdError {
     FlowdError::Storage(e.to_string())
 }
 
+/// Positional row tuple returned by [`SqlitePlanStore::load_plan`]'s
+/// `SELECT`: (`definition` JSON, `source_doc`, `open_questions` JSON,
+/// `decisions` JSON, `definition_dirty` flag, `project_root`). Aliased
+/// to keep clippy's `type_complexity` lint happy now that the row
+/// carries six distinct values across two nullable columns.
+type LoadPlanRow = (String, Option<String>, String, String, i64, Option<String>);
+
 impl PlanStore for SqlitePlanStore {
     fn save_plan(&self, plan: &Plan) -> impl std::future::Future<Output = Result<()>> + Send {
         let conn = Arc::clone(&self.conn);
@@ -85,8 +92,9 @@ impl PlanStore for SqlitePlanStore {
                 tx.execute(
                     "INSERT OR REPLACE INTO plans (
                         id, name, status, definition, created_at, started_at, completed_at, project,
-                        source_doc, open_questions_json, decisions_json, definition_dirty
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        source_doc, open_questions_json, decisions_json, definition_dirty,
+                        project_root
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     rusqlite::params![
                         &id,
                         &plan.name,
@@ -100,6 +108,7 @@ impl PlanStore for SqlitePlanStore {
                         &open_questions_json,
                         &decisions_json,
                         i64::from(plan.definition_dirty),
+                        plan.project_root.as_deref(),
                     ],
                 )
                 .map_err(storage_err)?;
@@ -148,7 +157,7 @@ impl PlanStore for SqlitePlanStore {
                     .map_err(|e| FlowdError::Storage(e.to_string()))?;
                 let mut stmt = conn
                     .prepare(
-                        "SELECT definition, source_doc, open_questions_json, decisions_json, definition_dirty
+                        "SELECT definition, source_doc, open_questions_json, decisions_json, definition_dirty, project_root
                          FROM plans WHERE id = ?1",
                     )
                     .map_err(storage_err)?;
@@ -156,36 +165,48 @@ impl PlanStore for SqlitePlanStore {
                 // statement-vs-item ordering quiet for clippy). Legacy
                 // DBs (post-migration but pre-Phase-4 binary writes)
                 // still load because the columns have SQL defaults so
-                // every read is well-typed.
-                let row: Option<(String, Option<String>, String, String, i64)> = stmt
-                    .query_row([&id_str], |row| {
+                // every read is well-typed. `project_root` is nullable
+                // (added in MIGRATION_006); rows written before that
+                // surface here as `None` and the caller treats it as
+                // the legacy "fall back to per-call discovery" case.
+                let row: Option<LoadPlanRow> =
+                    stmt.query_row([&id_str], |row| {
                         Ok((
                             row.get(0)?,
                             row.get(1)?,
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get(5)?,
                         ))
                     })
                     .optional()
                     .map_err(storage_err)?;
-                let Some((json, source_doc, open_questions_json, decisions_json, dirty)) = row
+                let Some((
+                    json,
+                    source_doc,
+                    open_questions_json,
+                    decisions_json,
+                    dirty,
+                    project_root,
+                )) = row
                 else {
                     return Ok(None);
                 };
 
                 // Base from the JSON blob (gives us steps, status,
-                // timestamps, project, etc.). The four clarification
-                // fields are then overlaid from their dedicated columns
-                // so the columns are the canonical source of truth even
-                // when the blob is stale (e.g. written by an older
-                // binary).
+                // timestamps, project, etc.). The clarification fields
+                // and `project_root` are then overlaid from their
+                // dedicated columns so the columns are the canonical
+                // source of truth even when the blob is stale (e.g.
+                // written by an older binary).
                 let mut plan: Plan = serde_json::from_str(&json)
                     .map_err(|e| FlowdError::Serialization(e.to_string()))?;
                 plan.source_doc = source_doc;
                 plan.open_questions = parse_open_questions(&open_questions_json, plan.id)?;
                 plan.decisions = parse_decisions(&decisions_json, plan.id)?;
                 plan.definition_dirty = dirty != 0;
+                plan.project_root = project_root;
 
                 Ok(Some(plan))
             })
@@ -211,7 +232,7 @@ impl PlanStore for SqlitePlanStore {
                 if let Some(ref p) = project {
                     let mut stmt = conn
                         .prepare(
-                            "SELECT id, name, status, created_at, project
+                            "SELECT id, name, status, created_at, project, project_root
                              FROM plans WHERE project = ?1
                              ORDER BY created_at DESC",
                         )
@@ -225,7 +246,7 @@ impl PlanStore for SqlitePlanStore {
                 } else {
                     let mut stmt = conn
                         .prepare(
-                            "SELECT id, name, status, created_at, project
+                            "SELECT id, name, status, created_at, project, project_root
                              FROM plans ORDER BY created_at DESC",
                         )
                         .map_err(storage_err)?;
@@ -272,6 +293,9 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanSummary> {
     // After migration 003 the column is NOT NULL; legacy rows backfilled
     // to '__legacy__'. Read as String directly.
     let project: String = row.get(4)?;
+    // `project_root` is nullable (introduced in MIGRATION_006); rows
+    // persisted before this column existed surface as `None`.
+    let project_root: Option<String> = row.get(5)?;
 
     Ok(PlanSummary {
         id: Uuid::parse_str(&id_str).unwrap_or_default(),
@@ -288,6 +312,7 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanSummary> {
         created_at: DateTime::parse_from_rfc3339(&created_str)
             .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc)),
         project,
+        project_root,
     })
 }
 
@@ -498,5 +523,87 @@ mod tests {
         assert_eq!(loaded.decisions.len(), 1);
         assert_eq!(loaded.decisions[0].question_id, "col-q");
         assert!(loaded.definition_dirty);
+    }
+
+    /// New plans persist their execution root and round-trip through
+    /// the dedicated column so resume / list / show paths see the same
+    /// path the daemon captured at submission.
+    #[tokio::test]
+    async fn save_and_load_round_trip_preserves_project_root() {
+        let store = store();
+        let plan = Plan::new("p", "proj", vec![step("a")]).with_project_root("/repos/flowd");
+        let id = plan.id;
+
+        store.save_plan(&plan).await.unwrap();
+        let loaded = store.load_plan(id).await.unwrap().expect("load");
+
+        assert_eq!(loaded.project_root.as_deref(), Some("/repos/flowd"));
+        // The namespace label and execution root are independent, so a
+        // round-trip must not collapse them into one field.
+        assert_eq!(loaded.project, "proj");
+    }
+
+    /// A row written before `project_root` existed (or by an older
+    /// binary that never wrote the column) must still load cleanly,
+    /// surfacing `None` as the documented legacy fallback.
+    #[tokio::test]
+    async fn load_falls_back_to_none_for_legacy_row_without_project_root() {
+        let store = store();
+        let plan = Plan::new("p", "proj", vec![step("a")]);
+        let id = plan.id;
+
+        // Hand-craft a "legacy" definition blob without the field, then
+        // INSERT directly so the `project_root` column stays NULL --
+        // mirroring a row that was written before MIGRATION_006 ran.
+        let mut json = serde_json::to_value(&plan).unwrap();
+        json.as_object_mut().unwrap().remove("project_root");
+        let legacy_blob = serde_json::to_string(&json).unwrap();
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO plans (id, name, status, definition, created_at, project)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    &id.to_string(),
+                    &plan.name,
+                    plan_status_str(plan.status),
+                    &legacy_blob,
+                    plan.created_at.to_rfc3339(),
+                    &plan.project,
+                ],
+            )
+            .unwrap();
+
+        let loaded = store.load_plan(id).await.unwrap().expect("load");
+        assert!(
+            loaded.project_root.is_none(),
+            "legacy row must surface project_root = None"
+        );
+        assert_eq!(loaded.project, "proj");
+    }
+
+    /// `list_plans` must surface `project_root` per row -- consumers
+    /// (CLI list, MCP `plan_list`) will eventually want to render it
+    /// alongside the project label, and the column has to be on the
+    /// summary path before that's safe to do.
+    #[tokio::test]
+    async fn list_plans_includes_project_root_in_summary() {
+        let store = store();
+        let mut alpha = Plan::new("a", "proj", vec![step("a")]).with_project_root("/repos/alpha");
+        let beta = Plan::new("b", "proj", vec![step("a")]).with_project_root("/repos/beta");
+        // Make ordering deterministic: alpha was created earlier.
+        alpha.created_at = beta.created_at - chrono::Duration::seconds(1);
+
+        store.save_plan(&alpha).await.unwrap();
+        store.save_plan(&beta).await.unwrap();
+
+        let summaries = store.list_plans(Some("proj")).await.unwrap();
+        assert_eq!(summaries.len(), 2);
+        // ORDER BY created_at DESC -> beta first.
+        assert_eq!(summaries[0].project_root.as_deref(), Some("/repos/beta"));
+        assert_eq!(summaries[1].project_root.as_deref(), Some("/repos/alpha"));
     }
 }

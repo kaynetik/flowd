@@ -11,6 +11,7 @@ Local-first memory, orchestration, and rules engine for AI coding agents. Expose
   - [1. Check status](#1-check-status)
   - [2. Wire your agent](#2-wire-your-agent)
   - [3. Use the agent](#3-use-the-agent)
+    - [Workspace and project scoping](#workspace-and-project-scoping)
   - [4. Observe out-of-band](#4-observe-out-of-band)
   - [5. Inspect](#5-inspect)
   - [6. Shut down](#6-shut-down)
@@ -121,7 +122,7 @@ Reports the flowd home layout, daemon liveness, and row counts per memory tier. 
 - **Cursor.** Run `flowd init cursor --global` (writes `~/.cursor/mcp.json`) or `flowd init cursor --project <path>` (writes `<path>/.cursor/mcp.json`). The command deep-merges the canonical server stanza into any existing file and pins the `command` to the absolute path of the running `flowd` binary; rerunning is a no-op. `integrations/cursor/mcp.json` is kept as a reference snapshot for manual merges.
 - **Claude Code.** Merge `integrations/claude-code/settings.json` into `~/.claude/settings.json` (deep-merge `mcpServers` and `hooks` so your existing keys survive). Hooks are now bare `flowd hook session-start`, `flowd hook post-tool-use`, `flowd hook session-end` commands -- no `/ABSOLUTE/PATH` substitution, no shell scripts to source. Assumes the `flowd` binary is on `$PATH`.
 
-Run the daemon before starting Cursor or Claude Code. Clients should launch `flowd mcp`, which bridges their stdio MCP session to the daemon's local socket at `$FLOWD_HOME/flowd.sock`.
+Run the daemon before starting Cursor or Claude Code. Clients should launch `flowd mcp`, which bridges their stdio MCP session to the daemon's local socket at `$FLOWD_HOME/flowd.sock`. The proxy is spawned *by the IDE inside the workspace it has open*, so it also stamps the invoking workspace onto outbound `plan_create` requests as `project_root` -- see [Workspace and project scoping](#workspace-and-project-scoping) for how that signal is resolved and verified.
 
 For local macOS use, keep it as a background process next to Qdrant:
 
@@ -154,7 +155,7 @@ The agent now has fifteen MCP tools. Inside a Claude Code or Cursor session:
 | `plan_confirm`   | To advance a plan from draft to running after human review.                       |
 | `plan_cancel`    | To abandon a draft, confirmed, or running plan.                                   |
 | `plan_status`    | To poll execution progress.                                                       |
-| `plan_resume`    | To reset failed or interrupted steps and re-execute from the failure boundary.    |
+| `plan_resume`    | To reset failed or interrupted steps and re-execute from the failure boundary. Not for fixing a plan rooted in the wrong repo -- see [Recovery rule](#recovery-rule-abandon-do-not-resume). |
 | `plan_list`      | To list persisted plan summaries.                                                 |
 | `plan_show`      | To inspect one persisted plan snapshot.                                           |
 | `plan_recent`    | To recover recent plan ids after restarting an agent client.                      |
@@ -162,6 +163,45 @@ The agent now has fifteen MCP tools. Inside a Claude Code or Cursor session:
 | `rules_list`     | To enumerate rules active for the current project or file scope.                  |
 
 Rules are YAML files under `~/.flowd/rules/` (global) and `<repo>/.flowd/rules/` (project). See `flowd-core/src/rules/loader.rs` for the schema. To inspect what the daemon loaded, run `flowd rules list -p <project>` (or `-f <file>`). Bare `flowd rules list` evaluates against an empty scope and returns no matches even when rules are loaded.
+
+#### Workspace and project scoping
+
+`project` and `project_root` are not the same thing and are not interchangeable:
+
+- `project` is the **namespace label** -- a free-form string (typically a short repo id) that scopes rules, observations, and `flowd history` / `flowd search` filters. Plans, rules, and memory rows all key off it.
+- `project_root` is the **execution root** -- the absolute, canonical filesystem path the plan runs against. It is what the spawner uses for the agent's cwd on sequential steps and as the `git -C` target for worktree creation on parallel steps.
+
+The daemon does not assume the two are coupled: the same `project` can legitimately host plans rooted at different worktrees, and a single repo can serve plans under different `project` labels.
+
+##### Resolution order
+
+The daemon never picks `project_root` from its own `current_dir()` if any better signal is available. `flowd_core::orchestration::resolve_workspace_root` walks these candidates, highest priority first, and stops at the first that resolves *and* lives inside a git checkout:
+
+1. **MCP client hint.** `plan_create` accepts an optional `project_root` argument. The `flowd mcp` proxy populates this automatically from the workspace the IDE spawned it in, so Cursor and Claude Code do not need any per-project configuration. Hand-written clients can pass it explicitly.
+2. **`FLOWD_WORKSPACE_ROOT` env var.** Set this on the resolving process (the daemon, the proxy, or a shell that launches a custom client) when neither the IDE nor the cwd can supply the right path -- e.g. when running `flowd start` under systemd.
+3. **Process `current_dir()`.** Last resort. Meaningful only when the daemon was launched from inside the workspace it is expected to serve (typical in single-user setups).
+
+Each candidate is canonicalised (symlinks and `..` resolved) and then verified by walking it and its parents looking for a `.git` entry -- directory, file (worktrees, submodules), or bare-repo subdir. Candidates that don't resolve, or resolve to a non-git directory, are skipped with a reason recorded; if every candidate fails, `plan_create` returns a `PlanValidation` error enumerating each rejected candidate so the operator can tell at a glance whether to set `FLOWD_WORKSPACE_ROOT`, fix the proxy, or run `git init` in the workspace.
+
+An explicit `project_root` field on a `PlanDefinition` (the legacy DAG-first authoring path) always wins over all three signals: an operator who hand-wrote that path is presumed to know what they meant.
+
+##### Wrong-repo guard
+
+Before any agent runs, the git-worktree spawner verifies the resolved `project_root` actually identifies the repo it claims to:
+
+- `git -C <project_root> rev-parse --show-toplevel` must return `<project_root>` itself. This rejects a path that points inside a *different* repo (for example, a nested submodule or a sibling checkout reachable through a symlink) before any worktree is created.
+- For parallel plans, immediately after `git worktree add` the spawner reads `git --git-common-dir` from the freshly created worktree and compares it to the common dir of `project_root`. A mismatch -- which can happen when `git worktree add` succeeds against a stale linked worktree, a symlinked path, or a nested checkout -- removes the worktree and aborts the step before the agent prompt is dispatched.
+- A clean tree is also enforced: parallel plans refuse to start when `git status --porcelain` against `project_root` is non-empty. The spawner does not stash; commit or discard first.
+
+In every wrong-repo case the operator gets a structured `PlanExecution` error naming both the configured `project_root` and what `git` actually resolved, instead of a silently mis-rooted plan whose worktrees, branches, and observations all anchor in the wrong tree.
+
+##### Recovery rule: abandon, do not resume
+
+`plan_resume` is intentionally narrow: it resets `Failed` (or `Interrupted`) **steps** back to `Pending` and re-drives execution from the failure boundary. It does not revisit steps that are already marked `Completed`.
+
+That makes resume the wrong tool when an *upstream foundation step was incorrectly marked complete* against the wrong repo -- typically the case where a pre-guard plan was created before `project_root` was being captured, or where the operator confirmed a plan whose hint pointed at a sibling checkout. The downstream guard will catch it on the next failing step, but the completed steps above the failure are recorded as having succeeded against the wrong tree, and `plan_resume` will trust them.
+
+When this happens, **abandon the plan with `plan_cancel` and re-create it from the correct workspace.** Do not `plan_resume`: the corrupted "completed" steps will not be re-executed and the new agent runs will keep building on artefacts that never existed in the right repo. `flowd plan events <plan_id>` is the audit trail; the cancelled plan stays queryable for forensics. Resume is for transient failures (a flaky agent, a network blip, a daemon restart mid-flight), not for retroactively correcting where a plan was rooted.
 
 #### Prose-first planning
 
@@ -309,6 +349,8 @@ Sends `SIGTERM` to the PID in `$FLOWD_HOME/flowd.pid` and cleans the file. Stale
 ## Recommendations
 
 - **Pin `$FLOWD_HOME` per machine, not per project.** Memory is cross-project by design; the `project` field discriminates scope.
+- **Treat `project` and `project_root` as separate decisions.** `project` is the namespace label; `project_root` is the absolute path the spawner will run agents against. The IDE-side `flowd mcp` proxy fills `project_root` automatically; for non-IDE clients (custom scripts, `flowd start` under systemd) set `FLOWD_WORKSPACE_ROOT` rather than relying on the daemon's cwd. See [Workspace and project scoping](#workspace-and-project-scoping).
+- **Abandon, do not resume, plans rooted in the wrong repo.** When the wrong-repo guard catches a divergence on a downstream step, any upstream steps already marked `Completed` ran against the wrong tree. `plan_resume` will not re-run them. Cancel the plan and re-create it from the correct workspace.
 - **Keep rules at project scope unless they must apply globally.** Project-local rules live under `<repo>/.flowd/rules/` and load automatically when the agent's `cwd` is inside the repo.
 - **Run Qdrant under the same user account that runs `flowd`.** Mixing users produces permission errors that are easier to avoid than debug.
 - **Review plan previews.** `plan_create` returns a preview with execution layers and a dependency graph before the plan runs. Read it.

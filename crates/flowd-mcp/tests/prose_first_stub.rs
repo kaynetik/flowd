@@ -184,6 +184,7 @@ Run the integration tests and capture failures.
             definition: None,
             prose: Some(prose.into()),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .expect("plan_create(prose) succeeds with structured input");
@@ -256,6 +257,7 @@ async fn freeform_prose_loops_through_refine_then_executes() {
                     .into(),
             ),
             compiler_override: None,
+            project_root: None,
         })
         .await
         .expect("plan_create(prose) returns Draft + question even on freeform input");

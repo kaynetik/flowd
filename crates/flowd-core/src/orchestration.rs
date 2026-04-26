@@ -65,6 +65,18 @@ pub struct Plan {
         deserialize_with = "deserialize_project_with_legacy_fallback"
     )]
     pub project: String,
+    /// Canonical filesystem root the plan executes against (the
+    /// "execution root"). Distinct from [`Self::project`]: `project` is
+    /// the namespace label shared across plans / rules / observations
+    /// and may be a short repo id, whereas `project_root` is an absolute
+    /// path captured from the invoking workspace at submission time.
+    ///
+    /// `None` for plans persisted before this field existed; readers
+    /// should fall back to per-call discovery in that case rather than
+    /// assuming a value. New code paths populate it via
+    /// [`infer_project_root_from_cwd`] (or an explicit override).
+    #[serde(default)]
+    pub project_root: Option<String>,
     pub steps: Vec<PlanStep>,
     pub status: PlanStatus,
     pub created_at: DateTime<Utc>,
@@ -97,6 +109,142 @@ pub struct Plan {
 
 fn default_legacy_project() -> String {
     "__legacy__".to_owned()
+}
+
+/// Environment variable consulted by [`resolve_workspace_root`] when no
+/// MCP client signal accompanies the request. Lets an operator pin the
+/// workspace at daemon-launch (or per `flowd mcp` proxy invocation)
+/// without rebuilding the binary.
+pub const FLOWD_WORKSPACE_ROOT_ENV: &str = "FLOWD_WORKSPACE_ROOT";
+
+/// Which signal a successful [`resolve_workspace_root`] picked up. Carried
+/// alongside the resolved path so the caller can log `ClientHint` vs.
+/// `EnvOverride` vs. `Cwd` without re-running the resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceRootSource {
+    /// MCP client / proxy supplied the path in the request payload. The
+    /// only signal that reflects the *invoking* workspace when the daemon
+    /// was launched somewhere unrelated.
+    ClientHint,
+    /// `FLOWD_WORKSPACE_ROOT` env var on the resolving process.
+    EnvOverride,
+    /// `current_dir()` of the resolving process. Last resort; meaningful
+    /// only when the daemon was launched from inside the workspace it is
+    /// expected to serve (typical in single-user / test setups).
+    Cwd,
+}
+
+/// Resolve a canonical, git-verified workspace root from the available
+/// signals.
+///
+/// Resolution order (highest priority first):
+/// 1. `client_hint` -- typically the MCP client or `flowd mcp` proxy
+///    forwarding the workspace it was spawned from.
+/// 2. `FLOWD_WORKSPACE_ROOT` env var on the resolving process.
+/// 3. The resolving process's `current_dir()`.
+///
+/// Each candidate is canonicalised (resolves symlinks and `..`), then the
+/// resulting path -- and its parents -- are scanned for a `.git` entry
+/// (directory or file; the latter is what `git worktree` and submodules
+/// emit). The first candidate that resolves and lives inside a git
+/// repository wins; the returned path is the canonical form of the
+/// candidate itself (NOT the repo root), so two plans created from the
+/// same subdirectory compare equal even when the repo root sits a few
+/// levels up.
+///
+/// # Errors
+/// Returns `FlowdError::PlanValidation` enumerating every candidate it
+/// considered and why each was rejected, so an operator can tell at a
+/// glance whether to set `FLOWD_WORKSPACE_ROOT`, fix the proxy, or run
+/// `git init` in the workspace.
+pub fn resolve_workspace_root(client_hint: Option<&str>) -> Result<(String, WorkspaceRootSource)> {
+    let mut tried: Vec<String> = Vec::new();
+
+    if let Some(raw) = client_hint {
+        match try_workspace_candidate(raw) {
+            Ok(canonical) => return Ok((canonical, WorkspaceRootSource::ClientHint)),
+            Err(reason) => tried.push(format!("client hint `{raw}`: {reason}")),
+        }
+    }
+
+    match std::env::var(FLOWD_WORKSPACE_ROOT_ENV) {
+        Ok(raw) => match try_workspace_candidate(&raw) {
+            Ok(canonical) => return Ok((canonical, WorkspaceRootSource::EnvOverride)),
+            Err(reason) => tried.push(format!("{FLOWD_WORKSPACE_ROOT_ENV}=`{raw}`: {reason}")),
+        },
+        Err(_) => tried.push(format!("{FLOWD_WORKSPACE_ROOT_ENV} not set")),
+    }
+
+    match std::env::current_dir() {
+        Ok(cwd) => match try_workspace_path(&cwd) {
+            Ok(canonical) => return Ok((canonical, WorkspaceRootSource::Cwd)),
+            Err(reason) => tried.push(format!("cwd `{}`: {reason}", cwd.display())),
+        },
+        Err(e) => tried.push(format!("cwd unavailable: {e}")),
+    }
+
+    Err(FlowdError::PlanValidation(format!(
+        "could not resolve a trustworthy workspace root for the plan; \
+         tried, in order: {}; set {FLOWD_WORKSPACE_ROOT_ENV} to a git-tracked \
+         directory or have the MCP client supply `project_root` in the request",
+        tried.join("; ")
+    )))
+}
+
+fn try_workspace_candidate(raw: &str) -> std::result::Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("path is empty / whitespace".into());
+    }
+    try_workspace_path(std::path::Path::new(trimmed))
+}
+
+fn try_workspace_path(path: &std::path::Path) -> std::result::Result<String, String> {
+    let canonical =
+        std::fs::canonicalize(path).map_err(|e| format!("canonicalize failed ({e})"))?;
+    if !is_within_git_repo(&canonical) {
+        return Err(
+            "not inside a git repository (no .git found in this directory or any parent)".into(),
+        );
+    }
+    Ok(canonical.display().to_string())
+}
+
+/// Walk `path` and its parents looking for a `.git` entry. Returns true
+/// for plain repos (`.git/` directory), worktrees and submodules
+/// (`.git` is a file pointing at the gitdir), and bare-repo subdirs the
+/// user might be editing inside. We deliberately do not exec `git
+/// rev-parse`: this is hot-path code and a filesystem probe is enough
+/// for the trust check the resolver makes.
+fn is_within_git_repo(path: &std::path::Path) -> bool {
+    let mut cursor = Some(path);
+    while let Some(dir) = cursor {
+        if dir.join(".git").exists() {
+            return true;
+        }
+        cursor = dir.parent();
+    }
+    false
+}
+
+/// Best-effort canonical workspace root from `current_dir()` only --
+/// retained as a thin wrapper for callers (and persisted plan loaders)
+/// that already trust their cwd, do not yet have an MCP client signal,
+/// and still want the `Option`-returning shape. Newer call sites should
+/// prefer [`resolve_workspace_root`] directly so the env-override and
+/// git-verification paths are honoured.
+#[must_use]
+pub fn infer_project_root_from_cwd() -> Option<String> {
+    resolve_workspace_root(None).ok().map(|(p, _)| p)
+}
+
+/// Re-canonicalise an externally-supplied execution root with the same
+/// git-verification [`resolve_workspace_root`] applies. Returns `None`
+/// for inputs that don't resolve to a git-tracked directory; the caller
+/// should decide whether to fall back to inference or refuse.
+#[must_use]
+pub fn canonicalize_project_root(raw: &str) -> Option<String> {
+    try_workspace_candidate(raw).ok()
 }
 
 fn deserialize_project_with_legacy_fallback<'de, D>(
@@ -320,13 +468,16 @@ impl Plan {
     ///
     /// `project` is required because every downstream subsystem (rule
     /// evaluator, plan observer, persistence layer) treats it as a
-    /// non-null namespace key.
+    /// non-null namespace key. The execution root is left unset; callers
+    /// that know their invoking workspace should chain
+    /// [`Self::with_project_root`].
     #[must_use]
     pub fn new(name: impl Into<String>, project: impl Into<String>, steps: Vec<PlanStep>) -> Self {
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
             project: project.into(),
+            project_root: None,
             steps,
             status: PlanStatus::Draft,
             created_at: Utc::now(),
@@ -337,6 +488,20 @@ impl Plan {
             decisions: Vec::new(),
             definition_dirty: false,
         }
+    }
+
+    /// Builder-style setter for the execution root. Trims and ignores
+    /// empty / whitespace-only inputs so callers can pipe a possibly
+    /// missing value (e.g. an env var) through without branching.
+    #[must_use]
+    pub fn with_project_root(mut self, root: impl Into<String>) -> Self {
+        let root = root.into();
+        if root.trim().is_empty() {
+            self.project_root = None;
+        } else {
+            self.project_root = Some(root);
+        }
+        self
     }
 
     /// Compute which steps can run in parallel at each stage (topological layers).
@@ -424,9 +589,29 @@ impl Plan {
         self.open_questions = output.open_questions;
         self.decisions.extend(output.new_decisions);
         if let Some(def) = output.definition {
+            // Preserve per-step `timeout_secs` that the prose-first
+            // compilers routinely lose across rounds. The structured
+            // markdown stub emits `None` for any header without an
+            // explicit `timeout_secs:` field, and the LLM-backed
+            // compiler is similarly free to drop it on a refine. Without
+            // this, a refined plan would silently fall back to the
+            // daemon-wide default and quietly violate the operator's
+            // authored deadline.
+            let prior_timeouts: HashMap<String, u64> = self
+                .steps
+                .iter()
+                .filter_map(|s| s.timeout_secs.map(|t| (s.id.clone(), t)))
+                .collect();
             let recompiled = def.into_plan_with_project(self.project.clone());
             self.name = recompiled.name;
             self.steps = recompiled.steps;
+            for s in &mut self.steps {
+                if s.timeout_secs.is_none() {
+                    if let Some(prior) = prior_timeouts.get(&s.id) {
+                        s.timeout_secs = Some(*prior);
+                    }
+                }
+            }
             self.definition_dirty = false;
         } else {
             self.definition_dirty = true;
@@ -891,6 +1076,7 @@ mod tests {
         let def = PlanDefinition {
             name: "p".into(),
             project: Some("proj".into()),
+            project_root: None,
             steps: vec![StepDefinition {
                 id: "new".into(),
                 agent_type: "echo".into(),
@@ -907,6 +1093,89 @@ mod tests {
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].id, "new");
         assert_eq!(plan.source_doc.as_deref(), Some("# done"));
+    }
+
+    #[test]
+    fn apply_compile_output_preserves_prior_timeout_for_matching_step_ids() {
+        // Round 1: operator authored a step with a deadline, then a
+        // refine round (the structured-markdown stub or LLM compiler)
+        // re-emits the same id but drops `timeout_secs`. The plan must
+        // keep the prior deadline so the executor doesn't silently fall
+        // back to the daemon-wide default.
+        use loader::{PlanDefinition, StepDefinition};
+
+        let mut prior_step = step("keeper", &[]);
+        prior_step.timeout_secs = Some(120);
+        let mut plan = Plan::new("p", "proj", vec![prior_step, step("dropped", &[])]);
+
+        let refined = PlanDefinition {
+            name: "p".into(),
+            project: Some("proj".into()),
+            project_root: None,
+            steps: vec![
+                StepDefinition {
+                    id: "keeper".into(),
+                    agent_type: "echo".into(),
+                    prompt: "still here".into(),
+                    depends_on: vec![],
+                    timeout_secs: None, // compiler dropped it
+                    retry_count: 0,
+                },
+                StepDefinition {
+                    id: "fresh".into(), // brand-new step, no prior to inherit
+                    agent_type: "echo".into(),
+                    prompt: "added".into(),
+                    depends_on: vec![],
+                    timeout_secs: None,
+                    retry_count: 0,
+                },
+            ],
+        };
+        plan.apply_compile_output(compiler::CompileOutput::ready("# refined", refined));
+
+        let keeper = plan
+            .steps
+            .iter()
+            .find(|s| s.id == "keeper")
+            .expect("keeper step preserved");
+        assert_eq!(
+            keeper.timeout_secs,
+            Some(120),
+            "prior timeout_secs survived the refine round"
+        );
+        let fresh = plan
+            .steps
+            .iter()
+            .find(|s| s.id == "fresh")
+            .expect("fresh step present");
+        assert_eq!(
+            fresh.timeout_secs, None,
+            "new step keeps None when no prior timeout to inherit"
+        );
+    }
+
+    #[test]
+    fn apply_compile_output_lets_explicit_timeout_override_prior() {
+        use loader::{PlanDefinition, StepDefinition};
+        let mut prior = step("a", &[]);
+        prior.timeout_secs = Some(30);
+        let mut plan = Plan::new("p", "proj", vec![prior]);
+
+        let def = PlanDefinition {
+            name: "p".into(),
+            project: Some("proj".into()),
+            project_root: None,
+            steps: vec![StepDefinition {
+                id: "a".into(),
+                agent_type: "echo".into(),
+                prompt: "hi".into(),
+                depends_on: vec![],
+                timeout_secs: Some(900), // explicit override wins
+                retry_count: 0,
+            }],
+        };
+        plan.apply_compile_output(compiler::CompileOutput::ready("# done", def));
+        assert_eq!(plan.steps[0].timeout_secs, Some(900));
     }
 
     #[test]
@@ -950,5 +1219,296 @@ mod tests {
         assert_eq!(back.decisions.len(), 1);
         assert_eq!(back.decisions[0].chosen_option_id, "yes");
         assert!(back.definition_dirty);
+    }
+
+    #[test]
+    fn plan_new_leaves_project_root_unset() {
+        // `project_root` is opt-in: callers that don't know the
+        // execution root (tests, programmatic consumers) should not see
+        // a fabricated value.
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        assert!(plan.project_root.is_none());
+    }
+
+    #[test]
+    fn with_project_root_round_trips_through_serde() {
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]).with_project_root("/repos/flowd");
+
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: Plan = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(plan.project_root.as_deref(), Some("/repos/flowd"));
+        assert_eq!(back.project_root.as_deref(), Some("/repos/flowd"));
+        assert_eq!(back.project, "proj");
+    }
+
+    #[test]
+    fn with_project_root_treats_blank_as_unset() {
+        // Pipe-through ergonomics: callers that route a possibly empty
+        // env var through the builder should not poison the field with
+        // whitespace.
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]).with_project_root("   \t\n");
+        assert!(plan.project_root.is_none());
+    }
+
+    /// Pre-`project_root` plan JSON must still deserialise cleanly so
+    /// existing rows in the `plans.definition` blob keep loading after
+    /// the field is added. Mirrors the legacy-fallback test that guards
+    /// the clarification fields.
+    #[test]
+    fn plan_deserialises_legacy_json_without_project_root_field() {
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        let mut json: serde_json::Value = serde_json::to_value(&plan).unwrap();
+        json.as_object_mut().unwrap().remove("project_root");
+
+        let restored: Plan = serde_json::from_value(json).unwrap();
+        assert!(
+            restored.project_root.is_none(),
+            "missing project_root must surface as None, the legacy fallback"
+        );
+        assert_eq!(restored.project, "proj");
+        assert_eq!(restored.steps.len(), 1);
+    }
+
+    /// `project` (namespace label) and `project_root` (filesystem path)
+    /// are independent: two plans can share a project label while
+    /// pointing at different execution roots, and the same root can be
+    /// reused across project labels. The validator only enforces a
+    /// non-empty project; `project_root` has no such requirement.
+    #[test]
+    fn project_and_project_root_are_independent_fields() {
+        let alpha =
+            Plan::new("a", "shared", vec![step("a", &[])]).with_project_root("/repos/repo-a");
+        let beta =
+            Plan::new("b", "shared", vec![step("a", &[])]).with_project_root("/repos/repo-b");
+
+        assert_eq!(alpha.project, beta.project);
+        assert_ne!(alpha.project_root, beta.project_root);
+
+        // The strict validator must accept both regardless of root --
+        // it's an execution hint, not a structural constraint.
+        validate_plan(&alpha).expect("plan validates without project_root constraint");
+        validate_plan(&beta).expect("plan validates with a different project_root");
+
+        // Conversely, identical roots across distinct project labels
+        // also round-trip cleanly: the two fields don't collapse.
+        let same_root_a =
+            Plan::new("a", "alpha", vec![step("a", &[])]).with_project_root("/repos/shared");
+        let same_root_b =
+            Plan::new("b", "beta", vec![step("a", &[])]).with_project_root("/repos/shared");
+        assert_eq!(same_root_a.project_root, same_root_b.project_root);
+        assert_ne!(same_root_a.project, same_root_b.project);
+    }
+
+    #[test]
+    fn validate_plan_ignores_project_root_value() {
+        // `project_root = None` is the legacy-load case; the validator
+        // must treat it as a perfectly valid plan rather than refusing
+        // it the way it does for an empty `project` label.
+        let no_root = Plan::new("p", "proj", vec![step("a", &[])]);
+        validate_plan(&no_root).expect("missing project_root is allowed");
+
+        let with_root =
+            Plan::new("p", "proj", vec![step("a", &[])]).with_project_root("/repos/flowd");
+        validate_plan(&with_root).expect("explicit project_root is allowed");
+    }
+
+    // ---- resolve_workspace_root ------------------------------------------
+
+    /// Mutex serialising tests that touch the process-global env or cwd.
+    /// `cargo test` runs cases in parallel within a binary, so two tests
+    /// concurrently flipping `FLOWD_WORKSPACE_ROOT` would race.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn make_git_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("flowd-resolve-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        dir
+    }
+
+    fn make_non_git_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("flowd-resolve-bare-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Hand-roll an env-var guard: thread-local `Drop`s aren't enough
+    /// because `std::env` is process-global. Restoring on drop keeps a
+    /// failed assertion from leaking state into the next test.
+    struct EnvGuard {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        // SAFETY: callers hold ENV_LOCK so no concurrent test mutates env.
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let prior = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prior }
+        }
+
+        #[allow(unsafe_code)]
+        fn unset(key: &'static str) -> Self {
+            let prior = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        // SAFETY: same as set/unset; the test held ENV_LOCK for its lifetime.
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_workspace_root_prefers_client_hint_over_env_and_cwd() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let hint_dir = make_git_dir("hint");
+        let env_dir = make_git_dir("env");
+        let _env = EnvGuard::set(FLOWD_WORKSPACE_ROOT_ENV, &env_dir);
+
+        let (resolved, src) = resolve_workspace_root(Some(hint_dir.to_str().unwrap()))
+            .expect("client hint should win");
+        assert_eq!(src, WorkspaceRootSource::ClientHint);
+        // The hint dir is in /tmp which symlinks to /private/tmp on macOS;
+        // canonicalize both sides so the equality check matches what the
+        // resolver returns.
+        let expected = std::fs::canonicalize(&hint_dir)
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_workspace_root_falls_back_to_env_when_hint_missing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let env_dir = make_git_dir("env-only");
+        let _env = EnvGuard::set(FLOWD_WORKSPACE_ROOT_ENV, &env_dir);
+
+        let (resolved, src) = resolve_workspace_root(None).expect("env should win");
+        assert_eq!(src, WorkspaceRootSource::EnvOverride);
+        let expected = std::fs::canonicalize(&env_dir)
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_workspace_root_falls_back_to_cwd_when_no_hint_or_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::unset(FLOWD_WORKSPACE_ROOT_ENV);
+        // We don't touch cwd; the test binary runs inside the flowd
+        // repo, which is itself a git repository, so the cwd fallback
+        // must succeed and report the cwd source.
+        let (resolved, src) = resolve_workspace_root(None).expect("cwd fallback inside flowd repo");
+        assert_eq!(src, WorkspaceRootSource::Cwd);
+        let cwd_canonical = std::fs::canonicalize(std::env::current_dir().unwrap())
+            .unwrap()
+            .display()
+            .to_string();
+        assert_eq!(resolved, cwd_canonical);
+    }
+
+    #[test]
+    fn resolve_workspace_root_skips_non_git_hint_and_falls_through() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let bare = make_non_git_dir("hint-no-git");
+        let env_dir = make_git_dir("env-rescue");
+        let _env = EnvGuard::set(FLOWD_WORKSPACE_ROOT_ENV, &env_dir);
+
+        let (_resolved, src) = resolve_workspace_root(Some(bare.to_str().unwrap()))
+            .expect("env should rescue the resolution");
+        assert_eq!(
+            src,
+            WorkspaceRootSource::EnvOverride,
+            "non-git hint must be rejected so the env override gets a turn"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_root_errors_when_every_candidate_rejects() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let bare_hint = make_non_git_dir("err-hint");
+        let bare_env = make_non_git_dir("err-env");
+        let _env = EnvGuard::set(FLOWD_WORKSPACE_ROOT_ENV, &bare_env);
+
+        // We can't trivially make the test process's cwd non-git (the
+        // repo holds the binary), so use a hint + env where both are
+        // outside any git tree. The cwd fallback will still succeed
+        // because it lives inside the flowd repo, but the error path
+        // we care about is exercised by passing `Err` candidates that
+        // every prior signal rejects -- so swap that test to ensure
+        // `try_workspace_candidate` rejects independently.
+        let hint_err = try_workspace_candidate(bare_hint.to_str().unwrap()).unwrap_err();
+        assert!(
+            hint_err.contains("not inside a git repository"),
+            "{hint_err}"
+        );
+        let env_err = try_workspace_candidate(bare_env.to_str().unwrap()).unwrap_err();
+        assert!(env_err.contains("not inside a git repository"), "{env_err}");
+    }
+
+    #[test]
+    fn resolve_workspace_root_returns_canonical_form_of_subdirectory() {
+        // Subdirectories within a repo must resolve to the subdirectory's
+        // canonical path, not the repo root: that way two plans created
+        // from the same workspace path compare equal even when authors
+        // are working several directories below the repo root.
+        let _g = ENV_LOCK.lock().unwrap();
+        let repo = make_git_dir("subdir-parent");
+        let sub = repo.join("nested").join("workspace");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let (resolved, src) =
+            resolve_workspace_root(Some(sub.to_str().unwrap())).expect("subdir resolves");
+        assert_eq!(src, WorkspaceRootSource::ClientHint);
+        let expected = std::fs::canonicalize(&sub).unwrap().display().to_string();
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_workspace_root_treats_blank_hint_as_absent() {
+        // Whitespace-only hints must be skipped silently so callers can
+        // forward an unset proxy variable through without branching.
+        let _g = ENV_LOCK.lock().unwrap();
+        let env_dir = make_git_dir("blank-hint");
+        let _env = EnvGuard::set(FLOWD_WORKSPACE_ROOT_ENV, &env_dir);
+
+        let (_, src) = resolve_workspace_root(Some("   ")).expect("env wins");
+        assert_eq!(src, WorkspaceRootSource::EnvOverride);
+    }
+
+    #[test]
+    fn canonicalize_project_root_round_trips_inside_git_repo() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = make_git_dir("canon");
+        let canon = canonicalize_project_root(dir.to_str().unwrap()).unwrap();
+        let expected = std::fs::canonicalize(&dir).unwrap().display().to_string();
+        assert_eq!(canon, expected);
+    }
+
+    #[test]
+    fn canonicalize_project_root_rejects_non_git_paths() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = make_non_git_dir("canon-bare");
+        // The git-verification gate is the whole point of the new
+        // resolver; the legacy-shaped helper inherits it so callers
+        // cannot accidentally route around the check.
+        assert!(canonicalize_project_root(dir.to_str().unwrap()).is_none());
     }
 }

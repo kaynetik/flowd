@@ -36,6 +36,10 @@
 //!
 //! ## <step-id> [agent: <agent_type>] depends_on: [a, b]
 //! prompt body
+//!
+//! ## <step-id> [agent: <agent_type>] timeout_secs: 90 depends_on: [a]
+//! prompt body                              (timeout_secs and depends_on may
+//!                                           appear in either order)
 //! ```
 //!
 //! Anything that does not match a step heading and follows one is treated
@@ -280,7 +284,7 @@ fn parse_structured(prose: &str) -> std::result::Result<PlanDefinition, String> 
             agent_type: header.agent_type,
             prompt,
             depends_on: header.depends_on,
-            timeout_secs: None,
+            timeout_secs: header.timeout_secs,
             retry_count: 0,
         });
         Ok(())
@@ -351,6 +355,7 @@ fn parse_structured(prose: &str) -> std::result::Result<PlanDefinition, String> 
     Ok(PlanDefinition {
         name: name.unwrap_or_else(|| "prose-plan".to_string()),
         project: None,
+        project_root: None,
         steps,
     })
 }
@@ -360,6 +365,7 @@ struct StepHeader {
     id: String,
     agent_type: String,
     depends_on: Vec<String>,
+    timeout_secs: Option<u64>,
 }
 
 /// Parse a single `## <id> [agent: <type>] [depends_on: [...]]` line.
@@ -411,11 +417,32 @@ fn parse_step_header(line: &str) -> Option<StepHeader> {
         None => Vec::new(),
     };
 
+    // Optional `timeout_secs: <N>`. Authors set this so the step keeps
+    // its bespoke deadline across compile/refine cycles instead of
+    // silently inheriting the daemon-wide default. May appear before or
+    // after `depends_on:`; an unparseable value is treated as "field
+    // omitted" so a typo never blocks the rest of the header.
+    let timeout_secs = parse_timeout_field(after_bracket);
+
     Some(StepHeader {
         id,
         agent_type,
         depends_on,
+        timeout_secs,
     })
+}
+
+/// Extract `timeout_secs: <N>` from the tail of a step header, if present.
+fn parse_timeout_field(tail: &str) -> Option<u64> {
+    let marker = "timeout_secs:";
+    let idx = tail.find(marker)?;
+    let after = tail[idx + marker.len()..].trim_start();
+    // Stop at the next whitespace, comma, or `]` so we don't slurp the
+    // following `depends_on: [...]` block.
+    let end = after
+        .find(|c: char| c.is_whitespace() || c == ',' || c == ']')
+        .unwrap_or(after.len());
+    after[..end].parse::<u64>().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +752,7 @@ impl LlmDefinition {
                 .or(top_level_name)
                 .unwrap_or_else(|| "prose-plan".to_string()),
             project: None,
+            project_root: None,
             steps: self
                 .steps
                 .into_iter()
@@ -1286,6 +1314,48 @@ Run the auth integration tests and capture failures.
             .definition
             .unwrap();
         assert_eq!(def.name, "prose-plan");
+    }
+
+    #[tokio::test]
+    async fn stub_compile_prose_parses_timeout_secs_field_in_step_header() {
+        // Author specifies a per-step deadline directly in the
+        // structured-markdown grammar so the value flows through compile
+        // and survives any subsequent refine round.
+        let prose = "## a [agent: echo] timeout_secs: 90\nbody\n\
+                     ## b [agent: echo] timeout_secs: 30 depends_on: [a]\nbody\n\
+                     ## c [agent: echo] depends_on: [a] timeout_secs: 12\nbody\n\
+                     ## d [agent: echo]\nno deadline\n";
+        let def = StubPlanCompiler::new()
+            .compile_prose(prose.into(), "proj".into())
+            .await
+            .unwrap()
+            .definition
+            .expect("definition");
+        assert_eq!(def.steps[0].timeout_secs, Some(90));
+        assert_eq!(def.steps[1].timeout_secs, Some(30));
+        assert_eq!(
+            def.steps[1].depends_on,
+            vec!["a".to_string()],
+            "depends_on still parsed alongside timeout_secs"
+        );
+        assert_eq!(def.steps[2].timeout_secs, Some(12));
+        assert_eq!(def.steps[2].depends_on, vec!["a".to_string()]);
+        assert_eq!(def.steps[3].timeout_secs, None);
+    }
+
+    #[tokio::test]
+    async fn stub_compile_prose_ignores_unparseable_timeout_value() {
+        // A typo in the value must not abort header parsing; the field
+        // is treated as omitted so the rest of the step still compiles.
+        let prose = "## a [agent: echo] timeout_secs: nope\nbody\n";
+        let def = StubPlanCompiler::new()
+            .compile_prose(prose.into(), "p".into())
+            .await
+            .unwrap()
+            .definition
+            .expect("definition");
+        assert_eq!(def.steps[0].timeout_secs, None);
+        assert_eq!(def.steps[0].id, "a");
     }
 
     #[tokio::test]

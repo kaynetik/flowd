@@ -779,6 +779,12 @@ fn print_plan_summary(plan: &Plan, style: Style, header: &str) {
     println!("  id:               {}", style.dim(&plan.id.to_string()));
     println!("  status:           {}", plan_status_label(plan.status));
     println!("  project:          {}", plan.project);
+    println!(
+        "  project_root:     {}",
+        plan.project_root
+            .as_deref()
+            .unwrap_or("(legacy: not recorded)")
+    );
     println!("  steps:            {}", plan.steps.len());
     println!("  open_questions:   {}", plan.open_questions.len());
     println!("  decisions:        {}", plan.decisions.len());
