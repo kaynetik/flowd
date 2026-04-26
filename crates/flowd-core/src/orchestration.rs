@@ -18,6 +18,7 @@ pub mod clarification;
 pub mod compiler;
 pub mod executor;
 pub mod gate;
+pub mod integration;
 mod layer_runner;
 pub mod loader;
 pub mod observer;
@@ -35,6 +36,11 @@ use uuid::Uuid;
 pub use clarification::{Answer, DecisionRecord, OpenQuestion, QuestionOption};
 pub use compiler::{CompileOutput, MockPlanCompiler, PlanCompiler, PlanDraftSnapshot};
 pub use executor::{AgentOutput, AgentSpawnContext, AgentSpawner, InMemoryPlanExecutor};
+pub use integration::{
+    CherryPick, CleanupPolicy, IntegrationConfig, IntegrationFailure, IntegrationMode,
+    IntegrationPlan, IntegrationRefusal, PlanIntegrateOutcome, PlanIntegrateRequest,
+    assess_eligibility, integration_branch_ref, step_branch_ref, topological_tip_cherry_picks,
+};
 pub use loader::{PlanDefinition, StepDefinition, load_plan, load_plan_json, load_plan_yaml};
 pub use store::{NoOpPlanStore, PlanStore, PlanSummary};
 
