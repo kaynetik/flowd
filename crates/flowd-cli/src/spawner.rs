@@ -542,6 +542,19 @@ impl GitWorktreeManager {
         // already operate on the right tree without needing the override.
         let repo = self.repo_for(ctx.project_root.as_deref());
         git_output(repo, ["worktree", "add", "-b", &branch, &path_arg, base]).await?;
+
+        // Repo identity guard. `git worktree add` can succeed against the
+        // wrong repo when the resolved path is a symlink that lands inside
+        // a different checkout, when the target collides with a stale
+        // linked worktree, or when a nested checkout intercepts it. Compare
+        // `--git-common-dir` of the freshly-added worktree against
+        // `--git-common-dir` of the base repo; on mismatch, rip out the
+        // worktree and abort before the agent prompt is dispatched.
+        if let Err(e) = assert_worktree_identity(repo, &path).await {
+            cleanup_rejected_worktree(repo, &path, &path_arg).await;
+            return Err(e);
+        }
+
         for dep in dep_branches.iter().skip(1) {
             git_output(&path, ["merge", "--no-edit", dep]).await?;
         }
@@ -674,6 +687,88 @@ async fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<Strin
         ),
         metrics: None,
     })
+}
+
+/// Resolve `git rev-parse --git-common-dir` from `cwd` and return it as a
+/// canonical absolute path. `--git-common-dir` returns a relative path
+/// (e.g. `.git`) when invoked from a primary worktree and an absolute path
+/// from a linked worktree, so we always join with `cwd` and canonicalize
+/// before comparing — otherwise two paths that point at the same on-disk
+/// `.git` would compare unequal just because one came back relative.
+async fn git_common_dir(cwd: &Path) -> Result<PathBuf> {
+    let raw = git_output(cwd, ["rev-parse", "--git-common-dir"]).await?;
+    let trimmed = raw.trim();
+    let candidate = PathBuf::from(trimmed);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        cwd.join(candidate)
+    };
+    std::fs::canonicalize(&resolved).map_err(|e| FlowdError::PlanExecution {
+        message: format!(
+            "canonicalize git common dir {} (from cwd {}): {e}",
+            resolved.display(),
+            cwd.display(),
+        ),
+        metrics: None,
+    })
+}
+
+/// README-promised post-`git worktree add` repository-identity guard:
+/// confirm the freshly-added `worktree` actually belongs to the same
+/// repository as `repo`. A mismatch happens when `git worktree add`
+/// succeeds against a stale linked worktree, a symlinked target inside a
+/// different checkout, or a nested checkout that intercepts the path.
+/// Returning `Err` here is the signal for the caller to remove the
+/// worktree and abort the step before the agent prompt is dispatched —
+/// otherwise the run anchors against the wrong tree and every artefact
+/// (commits, branches, observations) lands in the wrong repo.
+async fn assert_worktree_identity(repo: &Path, worktree: &Path) -> Result<()> {
+    let repo_common = git_common_dir(repo).await?;
+    let wt_common = git_common_dir(worktree).await?;
+    if repo_common == wt_common {
+        return Ok(());
+    }
+    Err(FlowdError::PlanExecution {
+        message: format!(
+            "worktree {} resolved to git-common-dir {} but project_root {} resolved to {}; \
+             refusing to dispatch step against the wrong repository",
+            worktree.display(),
+            wt_common.display(),
+            repo.display(),
+            repo_common.display(),
+        ),
+        metrics: None,
+    })
+}
+
+/// Tear down a worktree the identity guard rejected. Best-effort: try
+/// `git worktree remove --force` first so git's own bookkeeping (the
+/// `worktrees/<name>` admin dir under the common dir, the registered
+/// path) is cleaned up. If that fails — or if `git` refuses because the
+/// path it sees is not the worktree it expected — fall back to a raw
+/// `remove_dir_all` so we at least do not leave the directory on disk
+/// to collide with the next step. Failures are logged, not propagated:
+/// the caller is already returning the underlying guard error and the
+/// operator's signal is that error, not the cleanup outcome.
+async fn cleanup_rejected_worktree(repo: &Path, worktree: &Path, path_arg: &str) {
+    if let Err(e) = git_output(repo, ["worktree", "remove", "--force", path_arg]).await {
+        tracing::warn!(
+            repo = %repo.display(),
+            worktree = %worktree.display(),
+            error = %e,
+            "git worktree remove failed during identity-guard cleanup; falling back to rmdir"
+        );
+    }
+    if worktree.exists() {
+        if let Err(e) = tokio::fs::remove_dir_all(worktree).await {
+            tracing::warn!(
+                worktree = %worktree.display(),
+                error = %e,
+                "remove_dir_all failed during identity-guard cleanup; manual removal may be required"
+            );
+        }
+    }
 }
 
 async fn git_status<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<i32> {
@@ -1364,6 +1459,146 @@ mod tests {
                 .and_then(|plan_branches| plan_branches.get("a"))
                 .map(String::as_str),
             Some(step_branch(&ctx, &step).as_str()),
+        );
+    }
+
+    /// Bootstrap a real on-disk git repo with one commit so it has a
+    /// resolvable HEAD. Returns the canonical repo path so callers can
+    /// compare against canonicalised git output without macOS's
+    /// `/var` -> `/private/var` symlink biting them.
+    fn init_repo(dir: &Path) -> PathBuf {
+        git_sync(dir, &["init"]);
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git_sync(dir, &["add", "seed.txt"]);
+        git_sync(
+            dir,
+            &[
+                "-c",
+                "user.name=flowd-test",
+                "-c",
+                "user.email=flowd@test.local",
+                "commit",
+                "-m",
+                "seed",
+            ],
+        );
+        std::fs::canonicalize(dir).expect("canonicalize repo path")
+    }
+
+    /// Happy path of the post-`git worktree add` identity guard: a real
+    /// repo plus a worktree it actually owns must be accepted. This
+    /// also pins the canonicalisation behaviour — the helper has to
+    /// resolve the relative `.git` path returned from the primary
+    /// repo and the absolute path returned from the linked worktree
+    /// to the same on-disk location.
+    #[tokio::test]
+    async fn assert_worktree_identity_accepts_legitimate_worktree() {
+        let repo_dir = tempfile::tempdir().expect("repo dir");
+        let repo = init_repo(repo_dir.path());
+
+        let wt_parent = tempfile::tempdir().expect("worktree parent");
+        let wt_path = wt_parent.path().join("wt");
+        git_sync(
+            &repo,
+            &["worktree", "add", wt_path.to_str().unwrap(), "HEAD"],
+        );
+
+        assert_worktree_identity(&repo, &wt_path)
+            .await
+            .expect("a worktree git itself created must satisfy the identity guard");
+    }
+
+    /// Foreign-repo mismatch: a worktree that legitimately belongs to
+    /// repo B must be rejected when the guard is asked whether it
+    /// belongs to repo A. This is the README-promised defence against
+    /// `git worktree add` quietly landing in the wrong repository
+    /// (stale linked worktree, symlinked path, nested checkout).
+    /// The error must name both common dirs so the operator can see
+    /// at a glance which tree won and which they expected.
+    #[tokio::test]
+    async fn assert_worktree_identity_rejects_foreign_repo_worktree() {
+        let expected_dir = tempfile::tempdir().expect("expected repo dir");
+        let expected_repo = init_repo(expected_dir.path());
+        let foreign_dir = tempfile::tempdir().expect("foreign repo dir");
+        let foreign_repo = init_repo(foreign_dir.path());
+
+        let wt_parent = tempfile::tempdir().expect("worktree parent");
+        let wt_path = wt_parent.path().join("wt-of-foreign");
+        git_sync(
+            &foreign_repo,
+            &["worktree", "add", wt_path.to_str().unwrap(), "HEAD"],
+        );
+
+        let err = assert_worktree_identity(&expected_repo, &wt_path)
+            .await
+            .expect_err("guard must reject a worktree that belongs to a foreign repo");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to dispatch step against the wrong repository"),
+            "guard error must explain why the step was refused; got: {msg}"
+        );
+        assert!(
+            msg.contains("git-common-dir"),
+            "guard error must surface the common-dir comparison; got: {msg}"
+        );
+    }
+
+    /// Cleanup helper: a worktree git registered must be unregistered
+    /// from the source repo's `.git/worktrees` admin dir AND removed
+    /// from disk, so the next step's `path.exists()` precondition in
+    /// `prepare_step` does not trip on an orphaned directory.
+    #[tokio::test]
+    async fn cleanup_rejected_worktree_removes_real_worktree_and_admin_entry() {
+        let repo_dir = tempfile::tempdir().expect("repo dir");
+        let repo = init_repo(repo_dir.path());
+
+        let wt_parent = tempfile::tempdir().expect("worktree parent");
+        let wt_path = wt_parent.path().join("doomed");
+        let wt_arg = wt_path.to_string_lossy().into_owned();
+        git_sync(&repo, &["worktree", "add", &wt_arg, "HEAD"]);
+        assert!(wt_path.exists(), "sanity: worktree must exist before cleanup");
+
+        cleanup_rejected_worktree(&repo, &wt_path, &wt_arg).await;
+
+        assert!(
+            !wt_path.exists(),
+            "cleanup must remove the worktree directory at {}",
+            wt_path.display()
+        );
+        let admin = repo.join(".git/worktrees/doomed");
+        assert!(
+            !admin.exists(),
+            "cleanup must let git remove the admin entry at {}; \
+             leaving it behind makes the worktree name unreusable",
+            admin.display()
+        );
+    }
+
+    /// Cleanup must still take the directory off disk when
+    /// `git worktree remove --force` cannot — for example because the
+    /// directory was never registered as a worktree at all (a stale
+    /// leftover from an aborted operation, or a nested checkout the
+    /// guard caught before git would have linked it). Otherwise the
+    /// next attempt to add a worktree at the same path would fail the
+    /// `path.exists()` precondition and the operator would be stuck.
+    #[tokio::test]
+    async fn cleanup_rejected_worktree_falls_back_to_rmdir_when_git_refuses() {
+        let repo_dir = tempfile::tempdir().expect("repo dir");
+        let repo = init_repo(repo_dir.path());
+
+        let wt_parent = tempfile::tempdir().expect("worktree parent");
+        let wt_path = wt_parent.path().join("not-a-worktree");
+        let wt_arg = wt_path.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&wt_path).unwrap();
+        std::fs::write(wt_path.join("placeholder"), "x\n").unwrap();
+        assert!(wt_path.exists(), "sanity: directory must exist before cleanup");
+
+        cleanup_rejected_worktree(&repo, &wt_path, &wt_arg).await;
+
+        assert!(
+            !wt_path.exists(),
+            "cleanup fallback must rmdir an unregistered directory at {}",
+            wt_path.display()
         );
     }
 
