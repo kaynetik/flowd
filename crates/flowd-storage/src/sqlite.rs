@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::plan_event_store::SqlitePlanEventStore;
 use crate::plan_store::SqlitePlanStore;
+use crate::step_branch_store::SqliteStepBranchStore;
 
 #[derive(Clone)]
 pub struct SqliteBackend {
@@ -51,6 +52,15 @@ impl SqliteBackend {
     #[must_use]
     pub fn plan_event_store(&self) -> SqlitePlanEventStore {
         SqlitePlanEventStore::from_connection(Arc::clone(&self.conn))
+    }
+
+    /// Durable step → git-branch mapping sharing this database
+    /// connection. The daemon hands this to the worktree-isolating
+    /// spawner so a finished step's branch + tip sha survive a
+    /// restart, instead of evaporating with the in-process map.
+    #[must_use]
+    pub fn step_branch_store(&self) -> SqliteStepBranchStore {
+        SqliteStepBranchStore::from_connection(Arc::clone(&self.conn))
     }
 }
 

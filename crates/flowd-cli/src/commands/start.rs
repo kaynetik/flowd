@@ -113,7 +113,15 @@ pub async fn run(
     let compactor_handle = spawn_compactor(&backends, monitor.clone(), style);
 
     // ---- Plan execution wiring: select an agent CLI from $PATH or env.
-    let spawner = Arc::new(BoxedSpawner::auto(&paths.home));
+    // The step→branch store rides on the same SQLite connection as the
+    // plan and event stores so a parallel plan's worktree state lives
+    // in one transactionally-coherent file. The spawner needs it before
+    // any step runs, so it has to be built here -- before `BoxedSpawner`.
+    let step_branch_store = Arc::new(backends.sqlite.step_branch_store());
+    let spawner = Arc::new(BoxedSpawner::auto(
+        &paths.home,
+        Some(Arc::clone(&step_branch_store)),
+    ));
     eprintln!(
         "{} agent spawner: {}",
         style.cyan("using"),

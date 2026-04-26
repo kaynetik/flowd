@@ -11,6 +11,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_004,
     MIGRATION_005,
     MIGRATION_006,
+    MIGRATION_007,
 ];
 
 const MIGRATION_001: &str = r"
@@ -197,6 +198,43 @@ ALTER TABLE plans ADD COLUMN definition_dirty INTEGER NOT NULL DEFAULT 0;
 // callers fall back to per-call discovery.
 const MIGRATION_006: &str = r"
 ALTER TABLE plans ADD COLUMN project_root TEXT;
+";
+
+// Durable mapping from a finished plan step to the git branch that
+// captured its work. Replaces the in-process-only `branches` map on
+// `GitWorktreeManager`, which evaporated on daemon restart and made
+// resume / integration depend on the executor staying alive across the
+// whole plan.
+//
+// Kept in a dedicated table rather than as columns on `plan_steps`:
+// branch state is sparse (only parallel plans go through worktree
+// isolation) and conceptually owned by the spawner, not the plan
+// store. Splitting it keeps each migration small and lets the row be
+// rewritten on retry without churning the much wider `plan_steps`
+// row.
+//
+// `tip_sha` records the worktree HEAD at finish time so a future
+// integration step can fast-forward to that exact commit even after
+// the worktree directory has been pruned. `worktree_path` is
+// nullable because the path is a transient filesystem artifact -- the
+// branch + tip sha are sufficient to reproduce the state.
+//
+// No `REFERENCES plans(id)` foreign key on purpose: rows survive a
+// plan delete intentionally, so cleanup is an explicit caller decision
+// (e.g. `delete_for_plan`), not an implicit cascade.
+const MIGRATION_007: &str = r"
+CREATE TABLE IF NOT EXISTS plan_step_branches (
+    plan_id       TEXT NOT NULL,
+    step_id       TEXT NOT NULL,
+    branch        TEXT NOT NULL,
+    tip_sha       TEXT NOT NULL,
+    worktree_path TEXT,
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (plan_id, step_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_step_branches_plan
+    ON plan_step_branches(plan_id);
 ";
 
 /// Run all pending migrations.
