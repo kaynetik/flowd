@@ -58,6 +58,7 @@
 //!   artefact; [`CleanupPolicy::DropAlways`] is for ephemeral CI
 //!   integrations that own their state externally.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -176,6 +177,113 @@ impl IntegrationConfig {
     }
 }
 
+/// Lifecycle status of a plan's integration, tracked independently of
+/// the plan's terminal [`super::PlanStatus`].
+///
+/// A plan in [`super::PlanStatus::Completed`] keeps its terminal status
+/// while its integration progresses through these states; conflating
+/// the two would force the plan back into a non-terminal status
+/// whenever the operator staged or retried integration, breaking the
+/// eligibility contract [`assess_eligibility`] enforces.
+///
+/// Conceptual transitions:
+///
+/// ```text
+/// Pending ─► InProgress ─► Staged ─► InProgress ─► Promoted
+///                  │                       │
+///                  └────────► Failed ◄─────┘
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationStatus {
+    /// `plan_integrate` has not been invoked for this plan, or every
+    /// prior attempt was reset. Default for plans that have never
+    /// surfaced to the integration front door.
+    #[default]
+    Pending,
+    /// Integration is in flight: cherry-picks running, or fast-forward
+    /// to base in progress. Observed only between an
+    /// `IntegrationStarted` event and the next terminal event.
+    InProgress,
+    /// Confirm-mode integration finished cleanly: the integration
+    /// branch is ready, awaiting a follow-up `plan_integrate` call to
+    /// promote.
+    Staged,
+    /// Fast-forward to base completed. The base branch now points at
+    /// the integration tip.
+    Promoted,
+    /// A run failed (refusal *or* runtime failure). The structured
+    /// cause lives on [`IntegrationMetadata::failure`]; this enum
+    /// carries only the lifecycle marker so renderers can switch on
+    /// status alone without pattern-matching the cause.
+    Failed,
+}
+
+impl IntegrationStatus {
+    /// True for states from which no further transition is expected
+    /// without operator action ([`Self::Promoted`], [`Self::Failed`]).
+    /// [`Self::Staged`] is *not* terminal: a staged branch waits for a
+    /// follow-up promote call.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Promoted | Self::Failed)
+    }
+}
+
+/// Per-plan integration progress. Persisted on [`super::Plan`] so a
+/// daemon restart (or a reader who only has the plan struct) can render
+/// the right integration status without replaying the event log.
+///
+/// `None` on the plan means "no integration attempt observed"; this is
+/// distinct from `Some(IntegrationMetadata { status: Pending, .. })`,
+/// which means an operator opened the integration surface (e.g. a
+/// dry-run) and the daemon retains the chosen policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationMetadata {
+    pub status: IntegrationStatus,
+    /// Integration branch this run is targeting / has produced.
+    pub integration_branch: String,
+    /// Base branch this run will (or did) promote to.
+    pub base_branch: String,
+    pub mode: IntegrationMode,
+    pub cleanup: CleanupPolicy,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Set when [`Self::status`] is [`IntegrationStatus::Failed`].
+    /// Carries the structured runtime failure when one is available;
+    /// pre-flight refusals are surfaced via
+    /// [`IntegrationMetadata::refusal`] so the two stay typed
+    /// separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<IntegrationFailure>,
+    /// Set when [`Self::status`] is [`IntegrationStatus::Failed`] *and*
+    /// the failure was a deterministic refusal rather than a runtime
+    /// error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<IntegrationRefusal>,
+}
+
+impl IntegrationMetadata {
+    /// Build a fresh `Pending` metadata record from a validated
+    /// request. Used by the front door before any git work runs so the
+    /// plan persists the operator-chosen policy alongside its terminal
+    /// status.
+    #[must_use]
+    pub fn pending(plan_id: Uuid, project: &str, request: &PlanIntegrateRequest) -> Self {
+        Self {
+            status: IntegrationStatus::Pending,
+            integration_branch: integration_branch_ref(project, plan_id),
+            base_branch: request.config.base_branch.clone(),
+            mode: request.mode,
+            cleanup: request.config.cleanup,
+            started_at: None,
+            completed_at: None,
+            failure: None,
+            refusal: None,
+        }
+    }
+}
+
 /// Validated request to integrate a plan.
 ///
 /// Built by the front door from raw caller input; constructing one
@@ -203,7 +311,7 @@ impl PlanIntegrateRequest {
     ) -> Result<Self, IntegrationRefusal> {
         if config.base_branch.trim().is_empty() {
             return Err(IntegrationRefusal::InvalidConfig {
-                field: "base_branch",
+                field: "base_branch".into(),
                 reason: "base_branch must be a non-empty git ref name".into(),
             });
         }
@@ -316,11 +424,12 @@ pub enum IntegrationRefusal {
     NoTipSteps,
     /// The request payload is internally invalid (e.g. empty base
     /// branch). Surfaced via [`PlanIntegrateRequest::new`].
+    ///
+    /// `field` is owned (not `&'static str`) so the enclosing refusal
+    /// can round-trip through [`serde::Deserialize`]; embedding it in
+    /// [`IntegrationMetadata`] requires that.
     #[error("invalid integration config field `{field}`: {reason}")]
-    InvalidConfig {
-        field: &'static str,
-        reason: String,
-    },
+    InvalidConfig { field: String, reason: String },
 }
 
 /// Runtime failures the git-driving layer can surface. Pinned here so
@@ -570,7 +679,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            IntegrationRefusal::InvalidConfig { field: "base_branch", .. }
+            IntegrationRefusal::InvalidConfig { ref field, .. } if field == "base_branch"
         ));
     }
 
@@ -884,5 +993,136 @@ mod tests {
             promoted_tip: "deadbeef".into(),
         };
         assert_eq!(serde_json::to_value(&promoted).unwrap()["kind"], "promoted");
+    }
+
+    // -------- IntegrationStatus / IntegrationMetadata -------------------
+
+    #[test]
+    fn integration_status_default_is_pending() {
+        // The plan-side metadata seeds with `Pending` until the first
+        // run produces a real transition. A default flip would make
+        // every freshly-loaded plan look mid-integration.
+        assert_eq!(IntegrationStatus::default(), IntegrationStatus::Pending);
+    }
+
+    #[test]
+    fn integration_status_serialises_snake_case() {
+        // The wire format is checked here so a `rename_all` change to
+        // `lowercase` (which would compile but flip
+        // `in_progress` to `inprogress`) is caught at this layer.
+        for (variant, expected) in [
+            (IntegrationStatus::Pending, "pending"),
+            (IntegrationStatus::InProgress, "in_progress"),
+            (IntegrationStatus::Staged, "staged"),
+            (IntegrationStatus::Promoted, "promoted"),
+            (IntegrationStatus::Failed, "failed"),
+        ] {
+            let v = serde_json::to_value(variant).unwrap();
+            assert_eq!(v.as_str(), Some(expected));
+            let back: IntegrationStatus = serde_json::from_value(v).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn integration_status_terminal_only_for_promoted_and_failed() {
+        // `Staged` is deliberately *not* terminal: it awaits a follow-up
+        // promote call, and a renderer that treated it as terminal
+        // would hide the fact that the operator still has a step to take.
+        assert!(!IntegrationStatus::Pending.is_terminal());
+        assert!(!IntegrationStatus::InProgress.is_terminal());
+        assert!(!IntegrationStatus::Staged.is_terminal());
+        assert!(IntegrationStatus::Promoted.is_terminal());
+        assert!(IntegrationStatus::Failed.is_terminal());
+    }
+
+    #[test]
+    fn integration_metadata_round_trips_with_failure_set() {
+        let meta = IntegrationMetadata {
+            status: IntegrationStatus::Failed,
+            integration_branch: "flowd-integrate/proj/abc".into(),
+            base_branch: "main".into(),
+            mode: IntegrationMode::Confirm,
+            cleanup: CleanupPolicy::KeepAlways,
+            started_at: None,
+            completed_at: None,
+            failure: Some(IntegrationFailure::DirtyBase),
+            refusal: None,
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        let back: IntegrationMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn integration_metadata_omits_none_failure_and_refusal_fields() {
+        // `skip_serializing_if = "Option::is_none"` keeps the row
+        // compact for the common Pending / Staged / Promoted cases
+        // where neither cause is meaningful. A leaked `null` would
+        // bloat the events table and confuse downstream consumers.
+        let meta = IntegrationMetadata::pending(
+            Uuid::nil(),
+            "proj",
+            &PlanIntegrateRequest::new(
+                Uuid::nil(),
+                IntegrationMode::Confirm,
+                IntegrationConfig::with_base("main"),
+            )
+            .unwrap(),
+        );
+        let json = serde_json::to_value(&meta).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(!obj.contains_key("failure"));
+        assert!(!obj.contains_key("refusal"));
+    }
+
+    #[test]
+    fn integration_metadata_pending_seeds_branch_from_helper() {
+        // Pinning the seed against the branch helper makes sure the
+        // metadata and the actual cherry-pick target stay in lock-step
+        // -- a divergence here would have the plan advertise a branch
+        // the integrator never produces.
+        let plan_id = Uuid::new_v4();
+        let req = PlanIntegrateRequest::new(
+            plan_id,
+            IntegrationMode::DryRun,
+            IntegrationConfig::with_base("release"),
+        )
+        .unwrap();
+        let meta = IntegrationMetadata::pending(plan_id, "proj", &req);
+        assert_eq!(meta.status, IntegrationStatus::Pending);
+        assert_eq!(meta.base_branch, "release");
+        assert_eq!(meta.mode, IntegrationMode::DryRun);
+        assert_eq!(meta.cleanup, CleanupPolicy::KeepOnFailure);
+        assert_eq!(
+            meta.integration_branch,
+            integration_branch_ref("proj", plan_id)
+        );
+    }
+
+    #[test]
+    fn assess_eligibility_ignores_integration_metadata() {
+        // The integration sub-state must not feed back into the
+        // eligibility check: a plan that has been Staged or even
+        // Promoted is still `PlanStatus::Completed`, and re-running
+        // `assess_eligibility` on it (e.g. to re-render a dry-run)
+        // must produce the same plan-of-operations rather than refuse.
+        let mut plan = completed_plan(vec![step("a", &[])]);
+        let req = fixture_request(plan.id);
+        let baseline = assess_eligibility(&plan, &req).unwrap();
+
+        plan.integration = Some(IntegrationMetadata {
+            status: IntegrationStatus::Promoted,
+            integration_branch: integration_branch_ref(&plan.project, plan.id),
+            base_branch: "main".into(),
+            mode: IntegrationMode::Confirm,
+            cleanup: CleanupPolicy::KeepOnFailure,
+            started_at: None,
+            completed_at: None,
+            failure: None,
+            refusal: None,
+        });
+        let after = assess_eligibility(&plan, &req).unwrap();
+        assert_eq!(after, baseline);
     }
 }

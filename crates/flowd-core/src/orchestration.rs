@@ -37,9 +37,10 @@ pub use clarification::{Answer, DecisionRecord, OpenQuestion, QuestionOption};
 pub use compiler::{CompileOutput, MockPlanCompiler, PlanCompiler, PlanDraftSnapshot};
 pub use executor::{AgentOutput, AgentSpawnContext, AgentSpawner, InMemoryPlanExecutor};
 pub use integration::{
-    CherryPick, CleanupPolicy, IntegrationConfig, IntegrationFailure, IntegrationMode,
-    IntegrationPlan, IntegrationRefusal, PlanIntegrateOutcome, PlanIntegrateRequest,
-    assess_eligibility, integration_branch_ref, step_branch_ref, topological_tip_cherry_picks,
+    CherryPick, CleanupPolicy, IntegrationConfig, IntegrationFailure, IntegrationMetadata,
+    IntegrationMode, IntegrationPlan, IntegrationRefusal, IntegrationStatus,
+    PlanIntegrateOutcome, PlanIntegrateRequest, assess_eligibility, integration_branch_ref,
+    step_branch_ref, topological_tip_cherry_picks,
 };
 pub use loader::{PlanDefinition, StepDefinition, load_plan, load_plan_json, load_plan_yaml};
 pub use store::{NoOpPlanStore, PlanStore, PlanSummary};
@@ -111,6 +112,13 @@ pub struct Plan {
     /// confirmation. Always `false` for definition-first plans.
     #[serde(default)]
     pub definition_dirty: bool,
+    /// Integration progress for this plan, tracked separately from
+    /// [`Self::status`] so the terminal [`PlanStatus::Completed`]
+    /// contract is preserved across an integration cycle. `None` until
+    /// `plan_integrate` is invoked for the first time. Persisted plans
+    /// from before this field existed deserialise with `None`.
+    #[serde(default)]
+    pub integration: Option<integration::IntegrationMetadata>,
 }
 
 fn default_legacy_project() -> String {
@@ -493,6 +501,7 @@ impl Plan {
             open_questions: Vec::new(),
             decisions: Vec::new(),
             definition_dirty: false,
+            integration: None,
         }
     }
 
@@ -1290,6 +1299,66 @@ mod tests {
         // whitespace.
         let plan = Plan::new("p", "proj", vec![step("a", &[])]).with_project_root("   \t\n");
         assert!(plan.project_root.is_none());
+    }
+
+    #[test]
+    fn plan_new_leaves_integration_unset() {
+        // A fresh plan must surface `integration: None` so renderers
+        // can distinguish "never integrated" from a Pending in-flight
+        // attempt. Defaulting to `Some(Pending)` would silently inflate
+        // the integration timeline for every plan that never reaches
+        // the integration front door.
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        assert!(plan.integration.is_none());
+    }
+
+    #[test]
+    fn plan_round_trips_with_integration_metadata() {
+        use integration::{
+            CleanupPolicy, IntegrationMetadata, IntegrationMode, IntegrationStatus,
+        };
+        let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        plan.status = PlanStatus::Completed;
+        plan.integration = Some(IntegrationMetadata {
+            status: IntegrationStatus::Staged,
+            integration_branch: "flowd-integrate/proj/abc".into(),
+            base_branch: "main".into(),
+            mode: IntegrationMode::Confirm,
+            cleanup: CleanupPolicy::KeepOnFailure,
+            started_at: None,
+            completed_at: None,
+            failure: None,
+            refusal: None,
+        });
+
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: Plan = serde_json::from_str(&json).unwrap();
+
+        // The terminal status survives unchanged across the round trip
+        // -- this is the contract callers rely on when integration runs
+        // a second pass against an already-Completed plan.
+        assert_eq!(back.status, PlanStatus::Completed);
+        let meta = back.integration.expect("integration round-trips");
+        assert_eq!(meta.status, IntegrationStatus::Staged);
+        assert_eq!(meta.base_branch, "main");
+    }
+
+    /// Pre-integration plan JSON must still deserialise cleanly so
+    /// existing rows in the `plans.definition` blob keep loading after
+    /// the field is added. Mirrors the legacy-fallback tests that
+    /// guard the clarification and `project_root` fields.
+    #[test]
+    fn plan_deserialises_legacy_json_without_integration_field() {
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        let mut json: serde_json::Value = serde_json::to_value(&plan).unwrap();
+        json.as_object_mut().unwrap().remove("integration");
+
+        let restored: Plan = serde_json::from_value(json).unwrap();
+        assert!(
+            restored.integration.is_none(),
+            "missing integration must surface as None, the legacy fallback"
+        );
+        assert_eq!(restored.steps.len(), 1);
     }
 
     /// Pre-`project_root` plan JSON must still deserialise cleanly so

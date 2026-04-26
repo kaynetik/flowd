@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use super::PlanStatus;
 use super::executor::AgentMetrics;
+use super::integration::{IntegrationMode, IntegrationStatus};
 
 /// Per-terminal-outcome counts rolled up on the `Finished` event.
 ///
@@ -156,6 +157,44 @@ pub enum PlanEvent {
         project: String,
         feedback_summary: String,
     },
+    /// Integration of a [`PlanStatus::Completed`] plan has been
+    /// initiated. Emitted exactly once per `plan_integrate` invocation
+    /// that gets past the eligibility check, before any git work runs.
+    /// Distinct from [`Self::Started`], which is the *plan*'s execution
+    /// transition.
+    IntegrationStarted {
+        plan_id: Uuid,
+        project: String,
+        integration_branch: String,
+        base_branch: String,
+        mode: IntegrationMode,
+    },
+    /// An integration run finished without a failure. `status` carries
+    /// the post-run [`IntegrationStatus`]: `Staged` for a confirm-mode
+    /// run that produced an integration branch awaiting promotion;
+    /// `Promoted` when the fast-forward to base completed.
+    /// `promoted_tip` is `Some` only for `Promoted`.
+    IntegrationSucceeded {
+        plan_id: Uuid,
+        project: String,
+        integration_branch: String,
+        base_branch: String,
+        status: IntegrationStatus,
+        promoted_tip: Option<String>,
+    },
+    /// An integration run failed. `reason` is a one-line, human-readable
+    /// summary suitable for log lines and terse UIs; the structured
+    /// failure / refusal lives on the plan's
+    /// [`super::integration::IntegrationMetadata`] so consumers that
+    /// need a stable error code read it from there rather than
+    /// re-parsing the reason.
+    IntegrationFailed {
+        plan_id: Uuid,
+        project: String,
+        integration_branch: String,
+        base_branch: String,
+        reason: String,
+    },
 }
 
 impl PlanEvent {
@@ -172,7 +211,10 @@ impl PlanEvent {
             | Self::Finished { plan_id, .. }
             | Self::ClarificationOpened { plan_id, .. }
             | Self::ClarificationResolved { plan_id, .. }
-            | Self::RefinementApplied { plan_id, .. } => *plan_id,
+            | Self::RefinementApplied { plan_id, .. }
+            | Self::IntegrationStarted { plan_id, .. }
+            | Self::IntegrationSucceeded { plan_id, .. }
+            | Self::IntegrationFailed { plan_id, .. } => *plan_id,
         }
     }
 
@@ -189,7 +231,10 @@ impl PlanEvent {
             | Self::Finished { project, .. }
             | Self::ClarificationOpened { project, .. }
             | Self::ClarificationResolved { project, .. }
-            | Self::RefinementApplied { project, .. } => project.as_str(),
+            | Self::RefinementApplied { project, .. }
+            | Self::IntegrationStarted { project, .. }
+            | Self::IntegrationSucceeded { project, .. }
+            | Self::IntegrationFailed { project, .. } => project.as_str(),
         }
     }
 }
