@@ -13,16 +13,24 @@
     in the actual command it runs.
   match: "^(Bash|shell|shell_exec|run_command|run_terminal_cmd)$"
 
-- id: cargo-no-workspace-test
+- id: cargo-prefer-nextest
   scope: "**"
   level: warn
   description: |
-    Scope tests with `-p <crate>` during dev iteration;
-    `cargo test --workspace` runs the full suite (the README documents
-    it for pre-commit / CI verification, not for tight feedback loops).
+    Prefer `cargo nextest run -p <crate>` over plain `cargo test` for
+    dev-loop verification. Nextest's per-test process isolation surfaces
+    flakes earlier and parallelises better than libtest, and its
+    `-p <crate>` flag still scopes to the crate under test rather than
+    the whole workspace (`cargo test --workspace` is reserved for
+    pre-commit / CI).
 
-    Same engine caveat as `cargo-no-build`: this is advisory guidance,
-    not a hard gate on the command string.
+    Prerequisite: `cargo install cargo-nextest --locked`. If nextest
+    is not installed, fall back to `cargo test -p <crate>` -- the
+    crate-scoping point still stands.
+
+    Same engine caveat as `cargo-no-build`: the rules engine cannot
+    inspect command strings, so this is advisory guidance surfaced via
+    `rules_list`, not a hard gate.
   match: "^(Bash|shell|shell_exec|run_command|run_terminal_cmd)$"
 
 - id: cargo-no-install-from-path
