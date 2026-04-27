@@ -44,8 +44,8 @@ use crate::error::{FlowdError, Result};
 
 use super::Plan;
 use super::executor::{
-    AgentMetrics, AgentSpawnContext, AgentSpawner, PlanRuntime, StepOutcome, apply_outcome,
-    run_step,
+    AgentMetrics, AgentSpawnContext, AgentSpawner, PlanRuntime, PlanSessionHandle, StepOutcome,
+    apply_outcome, run_step,
 };
 use super::gate::SharedRuleGate;
 use super::observer::{PlanEvent, PlanStepCounts, SharedPlanObserver};
@@ -92,12 +92,22 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
     /// the post-layer snapshot is the executor's responsibility (it is
     /// also the executor that drives the layer iteration), keeping
     /// `LayerRunner` purely concerned with one layer's fan-out.
+    ///
+    /// `last_session` carries the predecessor's conversation handle
+    /// across layers (see [`PlanSessionHandle`]). It is updated
+    /// in-place: cleared at the start of every parallel layer (a
+    /// single conversation cannot fan out across N concurrent CLIs),
+    /// updated to the just-completed step's `session_id` after a
+    /// serial-layer success, and cleared when a serial-layer step
+    /// fails / cancels / returns no `session_id`. The executor owns
+    /// the slot and threads it from one `run` call to the next.
     pub(super) async fn run(
         &self,
         plan_id: Uuid,
         plan: &mut Plan,
         layer: &[String],
         cancel: &Arc<AtomicBool>,
+        last_session: &mut Option<PlanSessionHandle>,
     ) -> Result<LayerOutcome> {
         // Snapshot owned (id, output) pairs for completed steps so the
         // prompt substituter can run while we still hold a `&` to `plan`,
@@ -118,6 +128,15 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
         let mut step_count = PlanStepCounts::default();
 
         let plan_parallel = plan.execution_layers()?.iter().any(|l| l.len() > 1);
+        let layer_serial = layer.len() == 1;
+
+        // Parallel layers cannot resume a session: the conversation
+        // would fork into N concurrent CLI invocations and there is no
+        // sound merge. Drop the slot now so the post-layer
+        // bookkeeping below cannot accidentally re-use it.
+        if !layer_serial {
+            *last_session = None;
+        }
 
         for step_id in layer {
             let Some(mut step) = plan.steps.iter().find(|s| &s.id == step_id).cloned() else {
@@ -132,16 +151,19 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
                 continue;
             }
 
-            let spawner = Arc::clone(self.spawner);
-            let cancel_for_task = Arc::clone(cancel);
-            let default_timeout = self.default_step_timeout_secs;
+            let prior_session_id =
+                resume_id_for_step(layer_serial, last_session.as_ref(), &step.agent_type);
             let ctx = AgentSpawnContext {
                 plan_id,
                 project: plan.project.clone(),
                 plan_parallel,
                 layer_width: layer.len(),
                 project_root: plan.project_root.as_deref().map(std::path::PathBuf::from),
+                prior_session_id,
             };
+            let spawner = Arc::clone(self.spawner);
+            let cancel_for_task = Arc::clone(cancel);
+            let default_timeout = self.default_step_timeout_secs;
             let handle = tokio::spawn(async move {
                 run_step(&*spawner, ctx, step, cancel_for_task, default_timeout).await
             });
@@ -161,56 +183,19 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
                 .map(|s| s.agent_type.clone())
                 .unwrap_or_default();
 
-            match outcome {
-                StepOutcome::Failed { error, metrics } => {
-                    layer_failed = true;
-                    step_count.failed = step_count.failed.saturating_add(1);
-                    if let Some(m) = &metrics {
-                        rollup.merge(m);
-                    }
-                    self.emit(PlanEvent::StepFailed {
-                        plan_id,
-                        project: plan.project.clone(),
-                        step_id,
-                        agent_type,
-                        error,
-                        metrics,
-                    });
-                }
-                StepOutcome::Cancelled => {
-                    // Flip the cancellation latch so the next layer never
-                    // starts, but do *not* mark the layer failed: the
-                    // executor settles the plan as `Cancelled` (not
-                    // `Failed`) when this latch is set at finalisation.
-                    cancel.store(true, Ordering::SeqCst);
-                    self.emit(PlanEvent::StepCancelled {
-                        plan_id,
-                        project: plan.project.clone(),
-                        step_id,
-                        agent_type,
-                    });
-                }
-                StepOutcome::Completed { output, metrics } => {
-                    step_count.completed = step_count.completed.saturating_add(1);
-                    if let Some(m) = &metrics {
-                        rollup.merge(m);
-                    }
-                    self.emit(PlanEvent::StepCompleted {
-                        plan_id,
-                        project: plan.project.clone(),
-                        step_id,
-                        agent_type,
-                        output,
-                        metrics,
-                    });
-                }
-                // Refused outcomes never reach this loop: a denied step is
-                // settled inline by `refuse_via_gate` and never pushed
-                // into `handles`.
-                StepOutcome::Refused { .. } => {
-                    debug_assert!(false, "Refused outcome should never reach the join loop");
-                }
-            }
+            self.handle_outcome(
+                plan_id,
+                plan,
+                step_id,
+                agent_type,
+                outcome,
+                layer_serial,
+                cancel,
+                last_session,
+                &mut layer_failed,
+                &mut step_count,
+                &mut rollup,
+            );
         }
 
         Ok(LayerOutcome {
@@ -218,6 +203,99 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
             metrics: rollup,
             step_count,
         })
+    }
+
+    /// Settle a single completed task: update the resume slot, the
+    /// per-layer counters, the cancellation latch, and emit the
+    /// matching lifecycle event. Pulled out of [`Self::run`] purely
+    /// for clippy's `too_many_lines` budget; all behaviour is
+    /// identical to the inline match this replaced.
+    #[allow(clippy::too_many_arguments)] // intermediate helper, scoped to one caller.
+    fn handle_outcome(
+        &self,
+        plan_id: Uuid,
+        plan: &Plan,
+        step_id: String,
+        agent_type: String,
+        outcome: StepOutcome,
+        layer_serial: bool,
+        cancel: &Arc<AtomicBool>,
+        last_session: &mut Option<PlanSessionHandle>,
+        layer_failed: &mut bool,
+        step_count: &mut PlanStepCounts,
+        rollup: &mut AgentMetrics,
+    ) {
+        match outcome {
+            StepOutcome::Failed { error, metrics } => {
+                *layer_failed = true;
+                step_count.failed = step_count.failed.saturating_add(1);
+                if let Some(m) = &metrics {
+                    rollup.merge(m);
+                }
+                // A failed step in a serial layer breaks the resume
+                // chain: the next step starts fresh.
+                if layer_serial {
+                    *last_session = None;
+                }
+                self.emit(PlanEvent::StepFailed {
+                    plan_id,
+                    project: plan.project.clone(),
+                    step_id,
+                    agent_type,
+                    error,
+                    metrics,
+                });
+            }
+            StepOutcome::Cancelled => {
+                // Flip the cancellation latch so the next layer never
+                // starts, but do *not* mark the layer failed: the
+                // executor settles the plan as `Cancelled` (not
+                // `Failed`) when this latch is set at finalisation.
+                cancel.store(true, Ordering::SeqCst);
+                if layer_serial {
+                    *last_session = None;
+                }
+                self.emit(PlanEvent::StepCancelled {
+                    plan_id,
+                    project: plan.project.clone(),
+                    step_id,
+                    agent_type,
+                });
+            }
+            StepOutcome::Completed {
+                output,
+                metrics,
+                session_id,
+            } => {
+                step_count.completed = step_count.completed.saturating_add(1);
+                if let Some(m) = &metrics {
+                    rollup.merge(m);
+                }
+                // Only refresh the resume slot for serial layers.
+                // Parallel layers never write here; the slot was
+                // already cleared at layer entry above.
+                if layer_serial {
+                    *last_session = session_id.map(|sid| PlanSessionHandle {
+                        agent_type: agent_type.clone(),
+                        session_id: sid,
+                    });
+                }
+                self.emit(PlanEvent::StepCompleted {
+                    plan_id,
+                    project: plan.project.clone(),
+                    step_id,
+                    agent_type,
+                    output,
+                    metrics,
+                });
+            }
+            // Refused outcomes never reach this loop: a denied step is
+            // settled inline by `refuse_via_gate` and never pushed
+            // into `handles`.
+            StepOutcome::Refused { .. } => {
+                debug_assert!(false, "Refused outcome should never reach the join loop");
+            }
+        }
     }
 
     /// Apply the rule gate to a step before spawn. Returns `true` when the
@@ -302,6 +380,30 @@ fn collect_completed_outputs(plan: &Plan) -> Vec<(String, String)> {
         .iter()
         .filter_map(|s| s.output.as_ref().map(|o| (s.id.clone(), o.clone())))
         .collect()
+}
+
+/// Decide what `prior_session_id` to thread into the next step's
+/// [`AgentSpawnContext`].
+///
+/// Returns `Some(id)` only when all three guards hold:
+///
+/// 1. `layer_serial` -- a parallel layer cannot share one
+///    conversation across N concurrent CLI invocations.
+/// 2. The slot is populated -- nothing to resume otherwise.
+/// 3. The predecessor targeted the same `agent_type` -- a Claude
+///    session id handed to Codex / Aider would either be a no-op or
+///    a hard error from the foreign CLI.
+fn resume_id_for_step(
+    layer_serial: bool,
+    last_session: Option<&PlanSessionHandle>,
+    next_agent_type: &str,
+) -> Option<String> {
+    if !layer_serial {
+        return None;
+    }
+    last_session
+        .filter(|h| h.agent_type == next_agent_type)
+        .map(|h| h.session_id.clone())
 }
 
 /// Translate a `JoinHandle` result into a [`StepOutcome`]. Centralised so
@@ -410,6 +512,7 @@ mod tests {
             StepOutcome::Completed {
                 output: "ok".into(),
                 metrics: None,
+                session_id: None,
             }
         });
         let outcome = await_outcome(handle, "fast").await;

@@ -1,6 +1,6 @@
 [package]
 name = "flowd-cli"
-version = "0.5.1"
+version = "0.5.2"
 description = "CLI binary for the flowd daemon"
 edition.workspace = true
 rust-version.workspace = true

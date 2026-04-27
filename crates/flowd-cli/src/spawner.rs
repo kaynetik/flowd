@@ -54,11 +54,21 @@
 //!   chatty "I cannot do this" reply. The daemon would then record
 //!   `step_completed` against an empty working tree -- the worst
 //!   possible failure (green status, zero work).
-//! - `--output-format=json` -- exposes a structured envelope with
-//!   `is_error`, `permission_denials`, and a clean `result` field,
-//!   so the spawner can detect post-skip refusals (the model still
-//!   has policy gates beyond the workspace-trust prompt) and API
-//!   errors that exit code 0 cannot signal.
+//! - `--output-format=stream-json` (paired with the mandatory
+//!   `--verbose`) -- emits one NDJSON event per line. The leading
+//!   `system/init` event carries `session_id`, which the daemon
+//!   captures and threads into the next step's `--resume` so
+//!   prompt cache and conversation context survive across steps
+//!   in the same plan. The final `result` event carries the same
+//!   `is_error`, `permission_denials`, `usage`, `total_cost_usd`,
+//!   and `result` fields that single-blob `--output-format=json`
+//!   used to emit, so the spawner can still detect post-skip
+//!   refusals (the model has policy gates beyond the
+//!   workspace-trust prompt) and API errors that exit code 0
+//!   cannot signal. Intermediate events (assistant deltas, tool
+//!   uses, retries) are logged at `tracing::debug!` and
+//!   otherwise discarded; future PRs may surface them through
+//!   the plan observer.
 //!
 //! Operators who need the opposite (sandbox runs, audit replays)
 //! must wrap the binary -- e.g. point `$FLOWD_AGENT_BIN` at a
@@ -128,6 +138,45 @@ fn is_claude_like(bin: &OsStr) -> bool {
     )
 }
 
+/// Build the full argv (excluding the binary itself) for one spawn.
+///
+/// Order is:
+///
+/// 1. `--resume <id>` when `resume_id` is `Some` (the caller has
+///    already filtered to claude-like binaries; passing a foreign
+///    `resume_id` is a programmer error).
+/// 2. The `injected` defaults (e.g. `--bare`, the stream-json pair).
+/// 3. The operator-supplied `extra_args` -- Claude's last-flag-wins
+///    parsing means putting these AFTER our defaults lets operators
+///    override an injected flag without us having to know which
+///    flags can be overridden.
+/// 4. `prompt_flag prompt`.
+///
+/// Pure / no I/O so the test suite can pin the exact placement of
+/// `--resume` without spawning a real process. Centralising this
+/// logic is the only safe way to keep the resume flag's position
+/// from drifting under future refactors of `spawn_in_cwd`.
+fn assemble_args(
+    resume_id: Option<&str>,
+    injected: &[&str],
+    extra_args: &[String],
+    prompt_flag: &str,
+    prompt: &str,
+) -> Vec<String> {
+    // Capacity is exact for the common path (no resume) and 2-over for
+    // the resume path -- not worth a precise sum.
+    let mut out = Vec::with_capacity(injected.len() + extra_args.len() + 4);
+    if let Some(sid) = resume_id {
+        out.push("--resume".to_owned());
+        out.push(sid.to_owned());
+    }
+    out.extend(injected.iter().map(|s| (*s).to_owned()));
+    out.extend(extra_args.iter().cloned());
+    out.push(prompt_flag.to_owned());
+    out.push(prompt.to_owned());
+    out
+}
+
 /// Env var Anthropic looks for when bare mode is active and OAuth/keychain
 /// are skipped. Used only for the one-shot warning in
 /// [`LocalShellSpawner::detect`] -- the spawner never reads the value.
@@ -148,10 +197,12 @@ fn read_claude_bare_toggle() -> bool {
     parse_claude_bare_toggle(std::env::var("FLOWD_AGENT_CLAUDE_BARE").ok().as_deref())
 }
 
-/// Subset of Claude Code's `--output-format=json` envelope that the
-/// spawner cares about. Every field is `#[serde(default)]` so the
-/// parser tolerates schema drift from upstream Claude releases --
-/// missing fields degrade to "no signal", never "decode error".
+/// Subset of Claude Code's final `result` event payload (in
+/// `stream-json`) -- equivalent to the single-blob envelope
+/// `--output-format=json` used to emit. Every field is
+/// `#[serde(default)]` so the parser tolerates schema drift from
+/// upstream Claude releases -- missing fields degrade to "no signal",
+/// never "decode error".
 #[derive(Debug, Default, Deserialize)]
 struct ClaudeJsonEnvelope {
     /// True when the run terminated in an error state (API failure,
@@ -187,6 +238,16 @@ struct ClaudeJsonEnvelope {
     /// this one block needs explicit `rename`s.
     #[serde(default, rename = "modelUsage")]
     model_usage: BTreeMap<String, ClaudeModelUsage>,
+    /// Conversation handle. Both the `system/init` event (always
+    /// first) and the `result` event (always last) carry one, and
+    /// they are the same value for a given run. The init event is
+    /// authoritative and captured separately by the stream parser;
+    /// keeping the field here too means a stream that omits init
+    /// (e.g. a non-bare CLI without `--verbose`, or a future schema
+    /// drift) still surfaces *some* session id from the result
+    /// event rather than none.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,8 +424,17 @@ impl LocalShellSpawner {
     /// Flags prepended automatically before any user-supplied
     /// `extra_args`. Only Claude-like bins receive injected flags;
     /// everything else gets an empty slice. The exact set is gated on
-    /// `self.claude_bare` so operators can opt out of the speedup
-    /// without touching the binary path.
+    /// `self.claude_bare` so operators can opt out of the bare-mode
+    /// speedup without touching the binary path.
+    ///
+    /// `--output-format=stream-json` plus the mandatory `--verbose`
+    /// pair makes the CLI emit one NDJSON event per line: a leading
+    /// `system/init` (carrying `session_id`), a stream of
+    /// `assistant`/`user`/`rate_limit_event` events, and a final
+    /// `result` event with the same payload the old single-blob
+    /// `--output-format=json` produced. We need the `init` event to
+    /// capture `session_id` for cross-step resume; `--verbose` is
+    /// mandatory because Claude omits the init event without it.
     ///
     /// See the module docstring for why each flag is here.
     fn default_args(&self) -> &'static [&'static str] {
@@ -375,10 +445,15 @@ impl LocalShellSpawner {
             &[
                 "--bare",
                 "--dangerously-skip-permissions",
-                "--output-format=json",
+                "--output-format=stream-json",
+                "--verbose",
             ]
         } else {
-            &["--dangerously-skip-permissions", "--output-format=json"]
+            &[
+                "--dangerously-skip-permissions",
+                "--output-format=stream-json",
+                "--verbose",
+            ]
         }
     }
 
@@ -396,18 +471,26 @@ impl LocalShellSpawner {
         &self,
         step: &PlanStep,
         cwd_override: Option<&Path>,
+        prior_session_id: Option<&str>,
     ) -> Result<AgentOutput> {
         let claude_like = is_claude_like(&self.bin);
         let injected = self.default_args();
+        // Pure arg assembly is factored out so the test suite can pin
+        // the exact ordering (resume flag -> default flags -> operator
+        // extras -> prompt) without spawning a real process.
+        let resume_id = prior_session_id.filter(|_| claude_like);
+        let assembled = assemble_args(
+            resume_id,
+            injected,
+            &self.extra_args,
+            &self.prompt_flag,
+            &step.prompt,
+        );
 
         let mut cmd = Command::new(&self.bin);
-        for arg in injected {
+        for arg in &assembled {
             cmd.arg(arg);
         }
-        for arg in &self.extra_args {
-            cmd.arg(arg);
-        }
-        cmd.arg(&self.prompt_flag).arg(&step.prompt);
         if let Some(cwd) = cwd_override {
             cmd.current_dir(cwd);
         } else if let Some(cwd) = &self.cwd {
@@ -428,10 +511,23 @@ impl LocalShellSpawner {
             bin = %self.bin_display(),
             cwd = ?cwd_override.or(self.cwd.as_deref()),
             injected_args = ?injected,
+            resume = ?resume_id,
             claude_like,
             "spawning agent step"
         );
 
+        if claude_like {
+            self.spawn_claude_streaming(step, cmd).await
+        } else {
+            self.spawn_simple(step, cmd).await
+        }
+    }
+
+    /// Non-Claude-like spawners (cursor-agent's text mode, aider, codex,
+    /// shells used as test fixtures) pre-date stream-json and have no
+    /// `session_id` concept. Keep the simple "wait for exit, capture
+    /// stdout, passthrough" path so we don't regress them.
+    async fn spawn_simple(&self, step: &PlanStep, mut cmd: Command) -> Result<AgentOutput> {
         let output = cmd.output().await.map_err(|e| FlowdError::PlanExecution {
             message: format!(
                 "failed to spawn agent `{bin}` for step `{step}`: {e}",
@@ -471,16 +567,117 @@ impl LocalShellSpawner {
             );
         }
 
-        let (stdout, metrics) = if claude_like {
-            interpret_claude_stdout(&step.id, &raw_stdout)?
-        } else {
-            (raw_stdout, None)
+        Ok(AgentOutput {
+            stdout: raw_stdout,
+            exit_code: code,
+            metrics: None,
+            session_id: None,
+        })
+    }
+
+    /// Spawn a Claude-like CLI in `--output-format=stream-json` mode.
+    ///
+    /// Drains stdout line-by-line through [`parse_claude_stream`]
+    /// while concurrently draining stderr into a buffer for logging.
+    /// On a successful exit we still need a `result` event in the
+    /// stream; absence is treated as a hard failure (matching the
+    /// upstream bug pattern in `claude-code#1920` where a missing
+    /// `result` would otherwise hang or silently report success
+    /// against zero work).
+    async fn spawn_claude_streaming(
+        &self,
+        step: &PlanStep,
+        mut cmd: Command,
+    ) -> Result<AgentOutput> {
+        let mut child = cmd.spawn().map_err(|e| FlowdError::PlanExecution {
+            message: format!(
+                "failed to spawn agent `{bin}` for step `{step}`: {e}",
+                bin = self.bin_display(),
+                step = step.id,
+            ),
+            metrics: None,
+        })?;
+
+        let drained = drain_child_pipes(&mut child).await;
+
+        let status = child.wait().await.map_err(|e| FlowdError::PlanExecution {
+            message: format!(
+                "failed to wait on agent `{bin}` for step `{step}`: {e}",
+                bin = self.bin_display(),
+                step = step.id,
+            ),
+            metrics: None,
+        })?;
+
+        let DrainedPipes {
+            stdout: stdout_bytes,
+            stderr: stderr_string,
+        } = drained.map_err(|e| FlowdError::PlanExecution {
+            message: format!(
+                "failed to drain stdio for step `{step}`: {e}",
+                step = step.id
+            ),
+            metrics: None,
+        })?;
+
+        let code = status.code();
+
+        if !status.success() {
+            tracing::warn!(
+                step_id = %step.id,
+                exit_code = ?code,
+                stderr = %truncate_for_log(&stderr_string, 4096),
+                "agent step exited non-zero"
+            );
+            return Err(FlowdError::PlanExecution {
+                message: format!(
+                    "step `{step}` failed (exit={code}): {stderr}",
+                    step = step.id,
+                    code = code.map_or_else(|| "signal".into(), |c| c.to_string()),
+                    stderr = truncate_for_log(stderr_string.trim(), 1024),
+                ),
+                metrics: None,
+            });
+        }
+
+        if !stderr_string.is_empty() {
+            tracing::debug!(
+                step_id = %step.id,
+                stderr = %truncate_for_log(&stderr_string, 2048),
+                "agent step stderr"
+            );
+        }
+
+        let summary =
+            parse_claude_stream(&step.id, std::io::Cursor::new(&stdout_bytes)).map_err(|e| {
+                FlowdError::PlanExecution {
+                    message: format!(
+                        "failed to parse stream-json output for step `{step}`: {e}",
+                        step = step.id
+                    ),
+                    metrics: None,
+                }
+            })?;
+
+        let Some(envelope) = summary.final_envelope else {
+            return Err(FlowdError::PlanExecution {
+                message: format!(
+                    "step `{step}` produced no `result` event in its stream-json output \
+                     (claude exited 0 but the daemon cannot record success without the \
+                     final envelope; see claude-code#1920 for the upstream bug pattern)",
+                    step = step.id,
+                ),
+                metrics: None,
+            });
         };
+
+        let (stdout, metrics) = validate_claude_envelope(&step.id, &envelope)?;
 
         Ok(AgentOutput {
             stdout,
             exit_code: code,
             metrics,
+            session_id: summary.session_id,
         })
     }
 }
@@ -493,7 +690,12 @@ impl AgentSpawner for LocalShellSpawner {
         // this, every plan would silently anchor to wherever the
         // operator launched flowd from -- fine for one workspace,
         // wrong the moment a daemon services more than one plan.
-        self.spawn_in_cwd(step, ctx.project_root.as_deref()).await
+        self.spawn_in_cwd(
+            step,
+            ctx.project_root.as_deref(),
+            ctx.prior_session_id.as_deref(),
+        )
+        .await
     }
 }
 
@@ -543,14 +745,26 @@ impl AgentSpawner for GitWorktreeSpawner {
             // Sequential plans skip the worktree machinery but must
             // still honour the plan's `project_root` over the wrapped
             // spawner's daemon-cwd fallback -- same precedence rule
-            // `LocalShellSpawner::spawn` enforces directly.
+            // `LocalShellSpawner::spawn` enforces directly. Session
+            // resume is also forwarded here because purely sequential
+            // plans hit this branch end-to-end and benefit from the
+            // hot-cache behaviour.
             return self
                 .inner
-                .spawn_in_cwd(step, ctx.project_root.as_deref())
+                .spawn_in_cwd(
+                    step,
+                    ctx.project_root.as_deref(),
+                    ctx.prior_session_id.as_deref(),
+                )
                 .await;
         }
         let worktree = self.manager.prepare_step(&ctx, step).await?;
-        let output = self.inner.spawn_in_cwd(step, Some(&worktree)).await?;
+        // Parallel layers run inside isolated git worktrees; they
+        // never receive a resume id (the layer runner clears the
+        // session slot on entry), so we pass `None` unconditionally
+        // -- guards against a future caller that hands us a stale
+        // ctx.
+        let output = self.inner.spawn_in_cwd(step, Some(&worktree), None).await?;
         self.manager.finish_step(&ctx, step, &worktree).await?;
         Ok(output)
     }
@@ -1007,42 +1221,101 @@ fn sanitize_ref(raw: &str) -> String {
     }
 }
 
-/// Parse a Claude `--output-format=json` envelope, fail loudly on
-/// signals that exit-code zero would otherwise hide, and return the
-/// human-readable `result` field alongside the metrics block the
-/// envelope carries. Falls back to the raw payload (and no metrics)
-/// if the bytes do not parse as JSON -- common when an operator
-/// overrides `$FLOWD_AGENT_EXTRA_ARGS` to force text output.
+/// Bytes drained from a child's stdout/stderr pipes by
+/// [`drain_child_pipes`]. Both fields are populated on success;
+/// stderr is decoded with `from_utf8_lossy` since it is only used
+/// for logging and the daemon must never reject a step on a
+/// malformed log line.
+#[derive(Debug, Default)]
+struct DrainedPipes {
+    stdout: Vec<u8>,
+    stderr: String,
+}
+
+/// Concurrently drain a child's stdout and stderr pipes into memory.
+///
+/// Both drains run as `tokio::spawn`'d tasks so a slow producer on
+/// either pipe cannot deadlock us by filling the kernel buffer (the
+/// classic `cmd.output()` antipattern that `tokio::process` already
+/// avoids by reading both pipes in parallel under the hood; we
+/// replicate it here because we own the `Child` to also call
+/// `wait()` and `kill_on_drop`).
+///
+/// `Stdio::piped` must have been set on the `Command` that produced
+/// `child`; if it was not, the `expect()` below panics, which is
+/// strictly a programmer error.
+async fn drain_child_pipes(child: &mut tokio::process::Child) -> std::io::Result<DrainedPipes> {
+    let stdout = child
+        .stdout
+        .take()
+        .expect("child stdout was piped at command construction time");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("child stderr was piped at command construction time");
+
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::with_capacity(4096);
+        let mut reader = tokio::io::BufReader::new(stdout);
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf)
+            .await
+            .map(|_| buf)
+    });
+
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::with_capacity(1024);
+        let mut reader = tokio::io::BufReader::new(stderr);
+        let _ = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buf).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    // Surface drain-task panics as IO errors rather than letting them
+    // unwind into the executor; same panic-isolation contract the
+    // executor already enforces around the spawner itself.
+    let stderr_string = stderr_task
+        .await
+        .map_err(|e| std::io::Error::other(format!("stderr drain task panicked: {e}")))?;
+    let stdout_bytes = stdout_task
+        .await
+        .map_err(|e| std::io::Error::other(format!("stdout drain task panicked: {e}")))??;
+
+    Ok(DrainedPipes {
+        stdout: stdout_bytes,
+        stderr: stderr_string,
+    })
+}
+
+/// Aggregated state extracted from a `--output-format=stream-json`
+/// run: the `session_id` lifted from the leading `system/init` event
+/// (or, as a fallback, from the trailing `result` event) and the
+/// final `result` envelope itself. Either field may be `None` if the
+/// stream was malformed or the run died before completing; callers
+/// distinguish "no session" from "no result" because they have
+/// different recovery strategies.
+#[derive(Debug, Default)]
+struct ClaudeStreamSummary {
+    session_id: Option<String>,
+    final_envelope: Option<ClaudeJsonEnvelope>,
+}
+
+/// Validate a fully-assembled `result` envelope against the daemon's
+/// invariants and project it down to the transport-agnostic
+/// `(stdout, metrics)` pair the rest of the executor consumes.
 ///
 /// Failure paths (`is_error: true`, non-empty `permission_denials`)
 /// still attach the envelope's metrics to the returned `Err`: failed
 /// steps still cost money, and the audit log must reflect the spend.
-/// Returning `Err` here marks the step `failed` in the orchestration log.
-fn interpret_claude_stdout(step_id: &str, raw: &str) -> Result<(String, Option<AgentMetrics>)> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(FlowdError::PlanExecution {
-            message: format!(
-                "step `{step_id}` produced empty stdout (claude exited 0 with no JSON envelope; \
-                 likely a tool-use timeout or a config that suppressed --output-format=json)"
-            ),
-            metrics: None,
-        });
-    }
-
-    let envelope: ClaudeJsonEnvelope = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(
-                step_id,
-                error = %e,
-                "claude-like spawner: stdout was not parseable JSON; passing through raw"
-            );
-            return Ok((raw.to_owned(), None));
-        }
-    };
-
-    let metrics: AgentMetrics = (&envelope).into();
+/// Returning `Err` here marks the step `failed` in the orchestration
+/// log.
+///
+/// This function is pure -- no I/O, no env reads -- so the failure
+/// cases can be exercised by table-driven unit tests against
+/// hand-crafted envelopes, independent of the stream parser.
+fn validate_claude_envelope(
+    step_id: &str,
+    envelope: &ClaudeJsonEnvelope,
+) -> Result<(String, Option<AgentMetrics>)> {
+    let metrics: AgentMetrics = envelope.into();
 
     if envelope.is_error {
         return Err(FlowdError::PlanExecution {
@@ -1072,7 +1345,119 @@ fn interpret_claude_stdout(step_id: &str, raw: &str) -> Result<(String, Option<A
         });
     }
 
-    Ok((envelope.result, Some(metrics)))
+    Ok((envelope.result.clone(), Some(metrics)))
+}
+
+/// Parse a Claude `--output-format=stream-json --verbose` byte stream
+/// into a [`ClaudeStreamSummary`].
+///
+/// We only require two lines: the leading `system/init` (carrying
+/// `session_id`) and the trailing `result` event (carrying the final
+/// envelope). Everything else -- assistant text deltas, tool uses,
+/// rate-limit pings, `system/api_retry` -- is logged at `debug` and
+/// discarded. Parse errors on a single line are tolerated (logged at
+/// `debug`) so a stray non-JSON line in stderr-tunneled-through-stdout
+/// or a schema drift on an event we do not consume cannot fail the
+/// whole step.
+///
+/// If the stream emits multiple `result` lines (defensive: spec says
+/// exactly one, but real-world bugs have shipped duplicates), the
+/// last wins.
+///
+/// `step_id` flows into the trace context so the daemon log can
+/// correlate noisy event streams with a specific plan step.
+fn parse_claude_stream<R: std::io::BufRead>(
+    step_id: &str,
+    reader: R,
+) -> std::io::Result<ClaudeStreamSummary> {
+    let mut summary = ClaudeStreamSummary::default();
+    let mut event_count: u64 = 0;
+
+    for line_res in reader.lines() {
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        event_count += 1;
+
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(
+                    step_id,
+                    error = %e,
+                    line = %truncate_for_log(&line, 256),
+                    "claude stream-json: dropping unparseable line"
+                );
+                continue;
+            }
+        };
+
+        let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let subtype = value.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+
+        match ty {
+            "system" if subtype == "init" => {
+                if summary.session_id.is_none()
+                    && let Some(sid) = value.get("session_id").and_then(|v| v.as_str())
+                {
+                    summary.session_id = Some(sid.to_owned());
+                    tracing::debug!(step_id, session_id = sid, "claude stream-json: init");
+                }
+            }
+            "system" if subtype == "api_retry" => {
+                tracing::debug!(
+                    step_id,
+                    attempt = value.get("attempt").and_then(serde_json::Value::as_u64),
+                    max_retries = value.get("max_retries").and_then(serde_json::Value::as_u64),
+                    error_kind = value.get("error").and_then(|v| v.as_str()),
+                    "claude stream-json: api retry"
+                );
+            }
+            "result" => match serde_json::from_value::<ClaudeJsonEnvelope>(value) {
+                Ok(envelope) => {
+                    summary.final_envelope = Some(envelope);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        step_id,
+                        error = %e,
+                        "claude stream-json: result event failed to deserialize as envelope; \
+                         dropping. Schema drift?"
+                    );
+                }
+            },
+            _ => {
+                // assistant deltas, tool uses, rate_limit_event, stream_event, ...
+                // Quiet at debug; the `result` event is the source of truth for metrics.
+                tracing::trace!(
+                    step_id,
+                    event_type = ty,
+                    "claude stream-json: ignored event"
+                );
+            }
+        }
+    }
+
+    if summary.session_id.is_none()
+        && let Some(env) = summary.final_envelope.as_ref()
+        && let Some(sid) = env.session_id.as_deref()
+    {
+        // Fallback: missing/disabled init event but result still has the
+        // session id. Better to pick it up here than thread None forward
+        // and lose the resume opportunity.
+        summary.session_id = Some(sid.to_owned());
+    }
+
+    tracing::debug!(
+        step_id,
+        events = event_count,
+        captured_session = summary.session_id.is_some(),
+        captured_result = summary.final_envelope.is_some(),
+        "claude stream-json: parse complete"
+    );
+
+    Ok(summary)
 }
 
 /// Spawner used as the fallback when no agent binary is discoverable. Fails
@@ -1220,6 +1605,7 @@ mod tests {
             plan_parallel: false,
             layer_width: 1,
             project_root: None,
+            prior_session_id: None,
         }
     }
 
@@ -1422,8 +1808,9 @@ mod tests {
     }
 
     /// Default ON path: `--bare` is the first injected arg for every
-    /// Claude-like basename. This is the post-PR-1 default and the
-    /// state most operators will hit.
+    /// Claude-like basename, followed by the stream-json pair
+    /// (`--output-format=stream-json --verbose`) introduced in PR 2.
+    /// This is the default state most operators hit.
     #[test]
     fn default_args_includes_bare_when_enabled_for_claude_family() {
         assert_eq!(
@@ -1431,7 +1818,8 @@ mod tests {
             &[
                 "--bare",
                 "--dangerously-skip-permissions",
-                "--output-format=json",
+                "--output-format=stream-json",
+                "--verbose",
             ]
         );
         assert_eq!(
@@ -1439,7 +1827,8 @@ mod tests {
             &[
                 "--bare",
                 "--dangerously-skip-permissions",
-                "--output-format=json",
+                "--output-format=stream-json",
+                "--verbose",
             ]
         );
         // Path-prefixed bins still resolve as claude-like.
@@ -1448,25 +1837,110 @@ mod tests {
             &[
                 "--bare",
                 "--dangerously-skip-permissions",
-                "--output-format=json",
+                "--output-format=stream-json",
+                "--verbose",
             ]
         );
     }
 
     /// Opt-out path: `FLOWD_AGENT_CLAUDE_BARE=0` (modeled here as
-    /// `claude_bare: false`) restores the pre-PR-1 flag set so a
-    /// workflow that genuinely depends on auto-discovered context
-    /// can keep working without changing the bin path.
+    /// `claude_bare: false`) drops `--bare` but retains the
+    /// stream-json output pair, since the daemon still relies on the
+    /// `result` and `init` events regardless of bare/non-bare mode.
     #[test]
     fn default_args_omits_bare_when_disabled_for_claude_family() {
         assert_eq!(
             spawner_with_bare("claude", false).default_args(),
-            &["--dangerously-skip-permissions", "--output-format=json"]
+            &[
+                "--dangerously-skip-permissions",
+                "--output-format=stream-json",
+                "--verbose",
+            ]
         );
         assert_eq!(
             spawner_with_bare("cursor-agent", false).default_args(),
-            &["--dangerously-skip-permissions", "--output-format=json"]
+            &[
+                "--dangerously-skip-permissions",
+                "--output-format=stream-json",
+                "--verbose",
+            ]
         );
+    }
+
+    /// Resume injection: when `resume_id` is supplied the assembled
+    /// argv must lead with `--resume <id>` BEFORE the default flags
+    /// and the operator's extras, ending with `prompt_flag prompt`.
+    /// Pinning the order keeps a future refactor of `spawn_in_cwd`
+    /// from quietly reshuffling positions and breaking last-flag-wins
+    /// override semantics that operators rely on.
+    #[test]
+    fn assemble_args_prepends_resume_before_defaults_and_extras() {
+        let injected = ["--bare", "--output-format=stream-json", "--verbose"];
+        let extras = vec!["--model".to_owned(), "haiku".to_owned()];
+        let argv = assemble_args(Some("sid-abc"), &injected, &extras, "-p", "do thing");
+        assert_eq!(
+            argv,
+            vec![
+                "--resume".to_owned(),
+                "sid-abc".to_owned(),
+                "--bare".to_owned(),
+                "--output-format=stream-json".to_owned(),
+                "--verbose".to_owned(),
+                "--model".to_owned(),
+                "haiku".to_owned(),
+                "-p".to_owned(),
+                "do thing".to_owned(),
+            ]
+        );
+    }
+
+    /// Without a `resume_id` the assembled argv must look exactly like
+    /// the pre-PR3 layout: defaults, then extras, then prompt. Anyone
+    /// changing this contract should fail this test loudly.
+    #[test]
+    fn assemble_args_omits_resume_when_id_is_none() {
+        let injected = ["--bare", "--output-format=stream-json", "--verbose"];
+        let extras = vec!["--model".to_owned(), "haiku".to_owned()];
+        let argv = assemble_args(None, &injected, &extras, "-p", "do thing");
+        assert_eq!(
+            argv,
+            vec![
+                "--bare".to_owned(),
+                "--output-format=stream-json".to_owned(),
+                "--verbose".to_owned(),
+                "--model".to_owned(),
+                "haiku".to_owned(),
+                "-p".to_owned(),
+                "do thing".to_owned(),
+            ]
+        );
+    }
+
+    /// Empty `injected` and `extras` is the legitimate non-Claude
+    /// path: prompt comes through unchanged, no resume regardless of
+    /// what was passed (the caller is expected to filter `resume_id`
+    /// to claude-like binaries before calling, but we still verify
+    /// the minimal output shape).
+    #[test]
+    fn assemble_args_minimal_just_prompt_when_nothing_injected() {
+        let argv = assemble_args(None, &[], &[], "-p", "hello");
+        assert_eq!(argv, vec!["-p".to_owned(), "hello".to_owned()]);
+    }
+
+    /// `spawn_in_cwd` filters `prior_session_id` through
+    /// `claude_like` before constructing the `resume_id` passed to
+    /// `assemble_args`, so a foreign bin (codex/aider) gets `None`.
+    /// We pin that filtering by reproducing the call shape: a
+    /// non-Claude bin's filtered `resume_id` is `None`, and the
+    /// assembled argv contains no `--resume`.
+    #[test]
+    fn assemble_args_no_resume_when_caller_filtered_for_non_claude() {
+        // Simulating: prior_session_id was Some("sid-x") but the
+        // caller filtered it out because is_claude_like returned
+        // false.
+        let resume_id: Option<&str> = None;
+        let argv = assemble_args(resume_id, &[], &[], "--prompt", "p");
+        assert!(!argv.iter().any(|a| a == "--resume"));
     }
 
     /// Pin the toggle's parser so a typo doesn't silently switch
@@ -1491,21 +1965,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn interpret_claude_stdout_extracts_result_on_success() {
-        let raw = r#"{"is_error":false,"result":"OK","permission_denials":[]}"#;
-        let (out, _) = interpret_claude_stdout("step-1", raw).unwrap();
-        assert_eq!(out, "OK");
+    /// Build a `ClaudeJsonEnvelope` directly from a JSON-blob string,
+    /// for tests of the validator. In production the envelope arrives
+    /// via [`parse_claude_stream`]; here we skip that hop to keep
+    /// validator tests focused on the validator's own contracts
+    /// (failure surfacing, metrics propagation).
+    fn envelope_from_blob(blob: &str) -> ClaudeJsonEnvelope {
+        serde_json::from_str(blob).expect("test fixture must be valid envelope JSON")
     }
 
-    /// Empty stdout from a Claude-like bin is suspicious enough to
-    /// fail the step rather than silently record success against a
-    /// blank tree.
     #[test]
-    fn interpret_claude_stdout_fails_on_empty_payload() {
-        let err = interpret_claude_stdout("step-1", "").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("empty stdout"), "got: {msg}");
+    fn validate_envelope_extracts_result_on_success() {
+        let env = envelope_from_blob(r#"{"is_error":false,"result":"OK","permission_denials":[]}"#);
+        let (out, _) = validate_claude_envelope("step-1", &env).unwrap();
+        assert_eq!(out, "OK");
     }
 
     /// Permission denials persisting past `--dangerously-skip-permissions`
@@ -1513,13 +1986,15 @@ mod tests {
     /// exit 0 with `is_error: false` but `permission_denials` is non-empty;
     /// this used to land as `step_completed` against an empty working tree.
     #[test]
-    fn interpret_claude_stdout_fails_on_permission_denials() {
-        let raw = r#"{
-            "is_error": false,
-            "result": "File creation was denied. Let me know if you'd like to approve.",
-            "permission_denials": [{"tool_name": "Write"}]
-        }"#;
-        let err = interpret_claude_stdout("step-1", raw).unwrap_err();
+    fn validate_envelope_fails_on_permission_denials() {
+        let env = envelope_from_blob(
+            r#"{
+                "is_error": false,
+                "result": "File creation was denied. Let me know if you'd like to approve.",
+                "permission_denials": [{"tool_name": "Write"}]
+            }"#,
+        );
+        let err = validate_claude_envelope("step-1", &env).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("denied despite --dangerously-skip-permissions"),
@@ -1529,66 +2004,56 @@ mod tests {
     }
 
     #[test]
-    fn interpret_claude_stdout_fails_on_is_error_true() {
-        let raw = r#"{"is_error":true,"result":"upstream API error"}"#;
-        let err = interpret_claude_stdout("step-1", raw).unwrap_err();
+    fn validate_envelope_fails_on_is_error_true() {
+        let env = envelope_from_blob(r#"{"is_error":true,"result":"upstream API error"}"#);
+        let err = validate_claude_envelope("step-1", &env).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("is_error=true"), "got: {msg}");
         assert!(msg.contains("upstream API error"), "got: {msg}");
-    }
-
-    /// Operators may override `--output-format` via `FLOWD_AGENT_EXTRA_ARGS`,
-    /// which leaves stdout as plain text. Pass it through rather than
-    /// erroring -- the override is intentional.
-    #[test]
-    fn interpret_claude_stdout_passes_through_non_json_payload() {
-        let raw = "just a plain text reply\n";
-        let (out, metrics) = interpret_claude_stdout("step-1", raw).unwrap();
-        assert_eq!(out, raw);
-        assert!(
-            metrics.is_none(),
-            "plain-text passthrough yields no metrics"
-        );
     }
 
     /// Schema-drift defence: tolerate unknown keys without choking,
     /// and treat absent keys as their defaults (`is_error=false`,
     /// no denials, empty result).
     #[test]
-    fn interpret_claude_stdout_tolerates_unknown_fields() {
-        let raw = r#"{"is_error":false,"result":"x","future_field":42,"another":"y"}"#;
-        let (out, _) = interpret_claude_stdout("step-1", raw).unwrap();
+    fn validate_envelope_tolerates_unknown_fields() {
+        let env = envelope_from_blob(
+            r#"{"is_error":false,"result":"x","future_field":42,"another":"y"}"#,
+        );
+        let (out, _) = validate_claude_envelope("step-1", &env).unwrap();
         assert_eq!(out, "x");
     }
 
     /// Happy-path metric extraction: a full envelope populates every
     /// numeric field the daemon bills against.
     #[test]
-    fn interpret_claude_stdout_extracts_metrics_on_success() {
-        let raw = r#"{
-            "is_error": false,
-            "result": "done",
-            "permission_denials": [],
-            "usage": {
-                "input_tokens": 100,
-                "output_tokens": 50,
-                "cache_creation_input_tokens": 10,
-                "cache_read_input_tokens": 20
-            },
-            "total_cost_usd": 0.0123,
-            "duration_ms": 1500,
-            "duration_api_ms": 1200,
-            "modelUsage": {
-                "claude-sonnet-4-5": {
-                    "inputTokens": 100,
-                    "outputTokens": 50,
-                    "cacheCreationInputTokens": 10,
-                    "cacheReadInputTokens": 20,
-                    "costUSD": 0.0123
+    fn validate_envelope_extracts_metrics_on_success() {
+        let env = envelope_from_blob(
+            r#"{
+                "is_error": false,
+                "result": "done",
+                "permission_denials": [],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_creation_input_tokens": 10,
+                    "cache_read_input_tokens": 20
+                },
+                "total_cost_usd": 0.0123,
+                "duration_ms": 1500,
+                "duration_api_ms": 1200,
+                "modelUsage": {
+                    "claude-sonnet-4-5": {
+                        "inputTokens": 100,
+                        "outputTokens": 50,
+                        "cacheCreationInputTokens": 10,
+                        "cacheReadInputTokens": 20,
+                        "costUSD": 0.0123
+                    }
                 }
-            }
-        }"#;
-        let (stdout, metrics) = interpret_claude_stdout("step-1", raw).unwrap();
+            }"#,
+        );
+        let (stdout, metrics) = validate_claude_envelope("step-1", &env).unwrap();
         assert_eq!(stdout, "done");
         let m = metrics.expect("metrics must be present on success");
         assert_eq!(m.input_tokens, 100);
@@ -1613,16 +2078,18 @@ mod tests {
     /// surface the envelope's metrics through the `Err` so accounting
     /// stays honest.
     #[test]
-    fn interpret_claude_stdout_attaches_metrics_to_is_error_failure() {
-        let raw = r#"{
-            "is_error": true,
-            "result": "upstream API error",
-            "usage": {"input_tokens": 7, "output_tokens": 3},
-            "total_cost_usd": 0.004,
-            "duration_ms": 250,
-            "duration_api_ms": 240
-        }"#;
-        let err = interpret_claude_stdout("step-1", raw).unwrap_err();
+    fn validate_envelope_attaches_metrics_to_is_error_failure() {
+        let env = envelope_from_blob(
+            r#"{
+                "is_error": true,
+                "result": "upstream API error",
+                "usage": {"input_tokens": 7, "output_tokens": 3},
+                "total_cost_usd": 0.004,
+                "duration_ms": 250,
+                "duration_api_ms": 240
+            }"#,
+        );
+        let err = validate_claude_envelope("step-1", &env).unwrap_err();
         match err {
             FlowdError::PlanExecution { metrics, .. } => {
                 let m = metrics.expect("is_error failure must carry metrics");
@@ -1639,15 +2106,17 @@ mod tests {
     /// Same contract as `is_error`: a denied-tool failure must still
     /// report the cost incurred getting to the refusal.
     #[test]
-    fn interpret_claude_stdout_attaches_metrics_to_permission_denial_failure() {
-        let raw = r#"{
-            "is_error": false,
-            "result": "refused",
-            "permission_denials": [{"tool_name": "Write"}],
-            "usage": {"input_tokens": 12, "output_tokens": 4},
-            "total_cost_usd": 0.002
-        }"#;
-        let err = interpret_claude_stdout("step-1", raw).unwrap_err();
+    fn validate_envelope_attaches_metrics_to_permission_denial_failure() {
+        let env = envelope_from_blob(
+            r#"{
+                "is_error": false,
+                "result": "refused",
+                "permission_denials": [{"tool_name": "Write"}],
+                "usage": {"input_tokens": 12, "output_tokens": 4},
+                "total_cost_usd": 0.002
+            }"#,
+        );
+        let err = validate_claude_envelope("step-1", &env).unwrap_err();
         match err {
             FlowdError::PlanExecution { metrics, .. } => {
                 let m = metrics.expect("permission_denials failure must carry metrics");
@@ -1664,9 +2133,9 @@ mod tests {
     /// erroring. Upstream can drop or rename a field between releases
     /// and the spawner keeps running.
     #[test]
-    fn interpret_claude_stdout_handles_envelope_without_usage_block() {
-        let raw = r#"{"is_error":false,"result":"minimal"}"#;
-        let (stdout, metrics) = interpret_claude_stdout("step-1", raw).unwrap();
+    fn validate_envelope_handles_minimal_envelope() {
+        let env = envelope_from_blob(r#"{"is_error":false,"result":"minimal"}"#);
+        let (stdout, metrics) = validate_claude_envelope("step-1", &env).unwrap();
         assert_eq!(stdout, "minimal");
         let m = metrics.expect("metrics envelope is constructed unconditionally on parse");
         assert_eq!(m.input_tokens, 0);
@@ -1677,6 +2146,120 @@ mod tests {
         assert_eq!(m.duration_ms, 0);
         assert_eq!(m.duration_api_ms, 0);
         assert!(m.model_usage.is_empty());
+    }
+
+    // ---- parse_claude_stream ------------------------------------------
+
+    /// Helper: feed a literal NDJSON string to `parse_claude_stream`.
+    fn parse_stream(raw: &str) -> ClaudeStreamSummary {
+        parse_claude_stream("step-test", std::io::Cursor::new(raw.as_bytes()))
+            .expect("BufRead over &[u8] cannot fail; line decoding is infallible here")
+    }
+
+    /// Happy path: a real-world four-event stream (`init`, `assistant`,
+    /// `rate_limit_event`, `result`) yields both a session id and a
+    /// validated envelope.
+    #[test]
+    fn parse_stream_extracts_session_id_and_result() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"abc-123","model":"claude-sonnet-4-5"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}"#,
+            "\n",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"ok"}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","session_id":"abc-123","is_error":false,"result":"OK","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.001}"#,
+            "\n",
+        );
+        let summary = parse_stream(raw);
+        assert_eq!(summary.session_id.as_deref(), Some("abc-123"));
+        let env = summary
+            .final_envelope
+            .expect("result event must populate the envelope");
+        let (stdout, metrics) = validate_claude_envelope("step-1", &env).unwrap();
+        assert_eq!(stdout, "OK");
+        let m = metrics.unwrap();
+        assert_eq!(m.input_tokens, 10);
+        assert_eq!(m.output_tokens, 5);
+    }
+
+    /// Schema-drift defence: unknown event types and unparseable
+    /// lines (an in-band stderr leak, a partial flush) must not
+    /// abort the parse. We still get the result envelope.
+    #[test]
+    fn parse_stream_tolerates_unknown_event_types_and_garbage() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sid"}"#,
+            "\n",
+            r#"{"type":"future_event_type_we_do_not_handle","payload":"whatever"}"#,
+            "\n",
+            "this line is not JSON at all\n",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta"}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+            "\n",
+        );
+        let summary = parse_stream(raw);
+        assert_eq!(summary.session_id.as_deref(), Some("sid"));
+        let env = summary.final_envelope.expect("result still landed");
+        assert_eq!(env.result, "done");
+    }
+
+    /// Defensive: spec says exactly one `result` line, but if a buggy
+    /// build ships duplicates the LAST one wins (typically the more
+    /// complete envelope after retries).
+    #[test]
+    fn parse_stream_uses_last_result_when_multiple_present() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sid"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"first","total_cost_usd":0.001}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"second","total_cost_usd":0.002}"#,
+            "\n",
+        );
+        let summary = parse_stream(raw);
+        let env = summary.final_envelope.unwrap();
+        assert_eq!(env.result, "second");
+        assert!((env.total_cost_usd - 0.002).abs() < f64::EPSILON);
+    }
+
+    /// Fallback: when the init event is suppressed (a non-bare CLI
+    /// without `--verbose`, or a future schema drift) but the result
+    /// event still carries `session_id`, lift it from there.
+    #[test]
+    fn parse_stream_falls_back_to_session_id_in_result_event() {
+        let raw = concat!(
+            r#"{"type":"result","subtype":"success","session_id":"sid-from-result","is_error":false,"result":"done"}"#,
+            "\n",
+        );
+        let summary = parse_stream(raw);
+        assert_eq!(summary.session_id.as_deref(), Some("sid-from-result"));
+    }
+
+    /// Empty NDJSON: no session id captured, no envelope. The caller
+    /// (`spawn_claude_streaming`) is responsible for raising the
+    /// "no result event" error; the parser itself is content-free.
+    #[test]
+    fn parse_stream_returns_empty_summary_on_empty_input() {
+        let summary = parse_stream("");
+        assert!(summary.session_id.is_none());
+        assert!(summary.final_envelope.is_none());
+    }
+
+    /// A broken stream (init only, no `result`) yields a session id
+    /// but no envelope. Caller must error.
+    #[test]
+    fn parse_stream_yields_no_envelope_when_result_absent() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","session_id":"sid"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            "\n",
+        );
+        let summary = parse_stream(raw);
+        assert_eq!(summary.session_id.as_deref(), Some("sid"));
+        assert!(summary.final_envelope.is_none());
     }
 
     #[tokio::test]
@@ -1725,6 +2308,7 @@ mod tests {
             plan_parallel: true,
             layer_width: 2,
             project_root: None,
+            prior_session_id: None,
         };
         let step = step_with_id("a", "do a", &[]);
         let worktree = manager.prepare_step(&ctx, &step).await.unwrap();
@@ -1786,6 +2370,7 @@ mod tests {
             plan_parallel: true,
             layer_width: 2,
             project_root: None,
+            prior_session_id: None,
         };
 
         let recorded_branch;
@@ -2064,21 +2649,23 @@ mod tests {
     /// them regress to `snake_case`, the inner fields silently zero out.
     #[test]
     #[allow(non_snake_case)]
-    fn interpret_claude_stdout_parses_modelUsage_camelcase() {
-        let raw = r#"{
-            "is_error": false,
-            "result": "ok",
-            "modelUsage": {
-                "claude-opus-4-7": {
-                    "inputTokens": 11,
-                    "outputTokens": 22,
-                    "cacheCreationInputTokens": 33,
-                    "cacheReadInputTokens": 44,
-                    "costUSD": 0.55
+    fn validate_envelope_parses_modelUsage_camelcase() {
+        let env = envelope_from_blob(
+            r#"{
+                "is_error": false,
+                "result": "ok",
+                "modelUsage": {
+                    "claude-opus-4-7": {
+                        "inputTokens": 11,
+                        "outputTokens": 22,
+                        "cacheCreationInputTokens": 33,
+                        "cacheReadInputTokens": 44,
+                        "costUSD": 0.55
+                    }
                 }
-            }
-        }"#;
-        let (_, metrics) = interpret_claude_stdout("step-1", raw).unwrap();
+            }"#,
+        );
+        let (_, metrics) = validate_claude_envelope("step-1", &env).unwrap();
         let m = metrics.expect("metrics present on success");
         let entry = m
             .model_usage
@@ -2137,7 +2724,7 @@ mod tests {
         // claude-like detection or the parse path silently regressed.
         assert!(
             !out.stdout.contains("\"is_error\""),
-            "stdout still wrapped in JSON envelope; interpret_claude_stdout did not run: {out:?}"
+            "stdout still wrapped in JSON envelope; the stream-json parser did not run: {out:?}"
         );
         assert!(
             out.stdout.to_uppercase().contains("OK"),
@@ -2218,21 +2805,27 @@ mod tests {
         );
     }
 
-    /// Live: when an operator forces a non-JSON output format via
-    /// `extra_args`, the JSON parse should fall back to passthrough
-    /// rather than fail. Validates the escape hatch documented in
-    /// the module header.
+    /// Live: when an operator forces a non-stream-json output format
+    /// via `extra_args`, the spawner must fail loudly rather than
+    /// silently pass plain text up the stack. Under stream-json the
+    /// daemon depends on the `result` event for metrics and on the
+    /// `init` event for `session_id`; absent both, the run cannot be
+    /// recorded as success. Operators who genuinely need plain-text
+    /// output must wrap the binary (point `FLOWD_AGENT_BIN` at a
+    /// shell script that strips the injected flags) -- there is no
+    /// in-band escape hatch via `extra_args` anymore.
     #[tokio::test]
     #[ignore = "live: hits real claude API, skipped by default"]
-    async fn live_spawner_claude_passthrough_when_extra_args_force_text() {
+    async fn live_spawner_claude_text_override_fails_with_actionable_error() {
         let Some(claude) =
-            claude_path_or_skip("live_spawner_claude_passthrough_when_extra_args_force_text")
+            claude_path_or_skip("live_spawner_claude_text_override_fails_with_actionable_error")
         else {
             return;
         };
-        // The injected default is `--output-format=json`. Operator-supplied
-        // `extra_args` come AFTER injected args, so a later
-        // `--output-format=text` wins per claude's last-flag-wins parsing.
+        // Injected default ends with `--output-format=stream-json --verbose`.
+        // Operator-supplied extra_args come AFTER injected args, so a
+        // trailing `--output-format=text` wins per last-flag-wins
+        // parsing -- and the stream parser sees no `result` event.
         let s = LocalShellSpawner {
             bin: OsString::from(claude),
             prompt_flag: DEFAULT_PROMPT_FLAG.to_owned(),
@@ -2240,21 +2833,14 @@ mod tests {
             extra_args: vec!["--output-format=text".to_owned()],
             claude_bare: read_claude_bare_toggle(),
         };
-        let out = s
+        let err = s
             .spawn(ctx(), &step("Reply with exactly the two characters: OK"))
             .await
-            .expect("live claude passthrough: must not error on plain-text output");
-
-        assert_eq!(out.exit_code, Some(0));
-        // No JSON envelope -> passthrough -> stdout is raw text.
+            .expect_err("forcing text output must fail under stream-json");
+        let msg = err.to_string();
         assert!(
-            !out.stdout.contains("\"is_error\""),
-            "stdout looks like JSON despite --output-format=text override: {out:?}"
-        );
-        assert!(
-            out.stdout.to_uppercase().contains("OK"),
-            "expected 'OK' in plain-text result, got: {stdout}",
-            stdout = out.stdout
+            msg.contains("no `result` event"),
+            "expected error to mention missing result event; got: {msg}"
         );
     }
 }

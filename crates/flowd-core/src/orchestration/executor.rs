@@ -56,6 +56,15 @@ pub struct AgentOutput {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub metrics: Option<AgentMetrics>,
+    /// Provider-side conversation handle, when the spawner can extract one
+    /// (Claude Code stream-json `init` and `result` events both carry a
+    /// `session_id`). Threaded back into the executor's `PlanRuntime` so
+    /// later steps in the same plan can resume the conversation via
+    /// `--resume <id>`, keeping the prompt cache hot. `None` for spawners
+    /// that do not surface a session concept (Aider, plain shells, the
+    /// in-test mocks).
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl AgentOutput {
@@ -65,6 +74,7 @@ impl AgentOutput {
             stdout: stdout.into(),
             exit_code: Some(0),
             metrics: None,
+            session_id: None,
         }
     }
 }
@@ -150,6 +160,22 @@ pub struct AgentSpawnContext {
     /// happens to live in. `None` only for legacy plans persisted before
     /// the field existed; spawners fall back to their own cwd then.
     pub project_root: Option<std::path::PathBuf>,
+    /// Provider-side conversation handle from the immediately preceding
+    /// step in the same plan, when threading is safe. Set only by the
+    /// [`super::layer_runner::LayerRunner`] after a serial-layer step
+    /// completes with a non-`None` `session_id` AND the next step
+    /// targets the same `agent_type`. The Claude-like spawner uses it
+    /// to inject `--resume <id>`, keeping the prompt cache hot and
+    /// re-using accumulated context (including the `CLAUDE.md` and
+    /// rule discovery results that already cost a turn). `None` for:
+    /// - the first step of any plan;
+    /// - any step inside a parallel layer (a single conversation
+    ///   cannot fan out across N concurrent CLI invocations);
+    /// - any step whose predecessor was in a parallel layer (no single
+    ///   "previous" conversation exists);
+    /// - any cross-agent boundary (Claude session ids are not
+    ///   meaningful to Codex, Aider, etc.).
+    pub prior_session_id: Option<String>,
 }
 
 /// Strategy for invoking a single plan step.
@@ -187,6 +213,20 @@ pub trait AgentSpawner: Send + Sync {
     ) -> impl Future<Output = Result<AgentOutput>> + Send;
 }
 
+/// Provider-side conversation handle threaded between sequential
+/// plan steps. Held in [`PlanRuntime`] for the lifetime of the run
+/// only -- never persisted, never serialised: provider sessions
+/// expire on their own clock and a daemon restart cannot safely
+/// resume them. Carries the predecessor's `agent_type` so a
+/// follow-up step that targets a different CLI does not get a
+/// foreign session id (Claude session ids are not meaningful to
+/// Codex, Aider, etc.).
+#[derive(Debug, Clone)]
+pub(super) struct PlanSessionHandle {
+    pub(super) agent_type: String,
+    pub(super) session_id: String,
+}
+
 /// Internal record kept per registered plan.
 ///
 /// `pub(super)` so the sibling [`super::layer_runner`] module can publish
@@ -201,6 +241,19 @@ pub(super) struct PlanRuntime {
     /// be shared across owners) rather than the `JoinHandle` itself,
     /// which the runner needs to keep so it can `.await` each task.
     pub(super) in_flight: Vec<AbortHandle>,
+    /// Last conversation handle returned by a serial-layer step in
+    /// this plan, or `None` when:
+    ///
+    /// - no step has completed yet,
+    /// - the most recent settled layer was parallel (a single
+    ///   conversation cannot fan out across N concurrent CLIs and
+    ///   converge again in the next layer without losing context),
+    /// - the most recent step's spawner reported no `session_id`.
+    ///
+    /// Cleared (set to `None`) any time a parallel layer runs, so a
+    /// later serial layer cannot accidentally resume against a
+    /// session id from before the fan-out.
+    pub(super) last_session: Option<PlanSessionHandle>,
 }
 
 /// Default executor. Generic over the spawner and an optional [`PlanStore`].
@@ -369,6 +422,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
                         plan,
                         cancel: Arc::new(AtomicBool::new(false)),
                         in_flight: Vec::new(),
+                        last_session: None,
                     };
                     let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
                         message: "plan store poisoned".into(),
@@ -381,6 +435,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> InMemoryPlanExecutor<S, PS> {
                         plan,
                         cancel: Arc::new(AtomicBool::new(false)),
                         in_flight: Vec::new(),
+                        last_session: None,
                     };
                     let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
                         message: "plan store poisoned".into(),
@@ -565,6 +620,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             plan,
             cancel: Arc::new(AtomicBool::new(false)),
             in_flight: Vec::new(),
+            last_session: None,
         };
         // Scope the guard so its destructor runs *before* the `.await`.
         // Explicit `drop(guard)` is not enough for the future's auto-Send
@@ -622,6 +678,13 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
         let mut overall_failed = false;
         let mut total_metrics = AgentMetrics::default();
         let mut step_count = PlanStepCounts::default();
+        // Resume slot threaded across layers. Owned by `execute` (not
+        // `LayerRunner`) so it lives exactly as long as a single plan
+        // run; mirrored into `PlanRuntime::last_session` after every
+        // layer for observability and so a future resume-from-pause
+        // path can pick it back up.
+        let mut last_session: Option<PlanSessionHandle> =
+            self.with_plan_mut(plan_id, |runtime| runtime.last_session.clone())?;
         for layer in plan.execution_layers()? {
             // Cancellation can be set by an external `cancel(plan_id)`
             // call between layers, or by a `Cancelled` step outcome
@@ -630,7 +693,9 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
                 break;
             }
 
-            let outcome = runner.run(plan_id, &mut plan, &layer, &cancel).await?;
+            let outcome = runner
+                .run(plan_id, &mut plan, &layer, &cancel, &mut last_session)
+                .await?;
             total_metrics.merge(&outcome.metrics);
             step_count.completed = step_count
                 .completed
@@ -641,6 +706,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             // calls observe progress in real time.
             self.with_plan_mut(plan_id, |runtime| {
                 runtime.plan.steps.clone_from(&plan.steps);
+                runtime.last_session.clone_from(&last_session);
             })?;
             self.persist_snapshot(plan_id).await?;
             // Allow other tasks (and tests) to observe state between layers.
@@ -836,6 +902,15 @@ pub(super) enum StepOutcome {
     Completed {
         output: String,
         metrics: Option<AgentMetrics>,
+        /// Provider-side conversation handle returned by the spawner
+        /// (Claude Code stream-json `init`/`result` event). The
+        /// [`super::layer_runner::LayerRunner`] keeps the most recent
+        /// non-`None` value of a serial-layer step in
+        /// [`super::PlanRuntime::last_session`] so the next step's
+        /// [`AgentSpawnContext::prior_session_id`] can carry it
+        /// forward. `None` for spawners that have no session concept
+        /// (cursor-agent, aider, the in-test mocks).
+        session_id: Option<String>,
     },
     Failed {
         error: String,
@@ -890,6 +965,7 @@ pub(super) async fn run_step<S: AgentSpawner + ?Sized>(
                 return StepOutcome::Completed {
                     output: out.stdout,
                     metrics: out.metrics,
+                    session_id: out.session_id,
                 };
             }
             Err(e) => {
@@ -2086,6 +2162,7 @@ mod tests {
                     stdout: format!("ok:{}", step.id),
                     exit_code: Some(0),
                     metrics: Some(metrics.clone()),
+                    session_id: None,
                 }),
                 Some(Err(metrics)) => Err(FlowdError::PlanExecution {
                     message: format!("scripted failure for {}", step.id),
@@ -2217,5 +2294,237 @@ mod tests {
         );
         let back: AgentMetrics = serde_json::from_str(&json).unwrap();
         assert_eq!(back, m);
+    }
+
+    // ---- session-resume threading ------------------------------------
+
+    /// `(step.id, ctx.prior_session_id)` captured in spawn order by
+    /// the session-threading tests. Aliased so the spawner's `Arc`
+    /// signature stays under clippy's complex-type threshold.
+    type SessionObservations = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    /// Spawner that returns a scripted `session_id` per step (so tests
+    /// can pin which steps emit a session) and records the
+    /// `prior_session_id` it observed on each spawn.
+    struct SessionScriptedSpawner {
+        /// `step.id -> session_id to return`. Steps absent from the map
+        /// emit `session_id: None`, modelling spawners (or steps) that
+        /// never produce a session handle.
+        scripted_returns: HashMap<String, String>,
+        observed: SessionObservations,
+    }
+
+    impl AgentSpawner for SessionScriptedSpawner {
+        async fn spawn(&self, ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
+            self.observed
+                .lock()
+                .expect("observed poisoned")
+                .push((step.id.clone(), ctx.prior_session_id.clone()));
+            let session_id = self.scripted_returns.get(&step.id).cloned();
+            Ok(AgentOutput {
+                stdout: format!("ran:{}", step.id),
+                exit_code: Some(0),
+                metrics: None,
+                session_id,
+            })
+        }
+    }
+
+    fn step_with_agent(id: &str, deps: &[&str], agent: &str) -> PlanStep {
+        let mut s = step(id, deps);
+        s.agent_type = agent.into();
+        s
+    }
+
+    /// Serial chain (a -> b -> c), all same `agent_type`: each step
+    /// after the first must observe the predecessor's `session_id`.
+    /// This is the core resume contract.
+    #[test]
+    fn serial_chain_threads_session_id_from_predecessor() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let scripted_returns = HashMap::from([
+            ("a".to_owned(), "sid-a".to_owned()),
+            ("b".to_owned(), "sid-b".to_owned()),
+            ("c".to_owned(), "sid-c".to_owned()),
+        ]);
+        let exec = InMemoryPlanExecutor::new(SessionScriptedSpawner {
+            scripted_returns,
+            observed: Arc::clone(&observed),
+        });
+
+        let plan = Plan::new(
+            "p",
+            "proj",
+            vec![step("a", &[]), step("b", &["a"]), step("c", &["b"])],
+        );
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            exec.execute(id).await.unwrap();
+        });
+
+        let observed = observed.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![
+                ("a".to_owned(), None),
+                ("b".to_owned(), Some("sid-a".to_owned())),
+                ("c".to_owned(), Some("sid-b".to_owned())),
+            ]
+        );
+    }
+
+    /// A serial step that returns `session_id: None` (e.g. a non-Claude
+    /// agent, or a Claude run whose stream got truncated) breaks the
+    /// chain: the next step starts fresh, and a *third* step does NOT
+    /// resurrect the now-gone session by reaching back two steps.
+    #[test]
+    fn serial_chain_breaks_when_a_step_returns_no_session_id() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        // `b` deliberately omitted -> emits None.
+        let scripted_returns = HashMap::from([("a".to_owned(), "sid-a".to_owned())]);
+        let exec = InMemoryPlanExecutor::new(SessionScriptedSpawner {
+            scripted_returns,
+            observed: Arc::clone(&observed),
+        });
+
+        let plan = Plan::new(
+            "p",
+            "proj",
+            vec![step("a", &[]), step("b", &["a"]), step("c", &["b"])],
+        );
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            exec.execute(id).await.unwrap();
+        });
+
+        let observed = observed.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![
+                ("a".to_owned(), None),
+                ("b".to_owned(), Some("sid-a".to_owned())),
+                ("c".to_owned(), None),
+            ]
+        );
+    }
+
+    /// Cross-agent boundary: a serial chain where step `b` targets a
+    /// different agent than `a` must NOT see `a`'s `session_id`
+    /// (Claude session ids are not meaningful to Codex / Aider). Step
+    /// `c`, targeting agent `b`'s family again, also should not see
+    /// anything: the slot was already cleared at the cross-agent step.
+    #[test]
+    fn cross_agent_step_does_not_inherit_session_id() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let scripted_returns = HashMap::from([
+            ("a".to_owned(), "sid-a".to_owned()),
+            ("b".to_owned(), "sid-b".to_owned()),
+        ]);
+        let exec = InMemoryPlanExecutor::new(SessionScriptedSpawner {
+            scripted_returns,
+            observed: Arc::clone(&observed),
+        });
+
+        let plan = Plan::new(
+            "p",
+            "proj",
+            vec![
+                step_with_agent("a", &[], "claude"),
+                step_with_agent("b", &["a"], "codex"),
+                step_with_agent("c", &["b"], "claude"),
+            ],
+        );
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            exec.execute(id).await.unwrap();
+        });
+
+        let observed = observed.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![
+                ("a".to_owned(), None),
+                ("b".to_owned(), None),
+                // `c` targets "claude" again, but the immediate predecessor
+                // was "codex" (carrying sid-b). agent_type does not match
+                // -> no resume.
+                ("c".to_owned(), None),
+            ]
+        );
+    }
+
+    /// Parallel layers cannot resume a session: a single conversation
+    /// id cannot fan out across N concurrent CLI invocations. Layers
+    /// containing more than one step must always observe `None`, and
+    /// must also clear any previously-set session so a serial step
+    /// AFTER the parallel layer cannot wrongly resume against a
+    /// pre-fan-out conversation.
+    #[test]
+    fn parallel_layer_clears_session_and_no_step_in_it_resumes() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let scripted_returns = HashMap::from([
+            ("seed".to_owned(), "sid-seed".to_owned()),
+            ("p1".to_owned(), "sid-p1".to_owned()),
+            ("p2".to_owned(), "sid-p2".to_owned()),
+        ]);
+        let exec = InMemoryPlanExecutor::new(SessionScriptedSpawner {
+            scripted_returns,
+            observed: Arc::clone(&observed),
+        });
+
+        // Layers: [seed] -> [p1, p2] -> [tail]
+        let plan = Plan::new(
+            "p",
+            "proj",
+            vec![
+                step("seed", &[]),
+                step("p1", &["seed"]),
+                step("p2", &["seed"]),
+                step("tail", &["p1", "p2"]),
+            ],
+        );
+
+        rt().block_on(async {
+            let id = exec.submit(plan).await.unwrap();
+            exec.confirm(id).await.unwrap();
+            exec.execute(id).await.unwrap();
+        });
+
+        let observed = observed.lock().unwrap().clone();
+        // First step has no predecessor.
+        let seed = observed
+            .iter()
+            .find(|(id, _)| id == "seed")
+            .expect("seed observed");
+        assert_eq!(seed.1, None);
+        // Both parallel steps must observe None: the layer cleared the
+        // slot at entry, so `seed`'s session id never reached them.
+        let p1 = observed
+            .iter()
+            .find(|(id, _)| id == "p1")
+            .expect("p1 observed");
+        let p2 = observed
+            .iter()
+            .find(|(id, _)| id == "p2")
+            .expect("p2 observed");
+        assert_eq!(p1.1, None, "parallel step p1 must not resume seed");
+        assert_eq!(p2.1, None, "parallel step p2 must not resume seed");
+        // Tail in a serial-following-parallel layer must also see None:
+        // the slot was cleared by the parallel layer, and the parallel
+        // steps' session ids are not safe to thread (no canonical pick).
+        let tail = observed
+            .iter()
+            .find(|(id, _)| id == "tail")
+            .expect("tail observed");
+        assert_eq!(
+            tail.1, None,
+            "tail step must not resume any parallel-layer session"
+        );
     }
 }
