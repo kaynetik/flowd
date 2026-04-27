@@ -19,7 +19,7 @@
 //! Each step is invoked as
 //!
 //! ```text
-//! <bin> [default_args_for(bin)...] [extra_args...] <prompt_flag> "<step.prompt>"
+//! <bin> [LocalShellSpawner::default_args()...] [extra_args...] <prompt_flag> "<step.prompt>"
 //! ```
 //!
 //! `prompt_flag` defaults to `-p` (Claude Code, `cursor-agent`); override
@@ -30,9 +30,23 @@
 //! ### Auto-injected defaults for Claude-like CLIs
 //!
 //! When the resolved binary's basename is `claude` or `cursor-agent`,
-//! the spawner prepends two flags before any user-supplied
+//! the spawner prepends three flags before any user-supplied
 //! `extra_args`:
 //!
+//! - `--bare` -- skips the Node-side auto-discovery pass that
+//!   otherwise loads `~/.claude`, project `CLAUDE.md`, MCP servers,
+//!   hooks, plugins, skills, auto-memory, OAuth, and the OS
+//!   keychain on every invocation. In headless dispatch we want
+//!   none of that: the prompt comes from `step.prompt`, the
+//!   workspace trust gate is already bypassed, and reproducibility
+//!   matters more than convenience. Anthropic has stated `--bare`
+//!   will become the `-p` default in a future release; we adopt it
+//!   now. Bare mode requires `ANTHROPIC_API_KEY` to be set in the
+//!   environment (or an `apiKeyHelper` declared via `--settings`)
+//!   because keychain lookup is skipped. Override with
+//!   `FLOWD_AGENT_CLAUDE_BARE=0` if a workflow genuinely depends
+//!   on auto-discovered context (e.g. an in-repo `CLAUDE.md` that
+//!   you cannot pass via `--append-system-prompt-file`).
 //! - `--dangerously-skip-permissions` -- headless `-p` mode cannot
 //!   prompt the operator for tool-use approval. Without this flag,
 //!   every `Write` / `Edit` / `Bash` invocation by the spawned step
@@ -48,9 +62,10 @@
 //!
 //! Operators who need the opposite (sandbox runs, audit replays)
 //! must wrap the binary -- e.g. point `$FLOWD_AGENT_BIN` at a
-//! shell script that strips the flags. There is no opt-out env
-//! var, on purpose; the default has to make the common case
-//! (headless dispatch) safe.
+//! shell script that strips the flags. The `--bare` injection is
+//! the only one with an env opt-out (`FLOWD_AGENT_CLAUDE_BARE=0`);
+//! the other two are non-negotiable because the default has to
+//! make the common case (headless dispatch) safe.
 //!
 //! Stdout is captured into [`AgentOutput::stdout`]. For Claude-like
 //! bins the JSON envelope is parsed and the human-readable `result`
@@ -113,15 +128,24 @@ fn is_claude_like(bin: &OsStr) -> bool {
     )
 }
 
-/// Flags prepended automatically when the resolved binary is
-/// Claude-like. See the module docstring for why each is mandatory
-/// in headless dispatch.
-fn default_args_for(bin: &OsStr) -> &'static [&'static str] {
-    if is_claude_like(bin) {
-        &["--dangerously-skip-permissions", "--output-format=json"]
-    } else {
-        &[]
-    }
+/// Env var Anthropic looks for when bare mode is active and OAuth/keychain
+/// are skipped. Used only for the one-shot warning in
+/// [`LocalShellSpawner::detect`] -- the spawner never reads the value.
+const ENV_ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
+
+/// Pure parser for the `FLOWD_AGENT_CLAUDE_BARE` toggle. The default is
+/// `true`; only the literal string `"0"` flips it off, so a stray non-empty
+/// value (a typo, `"true"`, etc.) keeps the safe default rather than
+/// silently disabling the speedup. Pulled out as a free function so unit
+/// tests can exercise it without mutating the process environment.
+fn parse_claude_bare_toggle(raw: Option<&str>) -> bool {
+    !matches!(raw, Some("0"))
+}
+
+/// Resolve the toggle from the live process environment. Read once in
+/// [`LocalShellSpawner::detect`] so the hot path is env-free.
+fn read_claude_bare_toggle() -> bool {
+    parse_claude_bare_toggle(std::env::var("FLOWD_AGENT_CLAUDE_BARE").ok().as_deref())
 }
 
 /// Subset of Claude Code's `--output-format=json` envelope that the
@@ -246,6 +270,10 @@ pub struct LocalShellSpawner {
     prompt_flag: String,
     cwd: Option<PathBuf>,
     extra_args: Vec<String>,
+    /// Whether to prepend `--bare` for Claude-like bins. Resolved once at
+    /// construction time from `FLOWD_AGENT_CLAUDE_BARE` so per-spawn cost
+    /// stays env-free. Has no effect for non-Claude-like bins.
+    claude_bare: bool,
 }
 
 impl LocalShellSpawner {
@@ -276,16 +304,44 @@ impl LocalShellSpawner {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
 
+        let claude_bare = read_claude_bare_toggle();
+
+        // Bare mode disables OAuth/keychain lookup, so Anthropic auth has
+        // to come from the environment (or an `apiKeyHelper` declared via
+        // `--settings` in `extra_args`). We can't *prove* the latter from
+        // here, so we only warn when both: bare is on, the bin is
+        // Claude-like, and `ANTHROPIC_API_KEY` is unset. This fires once
+        // per spawner construction (typically once per daemon start) and
+        // never in the spawn hot path.
+        if claude_bare
+            && is_claude_like(&bin)
+            && std::env::var_os(ENV_ANTHROPIC_API_KEY).is_none_or(|v| v.is_empty())
+        {
+            tracing::warn!(
+                "FLOWD_AGENT_CLAUDE_BARE is on but ANTHROPIC_API_KEY is not set; \
+                 bare mode skips OAuth and the OS keychain, so spawned `claude` \
+                 invocations will fail unless an apiKeyHelper is provided via \
+                 `--settings` (in FLOWD_AGENT_EXTRA_ARGS). Set ANTHROPIC_API_KEY \
+                 or export FLOWD_AGENT_CLAUDE_BARE=0 to restore the previous \
+                 behavior."
+            );
+        }
+
         Some(Self {
             bin,
             prompt_flag,
             cwd,
             extra_args,
+            claude_bare,
         })
     }
 
     /// Construct an explicit spawner. Used by tests; not gated on `cfg(test)`
     /// so embedders that depend on the crate can call it directly.
+    ///
+    /// The `claude_bare` toggle is read from `FLOWD_AGENT_CLAUDE_BARE` here
+    /// too -- programmatic embedders that want a different default should
+    /// build the struct directly or set the env var before calling.
     #[must_use]
     #[allow(dead_code)]
     pub fn new(bin: impl Into<OsString>) -> Self {
@@ -294,6 +350,7 @@ impl LocalShellSpawner {
             prompt_flag: DEFAULT_PROMPT_FLAG.to_owned(),
             cwd: None,
             extra_args: Vec::new(),
+            claude_bare: read_claude_bare_toggle(),
         }
     }
 
@@ -301,6 +358,28 @@ impl LocalShellSpawner {
     #[must_use]
     pub fn bin_display(&self) -> std::path::Display<'_> {
         std::path::Path::new(&self.bin).display()
+    }
+
+    /// Flags prepended automatically before any user-supplied
+    /// `extra_args`. Only Claude-like bins receive injected flags;
+    /// everything else gets an empty slice. The exact set is gated on
+    /// `self.claude_bare` so operators can opt out of the speedup
+    /// without touching the binary path.
+    ///
+    /// See the module docstring for why each flag is here.
+    fn default_args(&self) -> &'static [&'static str] {
+        if !is_claude_like(&self.bin) {
+            return &[];
+        }
+        if self.claude_bare {
+            &[
+                "--bare",
+                "--dangerously-skip-permissions",
+                "--output-format=json",
+            ]
+        } else {
+            &["--dangerously-skip-permissions", "--output-format=json"]
+        }
     }
 
     fn effective_cwd(&self) -> Result<PathBuf> {
@@ -319,7 +398,7 @@ impl LocalShellSpawner {
         cwd_override: Option<&Path>,
     ) -> Result<AgentOutput> {
         let claude_like = is_claude_like(&self.bin);
-        let injected = default_args_for(&self.bin);
+        let injected = self.default_args();
 
         let mut cmd = Command::new(&self.bin);
         for arg in injected {
@@ -1196,6 +1275,7 @@ mod tests {
             prompt_flag: "-c".to_owned(),
             cwd: Some(daemon_cwd.path().to_path_buf()),
             extra_args: Vec::new(),
+            claude_bare: false,
         };
 
         let mut ctx = ctx();
@@ -1241,6 +1321,7 @@ mod tests {
             prompt_flag: "-c".to_owned(),
             cwd: Some(daemon_cwd.path().to_path_buf()),
             extra_args: Vec::new(),
+            claude_bare: false,
         };
         let s = GitWorktreeSpawner {
             inner,
@@ -1317,18 +1398,97 @@ mod tests {
         assert!(!is_claude_like(OsStr::new("/usr/bin/claude-like-but-not")));
     }
 
+    /// Helper: build a spawner with a chosen bin and `claude_bare`
+    /// flag, sidestepping `detect()`'s env reads. Tests should not
+    /// depend on the ambient `FLOWD_AGENT_CLAUDE_BARE` value.
+    fn spawner_with_bare(bin: &str, claude_bare: bool) -> LocalShellSpawner {
+        LocalShellSpawner {
+            bin: OsString::from(bin),
+            prompt_flag: DEFAULT_PROMPT_FLAG.to_owned(),
+            cwd: None,
+            extra_args: Vec::new(),
+            claude_bare,
+        }
+    }
+
+    /// Non-Claude bins never get injected flags, regardless of the
+    /// `claude_bare` toggle.
     #[test]
-    fn default_args_for_only_injects_for_claude_family() {
+    fn default_args_empty_for_non_claude_bins() {
+        assert!(spawner_with_bare("echo", true).default_args().is_empty());
+        assert!(spawner_with_bare("echo", false).default_args().is_empty());
+        assert!(spawner_with_bare("aider", true).default_args().is_empty());
+        assert!(spawner_with_bare("codex", false).default_args().is_empty());
+    }
+
+    /// Default ON path: `--bare` is the first injected arg for every
+    /// Claude-like basename. This is the post-PR-1 default and the
+    /// state most operators will hit.
+    #[test]
+    fn default_args_includes_bare_when_enabled_for_claude_family() {
         assert_eq!(
-            default_args_for(OsStr::new("claude")),
+            spawner_with_bare("claude", true).default_args(),
+            &[
+                "--bare",
+                "--dangerously-skip-permissions",
+                "--output-format=json",
+            ]
+        );
+        assert_eq!(
+            spawner_with_bare("cursor-agent", true).default_args(),
+            &[
+                "--bare",
+                "--dangerously-skip-permissions",
+                "--output-format=json",
+            ]
+        );
+        // Path-prefixed bins still resolve as claude-like.
+        assert_eq!(
+            spawner_with_bare("/usr/local/bin/claude", true).default_args(),
+            &[
+                "--bare",
+                "--dangerously-skip-permissions",
+                "--output-format=json",
+            ]
+        );
+    }
+
+    /// Opt-out path: `FLOWD_AGENT_CLAUDE_BARE=0` (modeled here as
+    /// `claude_bare: false`) restores the pre-PR-1 flag set so a
+    /// workflow that genuinely depends on auto-discovered context
+    /// can keep working without changing the bin path.
+    #[test]
+    fn default_args_omits_bare_when_disabled_for_claude_family() {
+        assert_eq!(
+            spawner_with_bare("claude", false).default_args(),
             &["--dangerously-skip-permissions", "--output-format=json"]
         );
         assert_eq!(
-            default_args_for(OsStr::new("cursor-agent")),
+            spawner_with_bare("cursor-agent", false).default_args(),
             &["--dangerously-skip-permissions", "--output-format=json"]
         );
-        assert!(default_args_for(OsStr::new("echo")).is_empty());
-        assert!(default_args_for(OsStr::new("aider")).is_empty());
+    }
+
+    /// Pin the toggle's parser so a typo doesn't silently switch
+    /// behavior. Anything other than the literal `"0"` keeps the safe
+    /// default ON, including unset, empty, `"false"`, `"no"`, `"1"`.
+    /// We test the pure parser rather than `read_claude_bare_toggle`
+    /// itself so this test does not race with parallel tests over the
+    /// process environment.
+    #[test]
+    fn parse_claude_bare_toggle_only_disables_on_literal_zero() {
+        assert!(parse_claude_bare_toggle(None), "unset defaults to ON");
+        assert!(!parse_claude_bare_toggle(Some("0")), "\"0\" disables");
+        assert!(parse_claude_bare_toggle(Some("1")), "\"1\" stays ON");
+        assert!(
+            parse_claude_bare_toggle(Some("false")),
+            "non-literal-zero values do not disable"
+        );
+        assert!(parse_claude_bare_toggle(Some("")), "empty string stays ON");
+        assert!(
+            parse_claude_bare_toggle(Some("00")),
+            "only the exact string \"0\" disables"
+        );
     }
 
     #[test]
@@ -2025,6 +2185,7 @@ mod tests {
             prompt_flag: DEFAULT_PROMPT_FLAG.to_owned(),
             cwd: Some(workdir.path().to_path_buf()),
             extra_args: Vec::new(),
+            claude_bare: read_claude_bare_toggle(),
         };
 
         let prompt = format!(
@@ -2077,6 +2238,7 @@ mod tests {
             prompt_flag: DEFAULT_PROMPT_FLAG.to_owned(),
             cwd: None,
             extra_args: vec!["--output-format=text".to_owned()],
+            claude_bare: read_claude_bare_toggle(),
         };
         let out = s
             .spawn(ctx(), &step("Reply with exactly the two characters: OK"))
