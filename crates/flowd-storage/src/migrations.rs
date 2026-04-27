@@ -12,6 +12,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_005,
     MIGRATION_006,
     MIGRATION_007,
+    MIGRATION_008,
 ];
 
 const MIGRATION_001: &str = r"
@@ -235,6 +236,47 @@ CREATE TABLE IF NOT EXISTS plan_step_branches (
 
 CREATE INDEX IF NOT EXISTS idx_plan_step_branches_plan
     ON plan_step_branches(plan_id);
+";
+
+// Repair the FTS5 maintenance triggers on the `observations` table.
+//
+// The original `observations_ad` (after-delete) and `observations_au`
+// (after-update of content) triggers from MIGRATION_001 issued the
+// FTS5 special command:
+//
+//     INSERT INTO observations_fts(observations_fts, rowid, content)
+//     VALUES ('delete', old.rowid, old.content);
+//
+// That command form is only valid for **contentless** or
+// **external-content** FTS5 tables. `observations_fts` is a regular
+// FTS5 table (it stores its own `content` column), so SQLite returns
+// `SQLITE_ERROR` ("SQL logic error") for every DELETE-or-content-UPDATE
+// on `observations`. The compactor's hot-to-warm pass exercises the
+// delete path on every tick, which is how the bug surfaced as
+// `failed to summarize session ... error=storage error: SQL logic error`
+// repeating against the same session ids forever.
+//
+// The fix is to drop the broken triggers and recreate them with the
+// regular DELETE statement, which is the documented way to remove a
+// row from a non-contentless FTS5 index. Since FTS5 maintains its
+// own row state, this also keeps the index consistent with
+// `observations` for both delete and update.
+//
+// Idempotent (`DROP TRIGGER IF EXISTS` + `CREATE TRIGGER IF NOT EXISTS`)
+// so re-running this migration on a partially-migrated DB stays safe
+// even outside the `migrations` table guard.
+const MIGRATION_008: &str = r"
+DROP TRIGGER IF EXISTS observations_ad;
+DROP TRIGGER IF EXISTS observations_au;
+
+CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations BEGIN
+    DELETE FROM observations_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS observations_au AFTER UPDATE OF content ON observations BEGIN
+    DELETE FROM observations_fts WHERE rowid = old.rowid;
+    INSERT INTO observations_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
 ";
 
 /// Run all pending migrations.

@@ -206,6 +206,10 @@ where
             let grouped = group_by_session(hot);
 
             for (session_id, observations) in grouped {
+                // Fall back to a synthesized session when the row is
+                // missing (legacy data or imports). `summarize_and_replace`
+                // upserts before writing the summary so the FK
+                // observations.session_id -> sessions.id is satisfied.
                 let session = sessions
                     .iter()
                     .find(|s| s.id == session_id)
@@ -273,6 +277,16 @@ where
             created_at: now,
             updated_at: now,
         };
+
+        // Idempotently ensure the sessions row exists. Without this,
+        // the summary insert can violate the FK
+        // `observations.session_id REFERENCES sessions(id)` whenever
+        // the session row is missing -- e.g. data imported before the
+        // MCP layer started calling `ensure_session`, a placeholder
+        // synthesized in `compact_once`, or a manually deleted
+        // `sessions` row. `upsert_session` is `ON CONFLICT DO UPDATE`
+        // so the happy path is a near-no-op.
+        self.memory.upsert_session(session).await?;
 
         self.memory.store(&summary).await?;
 

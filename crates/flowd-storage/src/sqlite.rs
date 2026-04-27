@@ -64,7 +64,26 @@ impl SqliteBackend {
     }
 }
 
+/// Generic fallback for non-rusqlite errors (e.g. poisoned mutex).
 fn storage_err(e: impl std::fmt::Display) -> FlowdError {
+    FlowdError::Storage(e.to_string())
+}
+
+/// Map a rusqlite error into `FlowdError::Storage` while preserving the
+/// primary + extended result codes. The default rusqlite `Display` for
+/// `SqliteFailure` collapses many distinct constraint violations (FK,
+/// UNIQUE, CHECK, NOT NULL) into the bare string `"SQL logic error"`,
+/// which makes operational logs useless: surfacing the extended code
+/// (e.g. `787` = `SQLITE_CONSTRAINT_FOREIGNKEY`) makes the failure
+/// diagnosable from the log alone.
+fn rusqlite_err(e: rusqlite::Error) -> FlowdError {
+    if let rusqlite::Error::SqliteFailure(code, ref msg) = e {
+        let detail = msg.clone().unwrap_or_else(|| e.to_string());
+        return FlowdError::Storage(format!(
+            "sqlite {:?} (extended {}): {}",
+            code.code, code.extended_code, detail,
+        ));
+    }
     FlowdError::Storage(e.to_string())
 }
 
@@ -95,7 +114,7 @@ impl MemoryBackend for SqliteBackend {
                     obs.updated_at.to_rfc3339(),
                 ],
             )
-            .map_err(storage_err)?;
+            .map_err(rusqlite_err)?;
             Ok(())
         })
         .await
@@ -112,15 +131,15 @@ impl MemoryBackend for SqliteBackend {
                     "SELECT id, session_id, project, content, tier, metadata, created_at, updated_at
                      FROM observations WHERE id = ?1",
                 )
-                .map_err(storage_err)?;
+                .map_err(rusqlite_err)?;
 
             let result = stmt
                 .query_row([id.to_string()], |row| Ok(row_to_observation(row)))
                 .optional()
-                .map_err(storage_err)?;
+                .map_err(rusqlite_err)?;
 
             match result {
-                Some(obs) => Ok(Some(obs.map_err(storage_err)?)),
+                Some(obs) => Ok(Some(obs.map_err(rusqlite_err)?)),
                 None => Ok(None),
             }
         })
@@ -154,17 +173,17 @@ impl MemoryBackend for SqliteBackend {
                          ORDER BY rank
                          LIMIT ?3",
                     )
-                    .map_err(storage_err)?;
+                    .map_err(rusqlite_err)?;
 
                 let rows = stmt
                     .query_map(
                         rusqlite::params![query.text, project, query.limit as i64],
                         mapper,
                     )
-                    .map_err(storage_err)?;
+                    .map_err(rusqlite_err)?;
 
                 for row in rows {
-                    let (obs, rank) = row.map_err(storage_err)?;
+                    let (obs, rank) = row.map_err(rusqlite_err)?;
                     results.push((obs, rank.abs()));
                 }
             } else {
@@ -178,14 +197,14 @@ impl MemoryBackend for SqliteBackend {
                          ORDER BY rank
                          LIMIT ?2",
                     )
-                    .map_err(storage_err)?;
+                    .map_err(rusqlite_err)?;
 
                 let rows = stmt
                     .query_map(rusqlite::params![query.text, query.limit as i64], mapper)
-                    .map_err(storage_err)?;
+                    .map_err(rusqlite_err)?;
 
                 for row in rows {
-                    let (obs, rank) = row.map_err(storage_err)?;
+                    let (obs, rank) = row.map_err(rusqlite_err)?;
                     results.push((obs, rank.abs()));
                 }
             }
@@ -216,15 +235,15 @@ impl MemoryBackend for SqliteBackend {
                 ),
             };
 
-            let mut stmt = conn.prepare(sql).map_err(storage_err)?;
+            let mut stmt = conn.prepare(sql).map_err(rusqlite_err)?;
             let rows = stmt
                 .query_map(rusqlite::params_from_iter(params.iter()), |row| {
                     row_to_session(row)
                 })
-                .map_err(storage_err)?;
+                .map_err(rusqlite_err)?;
 
             rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(storage_err)
+                .map_err(rusqlite_err)
         })
         .await
         .map_err(|e| FlowdError::Storage(format!("spawn_blocking panicked: {e}")))?
@@ -250,7 +269,7 @@ impl MemoryBackend for SqliteBackend {
                     session.ended_at.map(|dt| dt.to_rfc3339()),
                 ],
             )
-            .map_err(storage_err)?;
+            .map_err(rusqlite_err)?;
             Ok(())
         })
         .await
@@ -269,7 +288,7 @@ impl MemoryBackend for SqliteBackend {
                     "DELETE FROM observations WHERE tier = ?1",
                     rusqlite::params![tier_str],
                 )
-                .map_err(storage_err)?;
+                .map_err(rusqlite_err)?;
 
             Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
         })
@@ -295,17 +314,17 @@ impl MemoryBackend for SqliteBackend {
                      WHERE tier = ?1 AND created_at < ?2
                      ORDER BY session_id, created_at",
                 )
-                .map_err(storage_err)?;
+                .map_err(rusqlite_err)?;
 
             let rows = stmt
                 .query_map(rusqlite::params![tier_str, cutoff.to_rfc3339()], |row| {
                     Ok(row_to_observation(row))
                 })
-                .map_err(storage_err)?;
+                .map_err(rusqlite_err)?;
 
             let mut out = Vec::new();
             for row in rows {
-                out.push(row.map_err(storage_err)?.map_err(storage_err)?);
+                out.push(row.map_err(rusqlite_err)?.map_err(rusqlite_err)?);
             }
             Ok(out)
         })
@@ -325,21 +344,21 @@ impl MemoryBackend for SqliteBackend {
             let mut conn = lock(&conn)?;
             let tier_str = tier_as_str(new_tier);
             let now = chrono::Utc::now().to_rfc3339();
-            let tx = conn.transaction().map_err(storage_err)?;
+            let tx = conn.transaction().map_err(rusqlite_err)?;
 
             let mut updated: usize = 0;
             {
                 let mut stmt = tx
                     .prepare("UPDATE observations SET tier = ?1, updated_at = ?2 WHERE id = ?3")
-                    .map_err(storage_err)?;
+                    .map_err(rusqlite_err)?;
                 for id in &ids {
                     updated += stmt
                         .execute(rusqlite::params![tier_str, now, id])
-                        .map_err(storage_err)?;
+                        .map_err(rusqlite_err)?;
                 }
             }
 
-            tx.commit().map_err(storage_err)?;
+            tx.commit().map_err(rusqlite_err)?;
             Ok(u64::try_from(updated).unwrap_or(u64::MAX))
         })
         .await
@@ -356,19 +375,19 @@ impl MemoryBackend for SqliteBackend {
 
         tokio::task::spawn_blocking(move || {
             let mut conn = lock(&conn)?;
-            let tx = conn.transaction().map_err(storage_err)?;
+            let tx = conn.transaction().map_err(rusqlite_err)?;
 
             let mut deleted: usize = 0;
             {
                 let mut stmt = tx
                     .prepare("DELETE FROM observations WHERE id = ?1")
-                    .map_err(storage_err)?;
+                    .map_err(rusqlite_err)?;
                 for id in &ids {
-                    deleted += stmt.execute(rusqlite::params![id]).map_err(storage_err)?;
+                    deleted += stmt.execute(rusqlite::params![id]).map_err(rusqlite_err)?;
                 }
             }
 
-            tx.commit().map_err(storage_err)?;
+            tx.commit().map_err(rusqlite_err)?;
             Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
         })
         .await

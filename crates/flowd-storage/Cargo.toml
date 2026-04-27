@@ -1,6 +1,6 @@
 [package]
 name = "flowd-storage"
-version = "0.3.0"
+version = "0.4.1"
 description = "SQLite + FTS5 storage backend for flowd"
 edition.workspace = true
 rust-version.workspace = true
