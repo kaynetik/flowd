@@ -1596,18 +1596,7 @@ mod tests {
         let events = obs.events.lock().unwrap().clone();
         let kinds: Vec<&'static str> = events
             .iter()
-            .map(|e| match e {
-                PlanEvent::Submitted { .. } => "submitted",
-                PlanEvent::Started { .. } => "started",
-                PlanEvent::StepCompleted { .. } => "step_completed",
-                PlanEvent::StepFailed { .. } => "step_failed",
-                PlanEvent::StepRefused { .. } => "step_refused",
-                PlanEvent::StepCancelled { .. } => "step_cancelled",
-                PlanEvent::Finished { .. } => "finished",
-                PlanEvent::ClarificationOpened { .. } => "clarification_opened",
-                PlanEvent::ClarificationResolved { .. } => "clarification_resolved",
-                PlanEvent::RefinementApplied { .. } => "refinement_applied",
-            })
+            .map(crate::orchestration::plan_events::event_kind)
             .collect();
         assert_eq!(
             kinds,

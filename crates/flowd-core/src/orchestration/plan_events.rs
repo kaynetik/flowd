@@ -68,6 +68,9 @@ pub mod kind {
     pub const CLARIFICATION_OPENED: &str = "clarification_opened";
     pub const CLARIFICATION_RESOLVED: &str = "clarification_resolved";
     pub const REFINEMENT_APPLIED: &str = "refinement_applied";
+    pub const INTEGRATION_STARTED: &str = "integration_started";
+    pub const INTEGRATION_SUCCEEDED: &str = "integration_succeeded";
+    pub const INTEGRATION_FAILED: &str = "integration_failed";
 }
 
 /// Map a [`PlanEvent`] variant to its persisted `kind` string.
@@ -84,6 +87,9 @@ pub fn event_kind(event: &PlanEvent) -> &'static str {
         PlanEvent::ClarificationOpened { .. } => kind::CLARIFICATION_OPENED,
         PlanEvent::ClarificationResolved { .. } => kind::CLARIFICATION_RESOLVED,
         PlanEvent::RefinementApplied { .. } => kind::REFINEMENT_APPLIED,
+        PlanEvent::IntegrationStarted { .. } => kind::INTEGRATION_STARTED,
+        PlanEvent::IntegrationSucceeded { .. } => kind::INTEGRATION_SUCCEEDED,
+        PlanEvent::IntegrationFailed { .. } => kind::INTEGRATION_FAILED,
     }
 }
 
@@ -102,7 +108,10 @@ pub fn event_step_id(event: &PlanEvent) -> Option<&str> {
         | PlanEvent::Finished { .. }
         | PlanEvent::ClarificationOpened { .. }
         | PlanEvent::ClarificationResolved { .. }
-        | PlanEvent::RefinementApplied { .. } => None,
+        | PlanEvent::RefinementApplied { .. }
+        | PlanEvent::IntegrationStarted { .. }
+        | PlanEvent::IntegrationSucceeded { .. }
+        | PlanEvent::IntegrationFailed { .. } => None,
     }
 }
 
@@ -119,7 +128,10 @@ pub fn event_agent_type(event: &PlanEvent) -> Option<&str> {
         | PlanEvent::Finished { .. }
         | PlanEvent::ClarificationOpened { .. }
         | PlanEvent::ClarificationResolved { .. }
-        | PlanEvent::RefinementApplied { .. } => None,
+        | PlanEvent::RefinementApplied { .. }
+        | PlanEvent::IntegrationStarted { .. }
+        | PlanEvent::IntegrationSucceeded { .. }
+        | PlanEvent::IntegrationFailed { .. } => None,
     }
 }
 
@@ -180,6 +192,48 @@ pub fn event_payload(event: &PlanEvent) -> JsonValue {
         PlanEvent::RefinementApplied {
             feedback_summary, ..
         } => json!({ "feedback_summary": feedback_summary }),
+        PlanEvent::IntegrationStarted {
+            integration_branch,
+            base_branch,
+            mode,
+            ..
+        } => json!({
+            "integration_branch": integration_branch,
+            "base_branch": base_branch,
+            "mode": mode,
+        }),
+        PlanEvent::IntegrationSucceeded {
+            integration_branch,
+            base_branch,
+            status,
+            promoted_tip,
+            ..
+        } => {
+            let mut payload = json!({
+                "integration_branch": integration_branch,
+                "base_branch": base_branch,
+                "status": status,
+            });
+            // Absent rather than `null` so the staged-only path does
+            // not advertise a tip the operator could mistake for a
+            // promoted ref.
+            if let Some(tip) = promoted_tip {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("promoted_tip".into(), json!(tip));
+                }
+            }
+            payload
+        }
+        PlanEvent::IntegrationFailed {
+            integration_branch,
+            base_branch,
+            reason,
+            ..
+        } => json!({
+            "integration_branch": integration_branch,
+            "base_branch": base_branch,
+            "reason": reason,
+        }),
     }
 }
 
@@ -512,6 +566,78 @@ mod tests {
         assert_eq!(payload["metrics"]["total_cost_usd"], 0.004);
         assert_eq!(payload["metrics"]["duration_ms"], 250);
         assert_eq!(payload["metrics"]["duration_api_ms"], 240);
+    }
+
+    #[test]
+    fn integration_started_event_has_kind_and_payload() {
+        let evt = PlanEvent::IntegrationStarted {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            integration_branch: "flowd-integrate/demo/aa".into(),
+            base_branch: "main".into(),
+            mode: super::super::integration::IntegrationMode::Confirm,
+        };
+        assert_eq!(event_kind(&evt), kind::INTEGRATION_STARTED);
+        // Plan-scoped, not per-step: the columns must stay null on the
+        // persisted row regardless of which integration variant fires.
+        assert!(event_step_id(&evt).is_none());
+        assert!(event_agent_type(&evt).is_none());
+        let payload = event_payload(&evt);
+        assert_eq!(payload["integration_branch"], "flowd-integrate/demo/aa");
+        assert_eq!(payload["base_branch"], "main");
+        assert_eq!(payload["mode"], "confirm");
+    }
+
+    #[test]
+    fn integration_succeeded_promoted_event_carries_tip() {
+        let evt = PlanEvent::IntegrationSucceeded {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            integration_branch: "flowd-integrate/demo/aa".into(),
+            base_branch: "main".into(),
+            status: super::super::integration::IntegrationStatus::Promoted,
+            promoted_tip: Some("deadbeef".into()),
+        };
+        assert_eq!(event_kind(&evt), kind::INTEGRATION_SUCCEEDED);
+        let payload = event_payload(&evt);
+        assert_eq!(payload["status"], "promoted");
+        assert_eq!(payload["promoted_tip"], "deadbeef");
+    }
+
+    #[test]
+    fn integration_succeeded_staged_event_omits_tip() {
+        // Staged runs do not produce a promoted ref; surfacing one
+        // would let an operator chase a value the daemon never wrote.
+        let evt = PlanEvent::IntegrationSucceeded {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            integration_branch: "flowd-integrate/demo/aa".into(),
+            base_branch: "main".into(),
+            status: super::super::integration::IntegrationStatus::Staged,
+            promoted_tip: None,
+        };
+        let payload = event_payload(&evt);
+        let obj = payload.as_object().expect("payload is an object");
+        assert!(
+            !obj.contains_key("promoted_tip"),
+            "staged runs must omit promoted_tip; got {payload}"
+        );
+        assert_eq!(payload["status"], "staged");
+    }
+
+    #[test]
+    fn integration_failed_event_carries_reason() {
+        let evt = PlanEvent::IntegrationFailed {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            integration_branch: "flowd-integrate/demo/aa".into(),
+            base_branch: "main".into(),
+            reason: "cherry-pick conflict on src/lib.rs".into(),
+        };
+        assert_eq!(event_kind(&evt), kind::INTEGRATION_FAILED);
+        let payload = event_payload(&evt);
+        assert_eq!(payload["reason"], "cherry-pick conflict on src/lib.rs");
+        assert_eq!(payload["integration_branch"], "flowd-integrate/demo/aa");
     }
 
     #[test]
