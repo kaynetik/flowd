@@ -63,3 +63,10 @@ model        = "claude-opus-4-7"
 binary       = "claude"
 timeout_secs = 600
 effort       = "max"
+
+# Note: `plan_integrate` has no global config block. The integration
+# contract (manual confirm by default, no push, fast-forward-only
+# promotion, KeepOnFailure cleanup) is fixed in
+# `flowd_core::orchestration::integration` and parameters that *do*
+# vary -- `base_branch`, `mode`, `cleanup` -- are supplied per call
+# via `PlanIntegrateRequest`. See README "Plan integration".

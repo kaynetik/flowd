@@ -12,6 +12,7 @@ Local-first memory, orchestration, and rules engine for AI coding agents. Expose
   - [2. Wire your agent](#2-wire-your-agent)
   - [3. Use the agent](#3-use-the-agent)
     - [Workspace and project scoping](#workspace-and-project-scoping)
+    - [Plan integration (`plan_integrate`)](#plan-integration-plan_integrate)
   - [4. Observe out-of-band](#4-observe-out-of-band)
   - [5. Inspect](#5-inspect)
     - [Plan event log](#plan-event-log)
@@ -219,6 +220,26 @@ That makes resume the wrong tool when an *upstream foundation step was incorrect
 
 When this happens, **abandon the plan with `plan_cancel` and re-create it from the correct workspace.** Do not `plan_resume`: the corrupted "completed" steps will not be re-executed and the new agent runs will keep building on artefacts that never existed in the right repo. `flowd plan events <plan_id>` is the audit trail; the cancelled plan stays queryable for forensics. Resume is for transient failures (a flaky agent, a network blip, a daemon restart mid-flight), not for retroactively correcting where a plan was rooted.
 
+#### Plan integration (`plan_integrate`)
+
+A `Completed` plan is a working tree of per-step branches under `flowd/<project>/<plan_id>/<step>/`. Promoting that work to a long-lived base branch is a separate, human-gated step: `plan_integrate`. The contract is locked in `flowd_core::orchestration::integration`; the git-driving layer ships in a follow-up.
+
+**Manual confirm is the default.** `IntegrationMode::Confirm` stages a dedicated integration branch (`flowd-integrate/<project>/<plan_id>`) and stops -- the operator inspects, then re-invokes `plan_integrate` to promote. `IntegrationMode::DryRun` previews the operations without staging anything. There is no `Auto` variant.
+
+**No push.** Remote propagation stays out of the daemon. `plan_integrate` only touches local refs. Pushing the base branch (or the staged integration branch, for review) is the operator's call.
+
+**Eligibility.** Only `Completed` plans are eligible, and *every* step must be `StepStatus::Completed`. Partial success (`Skipped`, `Cancelled`, anything mid-flight) is refused with `IntegrationRefusal::PartialSuccess` -- the contract prefers a clean re-run over picking through a half-merged tree.
+
+**Topological tip-only cherry-pick.** Only the *tips* of the plan's DAG (steps with no dependents) are cherry-picked. The worktree spawner already merges each step's dependency closure into the step branch, so the tips carry the full plan's content; cherry-picking interior steps would re-apply commits already present.
+
+**Promotion is fast-forward-only.** If the configured `base_branch` advanced after staging, `IntegrationFailure::BaseAdvanced` blocks promotion -- the operator rebases the integration branch and re-confirms. The daemon never rebases on its own and never stashes a dirty base (`IntegrationFailure::DirtyBase`).
+
+**Conflict recovery.** A cherry-pick conflict surfaces as `IntegrationFailure::CherryPickConflict { step_id, conflicting_paths }`. The integration branch is left at the offending commit for human resolution; the daemon does not retry. Resolve in-place (or hard-reset and re-invoke) -- there is no automatic skip.
+
+**Cleanup policy.** `CleanupPolicy::KeepOnFailure` (default) drops the integration branch and per-step branches after a clean fast-forward; on any failure path it keeps every artefact for triage. `KeepAlways` retains everything unconditionally; `DropAlways` drops everything regardless of outcome (suited to ephemeral CI flows that own their state externally).
+
+**Commit messages.** Each tip's commit becomes part of the base history once promotion succeeds. Use Conventional Commits (`<type>(<scope>)?: summary`, `!` for breaking changes) so the integrated history stays scannable. The rules engine cannot inspect commit messages or git topology -- the `commit-message-conventional` rule under `.flowd/rules/` is advisory only; the agent owns the format.
+
 #### Prose-first planning
 
 `plan_create` accepts either a structured `definition` (the legacy DAG-first path) or a `prose` description. Prose plans are passed to the configured `PlanCompiler`, which can either compile them straight to a DAG or surface a list of `OpenQuestion`s the agent must resolve before the plan can run. The clarification loop is:
@@ -414,8 +435,11 @@ Sends `SIGTERM` to the PID in `$FLOWD_HOME/flowd.pid` and cleans the file. Stale
 ```bash
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace          # full pre-commit / CI suite
+cargo nextest run -p <crate>           # tight dev-loop verification
 ```
+
+Tests target [`cargo-nextest`](https://nexte.st) for its per-test process isolation and faster parallel scheduling. Install once with `cargo install cargo-nextest --locked`. Plain `cargo test --workspace` (or `-p <crate>`) still works as a fallback when nextest is unavailable; the rules under `.flowd/rules/cargo-discipline.yaml` document the preference.
 
 The MCP layer has two integration test suites:
 
