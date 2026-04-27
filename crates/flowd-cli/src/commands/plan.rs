@@ -19,10 +19,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 
 use chrono::{DateTime, Utc};
+use flowd_core::orchestration::observer::PlanEvent;
 use flowd_core::orchestration::plan_events::{PlanEventQuery, PlanEventStore, StoredPlanEvent};
 use flowd_core::orchestration::{
-    Answer, Plan, PlanCompiler, PlanDraftSnapshot, PlanStatus, PlanStore, PlanSummary,
-    build_preview, load_plan,
+    Answer, CleanupPolicy, IntegrationConfig, IntegrationMetadata, IntegrationMode,
+    IntegrationStatus, Plan, PlanCompiler, PlanDraftSnapshot, PlanIntegrateOutcome,
+    PlanIntegrateRequest, PlanStatus, PlanStore, PlanSummary, build_preview, load_plan,
 };
 use flowd_storage::plan_event_store::SqlitePlanEventStore;
 use flowd_storage::plan_store::SqlitePlanStore;
@@ -31,6 +33,7 @@ use uuid::Uuid;
 
 use crate::config::FlowdConfig;
 use crate::daemon;
+use crate::integration::{IntegrateError, PlanIntegrator};
 use crate::output::{Style, banner};
 use crate::paths::FlowdPaths;
 use crate::plan_compiler::DaemonPlanCompiler;
@@ -770,8 +773,71 @@ fn describe_payload(kind: &str, payload: &serde_json::Value) -> Option<String> {
             .get("status")
             .and_then(serde_json::Value::as_str)
             .map(|s| format!("status: {s}")),
+        k::INTEGRATION_STARTED => Some(format_integration_started(payload)),
+        k::INTEGRATION_SUCCEEDED => Some(format_integration_succeeded(payload)),
+        k::INTEGRATION_FAILED => Some(format_integration_failed(payload)),
         _ => None,
     }
+}
+
+/// Squeeze the structured integration event payloads into one
+/// `key=value` line per event. Keeps the renderer aligned with the
+/// per-step event style and avoids leaking raw JSON onto the terminal.
+fn format_integration_started(payload: &serde_json::Value) -> String {
+    let branch = payload
+        .get("integration_branch")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let base = payload
+        .get("base_branch")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let mode = payload
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    format!("integration_branch={branch}  base={base}  mode={mode}")
+}
+
+fn format_integration_succeeded(payload: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+
+    let branch = payload
+        .get("integration_branch")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let base = payload
+        .get("base_branch")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let status = payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let tip = payload
+        .get("promoted_tip")
+        .and_then(serde_json::Value::as_str);
+    let mut out = format!("integration_branch={branch}  base={base}  status={status}");
+    if let Some(t) = tip {
+        let _ = write!(out, "  promoted_tip={t}");
+    }
+    out
+}
+
+fn format_integration_failed(payload: &serde_json::Value) -> String {
+    let branch = payload
+        .get("integration_branch")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let base = payload
+        .get("base_branch")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let reason = payload
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    format!("integration_branch={branch}  base={base}  reason={reason}")
 }
 
 fn truncate_one_line(s: &str, max: usize) -> String {
@@ -971,6 +1037,553 @@ pub async fn cancel(paths: &FlowdPaths, style: Style, plan_id_arg: String) -> Re
     runner.save(&plan).await?;
     println!("{} plan {} -> Cancelled", style.green("cancelled"), plan.id);
     Ok(())
+}
+
+/// Bundle of arguments forwarded from clap to [`integrate`]. Pulled out so
+/// the dispatcher in `main.rs` does not exceed the
+/// `clippy::too_many_arguments` ceiling and so a future MCP front door can
+/// reuse the same parsing helpers without re-deriving the call shape.
+#[derive(Debug, Clone)]
+pub struct IntegrateArgs {
+    pub plan_id: String,
+    pub base: String,
+    pub promote: bool,
+    pub dry_run: bool,
+    pub cleanup: String,
+    pub strategy: String,
+    pub json: bool,
+}
+
+/// `flowd plan integrate <plan_id>` -- drive the `plan_integrate`
+/// contract against a real git repo and persist the resulting integration
+/// metadata.
+///
+/// Three modes:
+///
+/// * Default (no flags): stage. Runs eligibility, creates the integration
+///   worktree+branch, cherry-picks each tip step's range, and persists
+///   [`IntegrationStatus::Staged`] on the plan.
+/// * `--dry-run`: preview only. No git mutation; renders the planned
+///   cherry-picks. Does not persist anything to the plan store.
+/// * `--promote`: fast-forward the staged integration branch onto
+///   `--base`, persisting [`IntegrationStatus::Promoted`] on success.
+///
+/// Refuses while the daemon is alive (mutates shared `SQLite` state); the
+/// equivalent MCP tool is the alternative when the daemon owns the
+/// in-memory executor.
+///
+/// Never pushes -- remote propagation is the operator's job. The
+/// integrator only ever invokes local `git` plumbing (`worktree add`,
+/// `cherry-pick`, `update-ref`).
+pub async fn integrate(paths: &FlowdPaths, style: Style, args: IntegrateArgs) -> Result<()> {
+    ensure_daemon_offline(paths, style, "plan integrate")?;
+
+    let mode = parse_integrate_mode(args.dry_run, args.promote);
+    let cleanup = parse_cleanup_policy(&args.cleanup)?;
+    parse_integrate_strategy(&args.strategy)?;
+
+    let plan_id = parse_plan_id(&args.plan_id)?;
+
+    let runner = OfflinePlanRunner::open(paths)?;
+    let mut plan = runner.load_existing(plan_id).await?;
+
+    let request = PlanIntegrateRequest::new(
+        plan_id,
+        mode,
+        IntegrationConfig {
+            base_branch: args.base.clone(),
+            cleanup,
+        },
+    )
+    .map_err(|refusal| anyhow!("{refusal}"))?;
+
+    let event_store = open_plan_event_store(paths)?;
+    let integrator = PlanIntegrator::new(
+        plan.project_root
+            .as_deref()
+            .map_or_else(|| paths.home.clone(), Into::into),
+        paths.integrate_worktrees_dir(),
+        None,
+    );
+
+    if args.promote {
+        run_promote(
+            &integrator,
+            &runner,
+            &event_store,
+            &mut plan,
+            &request,
+            style,
+            args.json,
+        )
+        .await
+    } else {
+        run_stage(
+            &integrator,
+            &runner,
+            &event_store,
+            &mut plan,
+            &request,
+            style,
+            args.json,
+        )
+        .await
+    }
+}
+
+async fn run_stage(
+    integrator: &PlanIntegrator,
+    runner: &OfflinePlanRunner,
+    events: &SqlitePlanEventStore,
+    plan: &mut Plan,
+    request: &PlanIntegrateRequest,
+    style: Style,
+    json: bool,
+) -> Result<()> {
+    if request.mode != IntegrationMode::DryRun {
+        let now = Utc::now();
+        let mut meta = IntegrationMetadata::pending(plan.id, &plan.project, request);
+        meta.status = IntegrationStatus::InProgress;
+        meta.started_at = Some(now);
+        plan.integration = Some(meta.clone());
+        runner.save(plan).await?;
+
+        record_event(
+            events,
+            &PlanEvent::IntegrationStarted {
+                plan_id: plan.id,
+                project: plan.project.clone(),
+                integration_branch: meta.integration_branch.clone(),
+                base_branch: meta.base_branch.clone(),
+                mode: request.mode,
+            },
+        )
+        .await;
+    }
+
+    match integrator.integrate(plan, request).await {
+        Ok(outcome) => {
+            apply_outcome_to_plan(plan, request, &outcome);
+            // Dry-runs leave the plan store untouched: there is no
+            // persisted state change to record (no branch, no status
+            // transition), so a save would just rewrite the row with
+            // identical contents.
+            if request.mode != IntegrationMode::DryRun {
+                runner.save(plan).await?;
+                if let Some(meta) = &plan.integration {
+                    record_event(
+                        events,
+                        &PlanEvent::IntegrationSucceeded {
+                            plan_id: plan.id,
+                            project: plan.project.clone(),
+                            integration_branch: meta.integration_branch.clone(),
+                            base_branch: meta.base_branch.clone(),
+                            status: meta.status,
+                            promoted_tip: None,
+                        },
+                    )
+                    .await;
+                }
+            }
+            render_integrate_success(&outcome, plan, style, json);
+            Ok(())
+        }
+        Err(err) => {
+            mark_integration_failure(plan, &err);
+            // Persist the failure regardless of dry-run: a refusal that
+            // surfaces during `assess_eligibility` is information the
+            // operator wants captured. For dry-runs we skip the row
+            // write only to avoid clobbering a concurrently-staged
+            // metadata block.
+            if request.mode != IntegrationMode::DryRun {
+                let _ = runner.save(plan).await;
+                record_event(
+                    events,
+                    &PlanEvent::IntegrationFailed {
+                        plan_id: plan.id,
+                        project: plan.project.clone(),
+                        integration_branch: plan
+                            .integration
+                            .as_ref()
+                            .map(|m| m.integration_branch.clone())
+                            .unwrap_or_default(),
+                        base_branch: request.config.base_branch.clone(),
+                        reason: err.to_string(),
+                    },
+                )
+                .await;
+            }
+            render_integrate_error(&err, style, json);
+            Err(integrate_error_into_anyhow(err))
+        }
+    }
+}
+
+async fn run_promote(
+    integrator: &PlanIntegrator,
+    runner: &OfflinePlanRunner,
+    events: &SqlitePlanEventStore,
+    plan: &mut Plan,
+    request: &PlanIntegrateRequest,
+    style: Style,
+    json: bool,
+) -> Result<()> {
+    let now = Utc::now();
+    if let Some(meta) = plan.integration.as_mut() {
+        meta.status = IntegrationStatus::InProgress;
+        meta.started_at.get_or_insert(now);
+    } else {
+        // Promote without prior stage: the integrator will refuse with a
+        // typed Plan-execution error since the integration branch will
+        // not resolve. We still emit a started event so the audit trail
+        // shows the operator's attempt.
+        plan.integration = Some(IntegrationMetadata::pending(
+            plan.id,
+            &plan.project,
+            request,
+        ));
+    }
+    let started_branch = plan
+        .integration
+        .as_ref()
+        .map(|m| m.integration_branch.clone())
+        .unwrap_or_default();
+    runner.save(plan).await?;
+    record_event(
+        events,
+        &PlanEvent::IntegrationStarted {
+            plan_id: plan.id,
+            project: plan.project.clone(),
+            integration_branch: started_branch.clone(),
+            base_branch: request.config.base_branch.clone(),
+            mode: request.mode,
+        },
+    )
+    .await;
+
+    match integrator.promote(plan, request).await {
+        Ok(outcome) => {
+            apply_outcome_to_plan(plan, request, &outcome);
+            runner.save(plan).await?;
+            if let (PlanIntegrateOutcome::Promoted { promoted_tip, .. }, Some(meta)) =
+                (&outcome, plan.integration.as_ref())
+            {
+                record_event(
+                    events,
+                    &PlanEvent::IntegrationSucceeded {
+                        plan_id: plan.id,
+                        project: plan.project.clone(),
+                        integration_branch: meta.integration_branch.clone(),
+                        base_branch: meta.base_branch.clone(),
+                        status: meta.status,
+                        promoted_tip: Some(promoted_tip.clone()),
+                    },
+                )
+                .await;
+            }
+            render_integrate_success(&outcome, plan, style, json);
+            Ok(())
+        }
+        Err(err) => {
+            mark_integration_failure(plan, &err);
+            let _ = runner.save(plan).await;
+            record_event(
+                events,
+                &PlanEvent::IntegrationFailed {
+                    plan_id: plan.id,
+                    project: plan.project.clone(),
+                    integration_branch: started_branch,
+                    base_branch: request.config.base_branch.clone(),
+                    reason: err.to_string(),
+                },
+            )
+            .await;
+            render_integrate_error(&err, style, json);
+            Err(integrate_error_into_anyhow(err))
+        }
+    }
+}
+
+/// Translate the integrator's outcome into a fresh
+/// [`IntegrationMetadata`] block on `plan`. Pure -- the caller persists
+/// the plan via the runner separately so dry-runs can skip the I/O.
+fn apply_outcome_to_plan(
+    plan: &mut Plan,
+    request: &PlanIntegrateRequest,
+    outcome: &PlanIntegrateOutcome,
+) {
+    let now = Utc::now();
+    match outcome {
+        PlanIntegrateOutcome::DryRun { intended } => {
+            // Dry-runs report eligibility but should not advertise an
+            // attempted run on the plan: leave any prior metadata intact
+            // and only synthesise a fresh pending block when none exists.
+            if plan.integration.is_none() {
+                let mut meta = IntegrationMetadata::pending(plan.id, &plan.project, request);
+                meta.integration_branch
+                    .clone_from(&intended.integration_branch);
+                plan.integration = Some(meta);
+            }
+        }
+        PlanIntegrateOutcome::Staged { intended, .. } => {
+            let mut meta = plan
+                .integration
+                .clone()
+                .unwrap_or_else(|| IntegrationMetadata::pending(plan.id, &plan.project, request));
+            meta.status = IntegrationStatus::Staged;
+            meta.integration_branch
+                .clone_from(&intended.integration_branch);
+            meta.base_branch.clone_from(&intended.base_branch);
+            meta.mode = intended.mode;
+            meta.cleanup = intended.cleanup;
+            meta.completed_at = Some(now);
+            meta.failure = None;
+            meta.refusal = None;
+            plan.integration = Some(meta);
+        }
+        PlanIntegrateOutcome::Promoted { intended, .. } => {
+            let mut meta = plan
+                .integration
+                .clone()
+                .unwrap_or_else(|| IntegrationMetadata::pending(plan.id, &plan.project, request));
+            meta.status = IntegrationStatus::Promoted;
+            meta.integration_branch
+                .clone_from(&intended.integration_branch);
+            meta.base_branch.clone_from(&intended.base_branch);
+            meta.mode = intended.mode;
+            meta.cleanup = intended.cleanup;
+            meta.completed_at = Some(now);
+            meta.failure = None;
+            meta.refusal = None;
+            plan.integration = Some(meta);
+        }
+    }
+}
+
+/// Stamp the structured cause from an [`IntegrateError`] onto the plan's
+/// integration metadata so a follow-up `plan show` surfaces the typed
+/// failure without consulting the event log.
+fn mark_integration_failure(plan: &mut Plan, err: &IntegrateError) {
+    let now = Utc::now();
+    let meta = plan.integration.get_or_insert_with(|| IntegrationMetadata {
+        status: IntegrationStatus::Failed,
+        integration_branch: String::new(),
+        base_branch: String::new(),
+        mode: IntegrationMode::Confirm,
+        cleanup: CleanupPolicy::default(),
+        started_at: Some(now),
+        completed_at: Some(now),
+        failure: None,
+        refusal: None,
+    });
+    meta.status = IntegrationStatus::Failed;
+    meta.completed_at = Some(now);
+    meta.refusal = None;
+    meta.failure = None;
+    match err {
+        IntegrateError::Refusal(r) => meta.refusal = Some(r.clone()),
+        IntegrateError::Failure(f) => meta.failure = Some(f.clone()),
+        IntegrateError::Plan(_) => {}
+    }
+}
+
+/// Best-effort event write: the integrate flow is operator-facing, and a
+/// failure to persist a telemetry row should not abort the run after the
+/// git work has already landed. Logged at warn for diagnostics.
+async fn record_event(events: &SqlitePlanEventStore, event: &PlanEvent) {
+    if let Err(e) = PlanEventStore::record(events, event).await {
+        tracing::warn!(target: "flowd::cli::integrate", error = %e, "record plan event");
+    }
+}
+
+fn integrate_error_into_anyhow(err: IntegrateError) -> anyhow::Error {
+    match err {
+        IntegrateError::Refusal(r) => anyhow!(r),
+        IntegrateError::Failure(f) => anyhow!(f),
+        IntegrateError::Plan(p) => anyhow!(p),
+    }
+}
+
+fn render_integrate_success(outcome: &PlanIntegrateOutcome, plan: &Plan, style: Style, json: bool) {
+    if json {
+        let value = serde_json::to_value(outcome).unwrap_or_else(|_| {
+            serde_json::json!({
+                "kind": "unknown",
+                "error": "failed to serialise outcome",
+            })
+        });
+        if let Ok(s) = serde_json::to_string_pretty(&value) {
+            println!("{s}");
+        }
+        return;
+    }
+    let header = match outcome {
+        PlanIntegrateOutcome::DryRun { .. } => "dry-run -- no git mutation",
+        PlanIntegrateOutcome::Staged { .. } => "staged",
+        PlanIntegrateOutcome::Promoted { .. } => "promoted",
+    };
+    print!("{}", banner(&format!("integrate: {header}"), style));
+    match outcome {
+        PlanIntegrateOutcome::DryRun { intended } => {
+            println!(
+                "  plan_id:            {}",
+                style.dim(&intended.plan_id.to_string())
+            );
+            println!("  base_branch:        {}", intended.base_branch);
+            println!("  integration_branch: {}", intended.integration_branch);
+            println!(
+                "  cleanup:            {}",
+                cleanup_policy_label(intended.cleanup)
+            );
+            println!("\n{}", style.bold("planned cherry-picks:"));
+            for (i, pick) in intended.cherry_picks.iter().enumerate() {
+                println!(
+                    "  {idx} step={step}  branch={branch}",
+                    idx = style.cyan(&format!("{:>2}.", i + 1)),
+                    step = pick.step_id,
+                    branch = pick.source_branch,
+                );
+            }
+        }
+        PlanIntegrateOutcome::Staged {
+            intended,
+            integration_tip,
+        } => {
+            println!(
+                "  plan_id:            {}",
+                style.dim(&intended.plan_id.to_string())
+            );
+            println!("  base_branch:        {}", intended.base_branch);
+            println!("  integration_branch: {}", intended.integration_branch);
+            println!("  integration_tip:    {}", style.dim(integration_tip));
+            println!("  cherry_picks:       {}", intended.cherry_picks.len());
+            println!(
+                "\n{}",
+                style.dim(
+                    "next: review the integration branch, then re-run with `--promote --base <BRANCH>`"
+                ),
+            );
+        }
+        PlanIntegrateOutcome::Promoted {
+            intended,
+            promoted_tip,
+        } => {
+            println!(
+                "  plan_id:            {}",
+                style.dim(&intended.plan_id.to_string())
+            );
+            println!("  base_branch:        {}", intended.base_branch);
+            println!("  promoted_tip:       {}", style.green(promoted_tip));
+            println!(
+                "\n{}",
+                style.dim("note: nothing has been pushed; propagate to a remote yourself"),
+            );
+        }
+    }
+    if let Some(meta) = &plan.integration {
+        render_integration_metadata(meta, style);
+    }
+}
+
+fn render_integrate_error(err: &IntegrateError, style: Style, json: bool) {
+    if json {
+        let value = match err {
+            IntegrateError::Refusal(r) => serde_json::json!({
+                "kind": "refusal",
+                "cause": r,
+                "message": r.to_string(),
+            }),
+            IntegrateError::Failure(f) => serde_json::json!({
+                "kind": "failure",
+                "cause": f,
+                "message": f.to_string(),
+            }),
+            IntegrateError::Plan(p) => serde_json::json!({
+                "kind": "plan_execution",
+                "message": p.to_string(),
+            }),
+        };
+        if let Ok(s) = serde_json::to_string_pretty(&value) {
+            eprintln!("{s}");
+        }
+        return;
+    }
+    let (label, message) = match err {
+        IntegrateError::Refusal(r) => ("refusal", r.to_string()),
+        IntegrateError::Failure(f) => ("failure", f.to_string()),
+        IntegrateError::Plan(p) => ("error", p.to_string()),
+    };
+    eprintln!("{} {message}", style.red(&format!("integrate {label}:")));
+}
+
+fn parse_integrate_mode(dry_run: bool, promote: bool) -> IntegrationMode {
+    if dry_run {
+        IntegrationMode::DryRun
+    } else if promote {
+        // Promote replays eligibility against the same `Confirm` shape;
+        // the integrator distinguishes promote-vs-stage by which method
+        // the caller invokes, not by mode.
+        IntegrationMode::Confirm
+    } else {
+        IntegrationMode::Confirm
+    }
+}
+
+fn parse_cleanup_policy(raw: &str) -> Result<CleanupPolicy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "keep_on_failure" | "keep-on-failure" => Ok(CleanupPolicy::KeepOnFailure),
+        "keep_always" | "keep-always" => Ok(CleanupPolicy::KeepAlways),
+        "drop_always" | "drop-always" => Ok(CleanupPolicy::DropAlways),
+        other => bail!(
+            "unknown cleanup policy `{other}`; expected keep_on_failure, keep_always, or drop_always"
+        ),
+    }
+}
+
+fn parse_integrate_strategy(raw: &str) -> Result<()> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "tip-cherry-pick" | "tip_cherry_pick" => Ok(()),
+        other => {
+            bail!("unknown integrate strategy `{other}`; only `tip-cherry-pick` is supported in v1")
+        }
+    }
+}
+
+fn integration_status_label(status: IntegrationStatus) -> &'static str {
+    match status {
+        IntegrationStatus::Pending => "pending",
+        IntegrationStatus::InProgress => "in_progress",
+        IntegrationStatus::Staged => "staged",
+        IntegrationStatus::Promoted => "promoted",
+        IntegrationStatus::Failed => "failed",
+    }
+}
+
+fn integration_mode_label(mode: IntegrationMode) -> &'static str {
+    match mode {
+        IntegrationMode::Confirm => "confirm",
+        IntegrationMode::DryRun => "dry_run",
+    }
+}
+
+fn cleanup_policy_label(policy: CleanupPolicy) -> &'static str {
+    match policy {
+        CleanupPolicy::KeepOnFailure => "keep_on_failure",
+        CleanupPolicy::KeepAlways => "keep_always",
+        CleanupPolicy::DropAlways => "drop_always",
+    }
+}
+
+fn open_plan_event_store(paths: &FlowdPaths) -> Result<SqlitePlanEventStore> {
+    let db_path = paths.db_file();
+    if !db_path.exists() {
+        bail!(
+            "no flowd database at {}; start the daemon at least once to initialise it",
+            db_path.display()
+        );
+    }
+    SqlitePlanEventStore::open(&db_path)
+        .with_context(|| format!("open plan event store at {}", db_path.display()))
 }
 
 /// Wire shape for `--file` payloads to `flowd plan answer`. Mirrors
@@ -1177,6 +1790,9 @@ fn print_plan_summary(plan: &Plan, style: Style, header: &str) {
             );
         }
     }
+    if let Some(meta) = &plan.integration {
+        render_integration_metadata(meta, style);
+    }
     if !plan.steps.is_empty() && plan.open_questions.is_empty() {
         match build_preview(plan) {
             Ok(preview) => render_layers(&preview.execution_order, style),
@@ -1185,6 +1801,45 @@ fn print_plan_summary(plan: &Plan, style: Style, header: &str) {
                 style.yellow("warning:")
             ),
         }
+    }
+}
+
+/// Render the integration block on `plan show` / post-integrate output.
+/// Lifted out of [`print_plan_summary`] so the integrate handler can call
+/// it without going through the full plan summary header.
+fn render_integration_metadata(meta: &IntegrationMetadata, style: Style) {
+    println!("\n{}", style.bold("integration:"));
+    println!(
+        "  status:             {}",
+        integration_status_label(meta.status)
+    );
+    println!("  integration_branch: {}", meta.integration_branch);
+    println!("  base_branch:        {}", meta.base_branch);
+    println!(
+        "  mode:               {}",
+        integration_mode_label(meta.mode)
+    );
+    println!(
+        "  cleanup:            {}",
+        cleanup_policy_label(meta.cleanup),
+    );
+    if let Some(ts) = meta.started_at {
+        println!(
+            "  started_at:         {}",
+            style.dim(&ts.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        );
+    }
+    if let Some(ts) = meta.completed_at {
+        println!(
+            "  completed_at:       {}",
+            style.dim(&ts.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        );
+    }
+    if let Some(refusal) = &meta.refusal {
+        println!("  refusal:            {}", style.red(&refusal.to_string()));
+    }
+    if let Some(failure) = &meta.failure {
+        println!("  failure:            {}", style.red(&failure.to_string()));
     }
 }
 
@@ -1985,5 +2640,413 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:#}").contains("no flowd database"), "{err:#}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -------- `plan integrate` argument parsing -------------------------
+
+    fn parse_integrate(args: &[&str]) -> Result<crate::cli::PlanAction, clap::Error> {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let mut full: Vec<&str> = vec!["flowd", "plan", "integrate"];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full)?;
+        match cli.command {
+            Command::Plan { action } => Ok(action),
+            other => unreachable!("expected Command::Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integrate_minimal_args_parse_with_defaults() {
+        let id = Uuid::new_v4();
+        let action = parse_integrate(&[&id.to_string(), "--base", "main"]).expect("parse");
+        match action {
+            crate::cli::PlanAction::Integrate {
+                plan_id,
+                base,
+                promote,
+                dry_run,
+                cleanup,
+                strategy,
+                json,
+            } => {
+                assert_eq!(plan_id, id.to_string());
+                assert_eq!(base, "main");
+                assert!(!promote);
+                assert!(!dry_run);
+                assert_eq!(cleanup, "keep_on_failure");
+                assert_eq!(strategy, "tip-cherry-pick");
+                assert!(!json);
+            }
+            other => panic!("expected Integrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integrate_promote_flag_round_trips() {
+        let id = Uuid::new_v4();
+        let action =
+            parse_integrate(&[&id.to_string(), "--base", "main", "--promote"]).expect("parse");
+        let crate::cli::PlanAction::Integrate {
+            promote, dry_run, ..
+        } = action
+        else {
+            panic!("expected Integrate");
+        };
+        assert!(promote);
+        assert!(!dry_run);
+    }
+
+    #[test]
+    fn integrate_dry_run_flag_round_trips() {
+        let id = Uuid::new_v4();
+        let action =
+            parse_integrate(&[&id.to_string(), "--base", "main", "--dry-run"]).expect("parse");
+        let crate::cli::PlanAction::Integrate {
+            dry_run, promote, ..
+        } = action
+        else {
+            panic!("expected Integrate");
+        };
+        assert!(dry_run);
+        assert!(!promote);
+    }
+
+    #[test]
+    fn integrate_dry_run_and_promote_are_mutually_exclusive() {
+        let id = Uuid::new_v4();
+        let err = parse_integrate(&[&id.to_string(), "--base", "main", "--promote", "--dry-run"])
+            .unwrap_err();
+        // clap's conflict error is rendered to stderr; the typed kind
+        // is `ArgumentConflict`. Regardless, parsing must fail.
+        assert!(
+            err.kind() == clap::error::ErrorKind::ArgumentConflict,
+            "expected ArgumentConflict, got {:?}",
+            err.kind()
+        );
+    }
+
+    #[test]
+    fn integrate_requires_base_branch() {
+        let id = Uuid::new_v4();
+        let err = parse_integrate(&[&id.to_string()]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn integrate_accepts_cleanup_alias_forms() {
+        let id = Uuid::new_v4();
+        let action = parse_integrate(&[
+            &id.to_string(),
+            "--base",
+            "main",
+            "--cleanup",
+            "drop_always",
+        ])
+        .expect("parse");
+        let crate::cli::PlanAction::Integrate { cleanup, .. } = action else {
+            panic!("expected Integrate");
+        };
+        assert_eq!(cleanup, "drop_always");
+    }
+
+    // -------- Cleanup / strategy / mode parsers -------------------------
+
+    #[test]
+    fn parse_cleanup_policy_accepts_both_separators_per_variant() {
+        assert!(matches!(
+            parse_cleanup_policy("keep_on_failure").unwrap(),
+            CleanupPolicy::KeepOnFailure
+        ));
+        assert!(matches!(
+            parse_cleanup_policy("KEEP-ON-FAILURE").unwrap(),
+            CleanupPolicy::KeepOnFailure
+        ));
+        assert!(matches!(
+            parse_cleanup_policy("keep_always").unwrap(),
+            CleanupPolicy::KeepAlways
+        ));
+        assert!(matches!(
+            parse_cleanup_policy("drop-always").unwrap(),
+            CleanupPolicy::DropAlways
+        ));
+    }
+
+    #[test]
+    fn parse_cleanup_policy_rejects_unknown_value() {
+        let err = parse_cleanup_policy("yolo").unwrap_err();
+        assert!(format!("{err:#}").contains("yolo"), "{err:#}");
+    }
+
+    #[test]
+    fn parse_integrate_strategy_only_accepts_tip_cherry_pick() {
+        parse_integrate_strategy("tip-cherry-pick").unwrap();
+        parse_integrate_strategy("tip_cherry_pick").unwrap();
+        let err = parse_integrate_strategy("rebase-merge").unwrap_err();
+        assert!(format!("{err:#}").contains("rebase-merge"), "{err:#}");
+    }
+
+    #[test]
+    fn parse_integrate_mode_picks_dry_run_over_promote_when_both_set() {
+        // The clap layer rejects `--dry-run --promote` together (see
+        // `integrate_dry_run_and_promote_are_mutually_exclusive`), but
+        // the helper still pins a deterministic policy if it is ever
+        // called with both bits set programmatically.
+        assert_eq!(parse_integrate_mode(true, true), IntegrationMode::DryRun);
+        assert_eq!(parse_integrate_mode(true, false), IntegrationMode::DryRun);
+        assert_eq!(parse_integrate_mode(false, true), IntegrationMode::Confirm);
+        assert_eq!(parse_integrate_mode(false, false), IntegrationMode::Confirm);
+    }
+
+    // -------- Event payload renderers -----------------------------------
+
+    #[test]
+    fn integration_started_payload_renders_all_fields() {
+        let payload = serde_json::json!({
+            "integration_branch": "flowd-integrate/proj/abc",
+            "base_branch": "main",
+            "mode": "confirm",
+        });
+        let line = format_integration_started(&payload);
+        assert_eq!(
+            line,
+            "integration_branch=flowd-integrate/proj/abc  base=main  mode=confirm"
+        );
+    }
+
+    #[test]
+    fn integration_succeeded_payload_omits_promoted_tip_when_absent() {
+        let payload = serde_json::json!({
+            "integration_branch": "flowd-integrate/proj/abc",
+            "base_branch": "main",
+            "status": "staged",
+        });
+        let line = format_integration_succeeded(&payload);
+        assert_eq!(
+            line,
+            "integration_branch=flowd-integrate/proj/abc  base=main  status=staged"
+        );
+    }
+
+    #[test]
+    fn integration_succeeded_payload_appends_promoted_tip_when_present() {
+        let payload = serde_json::json!({
+            "integration_branch": "flowd-integrate/proj/abc",
+            "base_branch": "main",
+            "status": "promoted",
+            "promoted_tip": "deadbeef",
+        });
+        let line = format_integration_succeeded(&payload);
+        assert!(line.contains("status=promoted"), "{line}");
+        assert!(line.contains("promoted_tip=deadbeef"), "{line}");
+    }
+
+    #[test]
+    fn integration_failed_payload_carries_reason() {
+        let payload = serde_json::json!({
+            "integration_branch": "flowd-integrate/proj/abc",
+            "base_branch": "main",
+            "reason": "cherry-pick conflict on step `b`",
+        });
+        let line = format_integration_failed(&payload);
+        assert!(
+            line.contains("reason=cherry-pick conflict on step `b`"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn describe_payload_dispatches_integration_kinds() {
+        use flowd_core::orchestration::plan_events::kind as k;
+
+        let started = serde_json::json!({
+            "integration_branch": "i",
+            "base_branch": "main",
+            "mode": "confirm",
+        });
+        assert!(describe_payload(k::INTEGRATION_STARTED, &started).is_some());
+
+        let succeeded = serde_json::json!({
+            "integration_branch": "i",
+            "base_branch": "main",
+            "status": "promoted",
+        });
+        assert!(describe_payload(k::INTEGRATION_SUCCEEDED, &succeeded).is_some());
+
+        let failed = serde_json::json!({
+            "integration_branch": "i",
+            "base_branch": "main",
+            "reason": "boom",
+        });
+        assert!(describe_payload(k::INTEGRATION_FAILED, &failed).is_some());
+    }
+
+    // -------- Outcome → plan metadata mapping ---------------------------
+
+    fn fixture_request(plan_id: Uuid, base: &str) -> PlanIntegrateRequest {
+        PlanIntegrateRequest::new(
+            plan_id,
+            IntegrationMode::Confirm,
+            IntegrationConfig {
+                base_branch: base.into(),
+                cleanup: CleanupPolicy::DropAlways,
+            },
+        )
+        .expect("fixture request")
+    }
+
+    fn fixture_completed_plan() -> Plan {
+        use flowd_core::orchestration::{PlanStep, StepStatus};
+        let step = PlanStep {
+            id: "a".into(),
+            agent_type: "echo".into(),
+            prompt: "do a".into(),
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            retry_count: 0,
+            status: StepStatus::Completed,
+            output: Some("ok".into()),
+            error: None,
+            started_at: None,
+            completed_at: None,
+        };
+        let mut p = Plan::new("p", "proj", vec![step]);
+        p.status = PlanStatus::Completed;
+        p
+    }
+
+    #[test]
+    fn apply_outcome_dry_run_only_synthesises_metadata_when_absent() {
+        use flowd_core::orchestration::IntegrationPlan;
+
+        let mut plan = fixture_completed_plan();
+        let req = fixture_request(plan.id, "main");
+        let outcome = PlanIntegrateOutcome::DryRun {
+            intended: IntegrationPlan {
+                plan_id: plan.id,
+                project: plan.project.clone(),
+                base_branch: "main".into(),
+                integration_branch: "flowd-integrate/proj/abc".into(),
+                cherry_picks: Vec::new(),
+                mode: IntegrationMode::DryRun,
+                cleanup: CleanupPolicy::DropAlways,
+            },
+        };
+        apply_outcome_to_plan(&mut plan, &req, &outcome);
+        let meta = plan.integration.as_ref().expect("metadata");
+        assert_eq!(meta.status, IntegrationStatus::Pending);
+        assert_eq!(meta.integration_branch, "flowd-integrate/proj/abc");
+
+        // A pre-existing `Staged` block must not be downgraded by a
+        // subsequent dry-run -- preview never overwrites prior state.
+        plan.integration.as_mut().unwrap().status = IntegrationStatus::Staged;
+        apply_outcome_to_plan(&mut plan, &req, &outcome);
+        assert_eq!(
+            plan.integration.as_ref().unwrap().status,
+            IntegrationStatus::Staged
+        );
+    }
+
+    #[test]
+    fn apply_outcome_staged_marks_plan_metadata() {
+        use flowd_core::orchestration::IntegrationPlan;
+
+        let mut plan = fixture_completed_plan();
+        let req = fixture_request(plan.id, "main");
+        let outcome = PlanIntegrateOutcome::Staged {
+            intended: IntegrationPlan {
+                plan_id: plan.id,
+                project: plan.project.clone(),
+                base_branch: "main".into(),
+                integration_branch: "flowd-integrate/proj/abc".into(),
+                cherry_picks: Vec::new(),
+                mode: IntegrationMode::Confirm,
+                cleanup: CleanupPolicy::DropAlways,
+            },
+            integration_tip: "deadbeef".into(),
+        };
+        apply_outcome_to_plan(&mut plan, &req, &outcome);
+        let meta = plan.integration.expect("metadata");
+        assert_eq!(meta.status, IntegrationStatus::Staged);
+        assert_eq!(meta.cleanup, CleanupPolicy::DropAlways);
+        assert!(meta.completed_at.is_some());
+        assert!(meta.failure.is_none());
+        assert!(meta.refusal.is_none());
+    }
+
+    #[test]
+    fn apply_outcome_promoted_marks_plan_metadata() {
+        use flowd_core::orchestration::IntegrationPlan;
+
+        let mut plan = fixture_completed_plan();
+        let req = fixture_request(plan.id, "main");
+        let outcome = PlanIntegrateOutcome::Promoted {
+            intended: IntegrationPlan {
+                plan_id: plan.id,
+                project: plan.project.clone(),
+                base_branch: "main".into(),
+                integration_branch: "flowd-integrate/proj/abc".into(),
+                cherry_picks: Vec::new(),
+                mode: IntegrationMode::Confirm,
+                cleanup: CleanupPolicy::KeepOnFailure,
+            },
+            promoted_tip: "cafef00d".into(),
+        };
+        apply_outcome_to_plan(&mut plan, &req, &outcome);
+        let meta = plan.integration.expect("metadata");
+        assert_eq!(meta.status, IntegrationStatus::Promoted);
+    }
+
+    #[test]
+    fn mark_integration_failure_records_refusal_and_failure_separately() {
+        use flowd_core::orchestration::{IntegrationFailure, IntegrationRefusal};
+
+        let mut plan = fixture_completed_plan();
+        let refusal = IntegrationRefusal::PlanStatus {
+            observed: PlanStatus::Failed,
+        };
+        mark_integration_failure(&mut plan, &IntegrateError::Refusal(refusal.clone()));
+        let meta = plan.integration.as_ref().unwrap();
+        assert_eq!(meta.status, IntegrationStatus::Failed);
+        assert!(meta.refusal.is_some());
+        assert!(meta.failure.is_none());
+
+        let failure = IntegrationFailure::DirtyBase;
+        mark_integration_failure(&mut plan, &IntegrateError::Failure(failure.clone()));
+        let meta = plan.integration.as_ref().unwrap();
+        assert!(meta.failure.is_some());
+        assert!(meta.refusal.is_none());
+    }
+
+    #[test]
+    fn render_integration_metadata_does_not_panic_on_terminal_states() {
+        let meta = IntegrationMetadata {
+            status: IntegrationStatus::Promoted,
+            integration_branch: "flowd-integrate/proj/abc".into(),
+            base_branch: "main".into(),
+            mode: IntegrationMode::Confirm,
+            cleanup: CleanupPolicy::DropAlways,
+            started_at: Some(Utc::now()),
+            completed_at: Some(Utc::now()),
+            failure: None,
+            refusal: None,
+        };
+        render_integration_metadata(&meta, Style::plain());
+    }
+
+    #[test]
+    fn integration_status_label_covers_every_variant() {
+        // Compile-time guard: a new `IntegrationStatus` variant must be
+        // wired into the renderer or this match panics on the Default.
+        for status in [
+            IntegrationStatus::Pending,
+            IntegrationStatus::InProgress,
+            IntegrationStatus::Staged,
+            IntegrationStatus::Promoted,
+            IntegrationStatus::Failed,
+        ] {
+            let label = integration_status_label(status);
+            assert!(!label.is_empty(), "{status:?} -> empty label");
+        }
     }
 }

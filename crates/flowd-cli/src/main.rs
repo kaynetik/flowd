@@ -12,10 +12,9 @@ mod cli;
 mod commands;
 mod config;
 mod daemon;
-// I/O driver for the pure `plan_integrate` contract. Stands ready for the
-// CLI / MCP wiring landing in a follow-up; suppress dead-code while no
-// caller is hooked up yet.
-#[allow(dead_code)]
+// I/O driver for the pure `plan_integrate` contract. Wired into the CLI
+// via `flowd plan integrate`; the daemon-side `plan_integrate` MCP tool
+// reuses the same `PlanIntegrator` once the daemon front-door lands.
 mod integration;
 mod output;
 mod paths;
@@ -67,41 +66,7 @@ async fn main() -> Result<()> {
             since,
             limit,
         } => commands::history::run(&paths, style, project, since, limit).await,
-        Command::Plan { action } => match action {
-            PlanAction::Preview { file, dry_run } => {
-                commands::plan::preview(&paths, style, file, dry_run).await
-            }
-            PlanAction::Events {
-                plan_id,
-                limit,
-                kind,
-            } => commands::plan::events(&paths, style, plan_id, limit, kind).await,
-            PlanAction::List {
-                project,
-                status,
-                limit,
-            } => commands::plan::list(&paths, style, project, status, limit).await,
-            PlanAction::Show { plan_id } => commands::plan::show(&paths, style, plan_id).await,
-            PlanAction::Recent {
-                project,
-                status,
-                limit,
-            } => commands::plan::recent(&paths, style, project, status, limit).await,
-            PlanAction::Answer {
-                plan_id,
-                file,
-                defer_remaining,
-            } => commands::plan::answer(&paths, style, plan_id, file, defer_remaining).await,
-            PlanAction::Refine {
-                plan_id,
-                feedback,
-                file,
-            } => commands::plan::refine(&paths, style, plan_id, feedback, file).await,
-            PlanAction::Cancel { plan_id } => commands::plan::cancel(&paths, style, plan_id).await,
-            PlanAction::Usage { plan_id, json } => {
-                commands::plan::usage(&paths, style, plan_id, json).await
-            }
-        },
+        Command::Plan { action } => dispatch_plan(&paths, style, action).await,
         Command::Rules { action } => match action {
             RulesAction::List { project, file } => {
                 commands::rules::list(&paths, style, project.as_deref(), file.as_deref())
@@ -118,5 +83,70 @@ async fn main() -> Result<()> {
         }
         Command::Init { target } => commands::init::run(target).await,
         Command::Hook { event } => commands::hook::run(event).await,
+    }
+}
+
+/// `flowd plan` subcommand dispatcher. Lifted out of [`main`] so the
+/// outer `match` stays under the `clippy::too_many_lines` ceiling and
+/// the plan branches sit together in one place.
+async fn dispatch_plan(paths: &FlowdPaths, style: Style, action: PlanAction) -> Result<()> {
+    match action {
+        PlanAction::Preview { file, dry_run } => {
+            commands::plan::preview(paths, style, file, dry_run).await
+        }
+        PlanAction::Events {
+            plan_id,
+            limit,
+            kind,
+        } => commands::plan::events(paths, style, plan_id, limit, kind).await,
+        PlanAction::List {
+            project,
+            status,
+            limit,
+        } => commands::plan::list(paths, style, project, status, limit).await,
+        PlanAction::Show { plan_id } => commands::plan::show(paths, style, plan_id).await,
+        PlanAction::Recent {
+            project,
+            status,
+            limit,
+        } => commands::plan::recent(paths, style, project, status, limit).await,
+        PlanAction::Answer {
+            plan_id,
+            file,
+            defer_remaining,
+        } => commands::plan::answer(paths, style, plan_id, file, defer_remaining).await,
+        PlanAction::Refine {
+            plan_id,
+            feedback,
+            file,
+        } => commands::plan::refine(paths, style, plan_id, feedback, file).await,
+        PlanAction::Cancel { plan_id } => commands::plan::cancel(paths, style, plan_id).await,
+        PlanAction::Usage { plan_id, json } => {
+            commands::plan::usage(paths, style, plan_id, json).await
+        }
+        PlanAction::Integrate {
+            plan_id,
+            base,
+            promote,
+            dry_run,
+            cleanup,
+            strategy,
+            json,
+        } => {
+            commands::plan::integrate(
+                paths,
+                style,
+                commands::plan::IntegrateArgs {
+                    plan_id,
+                    base,
+                    promote,
+                    dry_run,
+                    cleanup,
+                    strategy,
+                    json,
+                },
+            )
+            .await
+        }
     }
 }

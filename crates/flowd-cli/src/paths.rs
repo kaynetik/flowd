@@ -90,6 +90,15 @@ impl FlowdPaths {
         self.home.join("hook-sessions")
     }
 
+    /// Root where `plan_integrate` materialises its temporary worktrees.
+    /// Lives under a distinct subdir from the spawner's `worktrees/` so a
+    /// per-plan cleanup loop keyed on the spawner's path does not sweep
+    /// integration state by accident.
+    #[must_use]
+    pub fn integrate_worktrees_dir(&self) -> PathBuf {
+        self.home.join("integrate-worktrees")
+    }
+
     /// Create the home dir (and parents) if missing. Idempotent.
     ///
     /// # Errors

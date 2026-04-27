@@ -311,6 +311,60 @@ pub enum PlanAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Stage (and optionally promote) a `Completed` plan onto a base
+    /// branch via the `plan_integrate` contract.
+    ///
+    /// Default mode stages an integration branch -- a fast-forward
+    /// promotion to the configured base requires `--promote` on a
+    /// follow-up call. `--dry-run` prints the planned cherry-picks
+    /// without touching the repo. Never pushes to a remote; the
+    /// operator propagates results themselves.
+    ///
+    /// Refuses while the daemon is alive: the CLI mutates the same
+    /// `SQLite` plan / event tables the daemon owns. Stop the daemon
+    /// (or use the equivalent MCP tool, when wired up) first.
+    Integrate {
+        /// Plan UUID.
+        plan_id: String,
+
+        /// Base branch to promote onto. Required: v1 has no inferred
+        /// default; the operator must declare the target so a
+        /// misconfigured workspace fails fast rather than quietly
+        /// merging into the wrong branch.
+        #[arg(short, long)]
+        base: String,
+
+        /// Stage / promote toggle. With `--promote`, fast-forwards the
+        /// previously-staged integration branch onto `--base`. Mutually
+        /// exclusive with `--dry-run`.
+        #[arg(long, conflicts_with = "dry_run")]
+        promote: bool,
+
+        /// Compute and render the planned operations without touching
+        /// the repo. Mutually exclusive with `--promote`.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// What to do with the integration branch and per-step branches
+        /// once the run finishes. Persisted with the integration metadata
+        /// so the daemon honours it on the cleanup pass. Allowed values:
+        /// `keep_on_failure` (default), `keep_always`, `drop_always`.
+        #[arg(long, default_value = "keep_on_failure", value_name = "POLICY")]
+        cleanup: String,
+
+        /// Cherry-pick strategy. Reserved for future variants; v1 only
+        /// supports the topological-tip cherry-pick. Anything else is
+        /// rejected with a structured error so scripts can pin behaviour.
+        #[arg(long, default_value = "tip-cherry-pick", value_name = "STRATEGY")]
+        strategy: String,
+
+        /// Emit the run outcome (or refusal/failure) as JSON instead of
+        /// the human-formatted block. Useful for scripted callers that
+        /// need to switch on the typed cause.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
