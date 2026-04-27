@@ -67,7 +67,7 @@
 //! `tracing` (warn on non-zero exit, debug otherwise) so it surfaces
 //! in the daemon log without polluting the JSON-RPC channel.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -78,6 +78,7 @@ use flowd_core::orchestration::executor::{
     AgentMetrics, AgentSpawnContext, AgentSpawner, ModelUsage,
 };
 use flowd_core::orchestration::{AgentOutput, Plan, PlanPreview, PlanStep};
+use flowd_storage::step_branch_store::{SqliteStepBranchStore, StepBranchRecord};
 use serde::Deserialize;
 use tokio::process::Command;
 
@@ -424,12 +425,20 @@ pub struct GitWorktreeSpawner {
 }
 
 impl GitWorktreeSpawner {
-    fn try_new(inner: LocalShellSpawner, flowd_home: &Path) -> Option<Self> {
+    fn try_new(
+        inner: LocalShellSpawner,
+        flowd_home: &Path,
+        branch_store: Option<Arc<SqliteStepBranchStore>>,
+    ) -> Option<Self> {
         let cwd = inner.effective_cwd().ok()?;
         let repo = discover_git_root(&cwd).ok()?;
         Some(Self {
             inner,
-            manager: Arc::new(GitWorktreeManager::new(repo, flowd_home.join("worktrees"))),
+            manager: Arc::new(GitWorktreeManager::new(
+                repo,
+                flowd_home.join("worktrees"),
+                branch_store,
+            )),
         })
     }
 
@@ -472,15 +481,32 @@ impl AgentSpawner for GitWorktreeSpawner {
 struct GitWorktreeManager {
     repo: PathBuf,
     root: PathBuf,
+    /// In-process cache of the durable `(plan_id, step_id) -> branch`
+    /// mapping. Populated lazily from `branch_store` on first access for
+    /// a given plan; written through on `finish_step`. The DB is the
+    /// source of truth across daemon restarts -- this map exists so
+    /// `dependency_branches` stays a sync hot path.
     branches: Mutex<HashMap<uuid::Uuid, HashMap<String, String>>>,
+    /// Plan ids whose state has already been pulled out of
+    /// `branch_store`. Distinct from `branches.contains_key(plan_id)`
+    /// because an in-process insert from `finish_step` would
+    /// otherwise look indistinguishable from "rehydrated, nothing
+    /// recorded yet" and skip a needed reload.
+    loaded_plans: Mutex<HashSet<uuid::Uuid>>,
+    /// Durable backing store. `None` only in unit-test setups that
+    /// don't need to assert restart behaviour; the daemon always
+    /// supplies one.
+    branch_store: Option<Arc<SqliteStepBranchStore>>,
 }
 
 impl GitWorktreeManager {
-    fn new(repo: PathBuf, root: PathBuf) -> Self {
+    fn new(repo: PathBuf, root: PathBuf, branch_store: Option<Arc<SqliteStepBranchStore>>) -> Self {
         Self {
             repo,
             root,
             branches: Mutex::new(HashMap::new()),
+            loaded_plans: Mutex::new(HashSet::new()),
+            branch_store,
         }
     }
 
@@ -532,6 +558,12 @@ impl GitWorktreeManager {
             });
         }
 
+        // Pull the plan's durable step→branch state into the in-memory
+        // cache before the sync `dependency_branches` consults it.
+        // After a daemon restart this is the only thing that lets a
+        // dependent step find its parent branch -- the in-process map
+        // is empty until this call seeds it.
+        self.ensure_branches_loaded(ctx.plan_id).await?;
         let dep_branches = self.dependency_branches(ctx.plan_id, step)?;
         let base = dep_branches.first().map_or("HEAD", String::as_str);
         let path_arg = path.to_string_lossy().into_owned();
@@ -582,17 +614,98 @@ impl GitWorktreeManager {
             .await?;
         }
         let branch = step_branch(ctx, step);
-        let mut guard = self
+        // Capture HEAD after the (maybe-)commit so the durable record
+        // points at the exact tree future integration must
+        // fast-forward to. A no-change step still records the inherited
+        // tip so dependents can ff-merge to it without re-running.
+        let tip_sha = git_output(worktree, ["rev-parse", "HEAD"])
+            .await?
+            .trim()
+            .to_owned();
+
+        {
+            let mut guard = self
+                .branches
+                .lock()
+                .map_err(|_| FlowdError::PlanExecution {
+                    message: "worktree branch map poisoned".into(),
+                    metrics: None,
+                })?;
+            guard
+                .entry(ctx.plan_id)
+                .or_default()
+                .insert(step.id.clone(), branch.clone());
+        }
+
+        // Write through to the durable store after the in-process
+        // cache update so the cache stays usable even if the DB write
+        // fails (the executor will surface the error and the next
+        // restart re-derives from the remaining rows).
+        if let Some(store) = &self.branch_store {
+            store
+                .upsert(&StepBranchRecord {
+                    plan_id: ctx.plan_id,
+                    step_id: step.id.clone(),
+                    branch,
+                    tip_sha,
+                    worktree_path: Some(worktree.to_string_lossy().into_owned()),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Pull every recorded `(step_id, branch)` for `plan_id` out of the
+    /// durable store into the in-memory cache. No-op once a plan has
+    /// been loaded -- subsequent calls within the same process trust
+    /// the cache, since `finish_step` writes through to both sides.
+    ///
+    /// Existing in-memory entries win over DB entries on a key clash,
+    /// because an in-flight `finish_step` reflects the latest commit
+    /// while the DB row could be one retry behind.
+    async fn ensure_branches_loaded(&self, plan_id: uuid::Uuid) -> Result<()> {
+        {
+            let loaded = self
+                .loaded_plans
+                .lock()
+                .map_err(|_| FlowdError::PlanExecution {
+                    message: "worktree loaded-plans set poisoned".into(),
+                    metrics: None,
+                })?;
+            if loaded.contains(&plan_id) {
+                return Ok(());
+            }
+        }
+
+        let records = if let Some(store) = &self.branch_store {
+            store.list_for_plan(plan_id).await?
+        } else {
+            Vec::new()
+        };
+
+        let mut branches = self
             .branches
             .lock()
             .map_err(|_| FlowdError::PlanExecution {
                 message: "worktree branch map poisoned".into(),
                 metrics: None,
             })?;
-        guard
-            .entry(ctx.plan_id)
-            .or_default()
-            .insert(step.id.clone(), branch);
+        let entry = branches.entry(plan_id).or_default();
+        for record in records {
+            // `or_insert`: do not clobber an in-memory write recorded
+            // by a concurrent `finish_step`.
+            entry.entry(record.step_id).or_insert(record.branch);
+        }
+        drop(branches);
+
+        let mut loaded = self
+            .loaded_plans
+            .lock()
+            .map_err(|_| FlowdError::PlanExecution {
+                message: "worktree loaded-plans set poisoned".into(),
+                metrics: None,
+            })?;
+        loaded.insert(plan_id);
         Ok(())
     }
 
@@ -816,11 +929,16 @@ pub enum BoxedSpawner {
 
 impl BoxedSpawner {
     /// Build the best available spawner for the current environment.
-    pub fn auto(flowd_home: &Path) -> Self {
+    ///
+    /// `branch_store`, when supplied, makes finished step → branch
+    /// state survive a daemon restart. Pass `None` only when the
+    /// caller explicitly does not want durable worktree state (the
+    /// integration tests do this; the daemon never does).
+    pub fn auto(flowd_home: &Path, branch_store: Option<Arc<SqliteStepBranchStore>>) -> Self {
         let Some(local) = LocalShellSpawner::detect() else {
             return Self::Unconfigured(UnconfiguredSpawner);
         };
-        GitWorktreeSpawner::try_new(local.clone(), flowd_home)
+        GitWorktreeSpawner::try_new(local.clone(), flowd_home, branch_store)
             .map_or(Self::Local(local), Self::Worktree)
     }
 
@@ -1037,6 +1155,7 @@ mod tests {
             manager: Arc::new(GitWorktreeManager::new(
                 daemon_cwd.path().to_path_buf(),
                 flowd_home.path().join("worktrees"),
+                None,
             )),
         };
 
@@ -1328,6 +1447,7 @@ mod tests {
         let manager = GitWorktreeManager::new(
             repo.path().to_path_buf(),
             worktrees.path().join("worktrees"),
+            None,
         );
         let plan = flowd_core::orchestration::Plan::new(
             "p",
@@ -1365,6 +1485,177 @@ mod tests {
                 .map(String::as_str),
             Some(step_branch(&ctx, &step).as_str()),
         );
+    }
+
+    /// End-to-end persistence: `finish_step` must write the durable
+    /// record, and a *fresh* `GitWorktreeManager` (modelling a daemon
+    /// restart) must rehydrate that state via `ensure_branches_loaded`
+    /// so dependency resolution still works -- this is the scenario
+    /// the in-process map could never satisfy.
+    #[tokio::test]
+    async fn worktree_manager_persists_branch_and_rehydrates_after_restart() {
+        let repo = tempfile::tempdir().expect("repo");
+        git_sync(repo.path(), &["init"]);
+        std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
+        git_sync(repo.path(), &["add", "README.md"]);
+        git_sync(
+            repo.path(),
+            &[
+                "-c",
+                "user.name=flowd-test",
+                "-c",
+                "user.email=flowd@test.local",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+
+        let worktrees = tempfile::tempdir().expect("worktrees");
+        let db_dir = tempfile::tempdir().expect("db dir");
+        let db_path = db_dir.path().join("flowd.sqlite");
+
+        // ---- First process: open store, run a step, drop the manager.
+        let plan = flowd_core::orchestration::Plan::new(
+            "p",
+            "proj",
+            vec![
+                step_with_id("a", "do a", &[]),
+                step_with_id("b", "do b", &["a"]),
+            ],
+        );
+        let step_a = step_with_id("a", "do a", &[]);
+        let ctx = AgentSpawnContext {
+            plan_id: plan.id,
+            project: plan.project.clone(),
+            plan_parallel: true,
+            layer_width: 2,
+            project_root: None,
+        };
+
+        let recorded_branch;
+        let recorded_tip_sha;
+        {
+            let store = Arc::new(
+                flowd_storage::step_branch_store::SqliteStepBranchStore::open(&db_path)
+                    .expect("open store"),
+            );
+            let manager = GitWorktreeManager::new(
+                repo.path().to_path_buf(),
+                worktrees.path().join("worktrees"),
+                Some(Arc::clone(&store)),
+            );
+            manager.prepare_plan(&plan).await.unwrap();
+            let worktree_a = manager.prepare_step(&ctx, &step_a).await.unwrap();
+            std::fs::write(worktree_a.join("a.txt"), "a\n").unwrap();
+            manager
+                .finish_step(&ctx, &step_a, &worktree_a)
+                .await
+                .unwrap();
+
+            // Read what got persisted so the second pass can assert
+            // the durable record carried the same branch + tip sha
+            // that the in-process map saw.
+            let rows = store.list_for_plan(plan.id).await.unwrap();
+            assert_eq!(rows.len(), 1, "exactly one row written for step a");
+            assert_eq!(rows[0].step_id, "a");
+            assert_eq!(rows[0].branch, step_branch(&ctx, &step_a));
+            assert!(
+                !rows[0].tip_sha.is_empty(),
+                "tip_sha must be captured from the worktree HEAD"
+            );
+            assert_eq!(
+                rows[0].worktree_path.as_deref(),
+                Some(worktree_a.to_string_lossy().as_ref()),
+            );
+            recorded_branch = rows[0].branch.clone();
+            recorded_tip_sha = rows[0].tip_sha.clone();
+        }
+
+        // ---- Second process: brand-new manager, brand-new in-memory
+        // map, same on-disk DB. `ensure_branches_loaded` must pull
+        // step a's branch back so a step b that depends on it can
+        // resolve its parent without the original manager ever having
+        // existed in this process. Without MIGRATION_007 + the
+        // rehydration hook this would error with
+        // "dependency branch for step `a` is missing".
+        let store2 = Arc::new(
+            flowd_storage::step_branch_store::SqliteStepBranchStore::open(&db_path)
+                .expect("reopen store"),
+        );
+        let manager2 = GitWorktreeManager::new(
+            repo.path().to_path_buf(),
+            worktrees.path().join("worktrees"),
+            Some(Arc::clone(&store2)),
+        );
+
+        manager2.ensure_branches_loaded(plan.id).await.unwrap();
+        let cached_branch = {
+            let guard = manager2.branches.lock().unwrap();
+            guard
+                .get(&plan.id)
+                .and_then(|m| m.get("a"))
+                .cloned()
+                .expect("branch must be rehydrated from durable store")
+        };
+        assert_eq!(
+            cached_branch, recorded_branch,
+            "rehydrated branch name must match the persisted record"
+        );
+
+        // Sanity: a step that depends on `a` must now resolve through
+        // the rehydrated map -- this is the production read site we
+        // care about, not just the cache contents.
+        let step_b = step_with_id("b", "do b", &["a"]);
+        let dep_branches = manager2.dependency_branches(plan.id, &step_b).unwrap();
+        assert_eq!(dep_branches, vec![recorded_branch.clone()]);
+
+        // The tip sha is preserved verbatim across the boundary --
+        // future integration uses it to fast-forward instead of
+        // walking the worktree.
+        let rows2 = store2.list_for_plan(plan.id).await.unwrap();
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows2[0].tip_sha, recorded_tip_sha);
+    }
+
+    /// `ensure_branches_loaded` must be safe to call even when the
+    /// plan has nothing recorded yet -- this is the common case before
+    /// any step finishes (and the only case for sequential plans). It
+    /// must not error and must not poison the cache against a
+    /// subsequent `finish_step`.
+    #[tokio::test]
+    async fn ensure_branches_loaded_is_noop_for_legacy_empty_plan_state() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Arc::new(
+            flowd_storage::step_branch_store::SqliteStepBranchStore::open(
+                &dir.path().join("flowd.sqlite"),
+            )
+            .expect("open store"),
+        );
+        let manager = GitWorktreeManager::new(
+            dir.path().to_path_buf(),
+            dir.path().join("worktrees"),
+            Some(Arc::clone(&store)),
+        );
+
+        let plan_id = uuid::Uuid::new_v4();
+        // No prior writes -- DB has the table but no rows for this
+        // plan. `ensure_branches_loaded` should treat that as
+        // "nothing to rehydrate" and succeed.
+        manager.ensure_branches_loaded(plan_id).await.unwrap();
+        assert!(
+            manager
+                .branches
+                .lock()
+                .unwrap()
+                .get(&plan_id)
+                .is_none_or(std::collections::HashMap::is_empty),
+            "no rows recorded -> in-memory map stays empty for this plan"
+        );
+
+        // Calling again is also a no-op: the loaded set guards
+        // against a redundant DB read on every subsequent prepare.
+        manager.ensure_branches_loaded(plan_id).await.unwrap();
     }
 
     /// The `modelUsage` block is the one place upstream swaps to
