@@ -147,6 +147,50 @@ pub enum CleanupPolicy {
     DropAlways,
 }
 
+/// Optional verification command run inside the integration worktree
+/// before fast-forward promotion.
+///
+/// V1 contract: a single argv. When `command` is `Some`, the integrator
+/// invokes it from the integration worktree's path (so `cargo nextest
+/// run`, `cargo test`, `make check`, ...) sees the staged tree). A
+/// non-zero exit blocks the fast-forward and surfaces as
+/// [`IntegrationFailure::VerificationFailed`]; the base ref is never
+/// touched. `None` (the default) skips verification entirely.
+///
+/// The argv form is deliberately not a shell string: callers compose the
+/// program + args themselves so the integrator never spawns a shell. CLI
+/// front doors that take a string split on whitespace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationConfig {
+    /// `[program, arg, ...]`. Empty-vec is treated as `None` by
+    /// [`Self::is_enabled`] so a caller that builds the struct from
+    /// raw input can leave it empty without a separate `Option` layer
+    /// at the boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+}
+
+impl VerificationConfig {
+    /// True when a non-empty command is configured.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.command.as_ref().is_some_and(|c| !c.is_empty())
+    }
+
+    /// Build a verification config from an argv. An empty `argv` resolves
+    /// to a disabled config so callers do not have to special-case it.
+    #[must_use]
+    pub fn from_argv(argv: Vec<String>) -> Self {
+        if argv.is_empty() {
+            Self::default()
+        } else {
+            Self {
+                command: Some(argv),
+            }
+        }
+    }
+}
+
 /// Operator-supplied policy for a single `plan_integrate` invocation.
 ///
 /// Carries no per-plan identifiers (`plan_id`, project) -- those
@@ -163,16 +207,26 @@ pub struct IntegrationConfig {
     pub base_branch: String,
     /// What the daemon does with branches once the run finishes.
     pub cleanup: CleanupPolicy,
+    /// Optional pre-promotion verification command. Disabled by
+    /// default; opt-in per call.
+    #[serde(default, skip_serializing_if = "verification_is_default")]
+    pub verify: VerificationConfig,
+}
+
+fn verification_is_default(v: &VerificationConfig) -> bool {
+    !v.is_enabled()
 }
 
 impl IntegrationConfig {
     /// Build a config with a declared base branch and the
     /// [`CleanupPolicy`] default ([`CleanupPolicy::KeepOnFailure`]).
+    /// Verification stays disabled until the caller opts in.
     #[must_use]
     pub fn with_base(base_branch: impl Into<String>) -> Self {
         Self {
             base_branch: base_branch.into(),
             cleanup: CleanupPolicy::default(),
+            verify: VerificationConfig::default(),
         }
     }
 }
@@ -354,6 +408,11 @@ pub struct IntegrationPlan {
     pub cherry_picks: Vec<CherryPick>,
     pub mode: IntegrationMode,
     pub cleanup: CleanupPolicy,
+    /// Echo of the operator's verification config. Empty / disabled by
+    /// default. Skipped in the JSON envelope when disabled to keep
+    /// payloads compact for the common no-verify case.
+    #[serde(default, skip_serializing_if = "verification_is_default")]
+    pub verify: VerificationConfig,
 }
 
 /// Final outcome reported back to the caller.
@@ -473,6 +532,29 @@ pub enum IntegrationFailure {
         base_tip_at_assess: String,
         observed_base_tip: String,
     },
+    /// The configured verification command exited non-zero. The base
+    /// ref is left untouched and the integration worktree is preserved
+    /// so the operator can inspect the failure. `stderr_tail` carries
+    /// the last `~4 KiB` of stderr to keep payloads bounded -- callers
+    /// re-run the command directly when they need full output.
+    #[error(
+        "verification command `{program}` (with {arg_count} args) exited with status {exit_code}: \
+         {stderr_tail}"
+    )]
+    VerificationFailed {
+        /// Program (`argv[0]`) for the verification command.
+        program: String,
+        /// Count of additional argv entries -- the full argv survives
+        /// in the persisted [`IntegrationMetadata`] when integrators
+        /// stamp the failure.
+        arg_count: usize,
+        /// Process exit status, or `-1` when the OS reported no code
+        /// (signal-terminated).
+        exit_code: i32,
+        /// Trailing slice of stderr (truncated). Empty when the
+        /// command produced none.
+        stderr_tail: String,
+    },
 }
 
 /// Pure eligibility + plan-of-operations check.
@@ -520,6 +602,7 @@ pub fn assess_eligibility(
         cherry_picks,
         mode: request.mode,
         cleanup: request.config.cleanup,
+        verify: request.config.verify.clone(),
     })
 }
 
@@ -923,6 +1006,11 @@ mod tests {
             IntegrationConfig {
                 base_branch: "release/2026.04".into(),
                 cleanup: CleanupPolicy::KeepAlways,
+                verify: VerificationConfig::from_argv(vec![
+                    "cargo".into(),
+                    "nextest".into(),
+                    "run".into(),
+                ]),
             },
         )
         .unwrap();
@@ -932,10 +1020,48 @@ mod tests {
         assert_eq!(result.base_branch, "release/2026.04");
         assert_eq!(result.mode, IntegrationMode::DryRun);
         assert_eq!(result.cleanup, CleanupPolicy::KeepAlways);
+        assert!(
+            result.verify.is_enabled(),
+            "verification config must round-trip through the eligibility plan"
+        );
+        assert_eq!(
+            result.verify.command.as_deref().unwrap(),
+            ["cargo", "nextest", "run"]
+        );
         assert_eq!(
             result.integration_branch,
             integration_branch_ref(&plan.project, plan.id)
         );
+    }
+
+    #[test]
+    fn verification_config_default_is_disabled_and_omitted_from_payload() {
+        // Pin the wire-shape default so a struct-init oversight that
+        // serialised an empty `verify: {}` block (instead of skipping
+        // it) does not silently bloat every existing integration plan
+        // row in the persisted event log.
+        let cfg = IntegrationConfig::with_base("main");
+        assert!(!cfg.verify.is_enabled());
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert!(
+            !v.as_object().unwrap().contains_key("verify"),
+            "disabled verification config must be omitted from the JSON envelope, got: {v}"
+        );
+    }
+
+    #[test]
+    fn verification_failure_serialises_with_stable_discriminant() {
+        let f = IntegrationFailure::VerificationFailed {
+            program: "cargo".into(),
+            arg_count: 3,
+            exit_code: 101,
+            stderr_tail: "test failed: foo".into(),
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        assert_eq!(v["kind"], "verification_failed");
+        assert_eq!(v["program"], "cargo");
+        assert_eq!(v["exit_code"], 101);
+        assert_eq!(v["arg_count"], 3);
     }
 
     // -------- Wire stability of the outcome / failure surface -----------

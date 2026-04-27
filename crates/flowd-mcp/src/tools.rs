@@ -212,13 +212,27 @@ pub struct PlanIntegrateParams {
     pub mode: Option<String>,
     /// When true, fast-forward the configured base ref onto the
     /// previously-staged integration tip. Mutually exclusive with
-    /// `mode = "dry_run"`; the handler refuses that combination.
+    /// `mode = "dry_run"` and with `discard`; the handler refuses
+    /// either combination.
     #[serde(default)]
     pub promote: bool,
+    /// When true, tear down a previously-staged integration without
+    /// promoting. Removes the integration worktree+branch and (per
+    /// `cleanup`) the per-step branches and worktrees. Mutually
+    /// exclusive with `promote` and `mode=dry_run`.
+    #[serde(default)]
+    pub discard: bool,
     /// What to do with the integration / per-step branches once the run
     /// finishes. Defaults to `keep_on_failure` to match CLI behaviour.
     #[serde(default)]
     pub cleanup: Option<String>,
+    /// Optional pre-promotion verification command (`[program, args...]`).
+    /// Runs in the integration worktree before fast-forward; a non-zero
+    /// exit blocks the promote and leaves the base ref untouched. Empty /
+    /// absent skips verification. Operators commonly wire this to
+    /// `["cargo", "nextest", "run", ...]` for Rust workspaces.
+    #[serde(default)]
+    pub verify_command: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -569,6 +583,16 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
                         "type": "string",
                         "enum": ["keep_on_failure", "keep_always", "drop_always"],
                         "default": "keep_on_failure"
+                    },
+                    "verify_command": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional pre-promotion verification argv. Runs in the integration worktree; non-zero exit blocks promote and leaves base untouched."
+                    },
+                    "discard": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Tear down a previously-staged integration without promoting. Removes the integration worktree+branch and (per cleanup) per-step artefacts. Mutually exclusive with promote and mode=dry_run."
                     }
                 }
             }),

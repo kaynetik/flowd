@@ -24,7 +24,8 @@ use flowd_core::orchestration::plan_events::{PlanEventQuery, PlanEventStore, Sto
 use flowd_core::orchestration::{
     Answer, CleanupPolicy, IntegrationConfig, IntegrationMetadata, IntegrationMode,
     IntegrationStatus, Plan, PlanCompiler, PlanDraftSnapshot, PlanIntegrateOutcome,
-    PlanIntegrateRequest, PlanStatus, PlanStore, PlanSummary, build_preview, load_plan,
+    PlanIntegrateRequest, PlanStatus, PlanStore, PlanSummary, VerificationConfig, build_preview,
+    load_plan,
 };
 use flowd_storage::plan_event_store::SqlitePlanEventStore;
 use flowd_storage::plan_store::SqlitePlanStore;
@@ -1043,14 +1044,34 @@ pub async fn cancel(paths: &FlowdPaths, style: Style, plan_id_arg: String) -> Re
 /// the dispatcher in `main.rs` does not exceed the
 /// `clippy::too_many_arguments` ceiling and so a future MCP front door can
 /// reuse the same parsing helpers without re-deriving the call shape.
+///
+/// Lint allowances:
+/// * `struct_excessive_bools`: the four operator-facing toggles
+///   (`promote`, `dry_run`, `discard`, `json`) intentionally each carry
+///   their own flag at the CLI surface so scripts can pin behaviour
+///   without parsing a state-machine value. Clap already enforces the
+///   mutually-exclusive set upstream, so the lint's "use a state
+///   machine" suggestion would just shuffle the validation boilerplate
+///   inward.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct IntegrateArgs {
     pub plan_id: String,
     pub base: String,
     pub promote: bool,
     pub dry_run: bool,
+    /// Tear down a previously-staged integration without promoting.
+    /// Removes the integration worktree+branch and (per `cleanup`) the
+    /// per-step branches and worktrees. Mutually exclusive with
+    /// `promote` and `dry_run` -- enforced upstream by clap.
+    pub discard: bool,
     pub cleanup: String,
     pub strategy: String,
+    /// Optional verification command run inside the integration worktree
+    /// before promote. Supplied as a single shell-style string (e.g.
+    /// `cargo nextest run -p flowd-cli`); split on whitespace at parse
+    /// time. Empty / missing skips verification.
+    pub verify: Option<String>,
     pub json: bool,
 }
 
@@ -1087,12 +1108,14 @@ pub async fn integrate(paths: &FlowdPaths, style: Style, args: IntegrateArgs) ->
     let runner = OfflinePlanRunner::open(paths)?;
     let mut plan = runner.load_existing(plan_id).await?;
 
+    let verify = parse_verify_argv(args.verify.as_deref());
     let request = PlanIntegrateRequest::new(
         plan_id,
         mode,
         IntegrationConfig {
             base_branch: args.base.clone(),
             cleanup,
+            verify,
         },
     )
     .map_err(|refusal| anyhow!("{refusal}"))?;
@@ -1103,10 +1126,13 @@ pub async fn integrate(paths: &FlowdPaths, style: Style, args: IntegrateArgs) ->
             .as_deref()
             .map_or_else(|| paths.home.clone(), Into::into),
         paths.integrate_worktrees_dir(),
+        paths.home.join("worktrees"),
         None,
     );
 
-    if args.promote {
+    if args.discard {
+        run_discard(&integrator, &runner, &mut plan, &request, style, args.json).await
+    } else if args.promote {
         run_promote(
             &integrator,
             &runner,
@@ -1128,6 +1154,57 @@ pub async fn integrate(paths: &FlowdPaths, style: Style, args: IntegrateArgs) ->
             args.json,
         )
         .await
+    }
+}
+
+/// Tear down a previously-staged integration without touching the base.
+/// Resets the persisted integration metadata to `Pending` so a follow-up
+/// stage starts from a clean slate. Refusals from the pure contract
+/// surface verbatim; missing artefacts on disk are treated as
+/// already-cleaned (the integrator is idempotent).
+async fn run_discard(
+    integrator: &PlanIntegrator,
+    runner: &OfflinePlanRunner,
+    plan: &mut Plan,
+    request: &PlanIntegrateRequest,
+    style: Style,
+    json: bool,
+) -> Result<()> {
+    match integrator.discard(plan, request).await {
+        Ok(()) => {
+            // Operator-driven discard: drop the integration metadata so a
+            // subsequent stage starts fresh. We deliberately do not write
+            // a `Failed` status -- nothing failed, the operator chose to
+            // throw away the work.
+            plan.integration = None;
+            runner.save(plan).await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "discarded",
+                        "plan_id": plan.id,
+                        "base_branch": request.config.base_branch,
+                    }))
+                    .unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                print!("{}", banner("integrate: discarded", style));
+                println!("  plan_id:     {}", style.dim(&plan.id.to_string()));
+                println!("  base_branch: {}", request.config.base_branch);
+                println!(
+                    "\n{}",
+                    style.dim(
+                        "integration worktree + branch removed; per-step artefacts honour --cleanup",
+                    ),
+                );
+            }
+            Ok(())
+        }
+        Err(err) => {
+            render_integrate_error(&err, style, json);
+            Err(integrate_error_into_anyhow(err))
+        }
     }
 }
 
@@ -1547,6 +1624,21 @@ fn parse_integrate_strategy(raw: &str) -> Result<()> {
             bail!("unknown integrate strategy `{other}`; only `tip-cherry-pick` is supported in v1")
         }
     }
+}
+
+/// Parse the `--verify "<cmd>"` argument into a [`VerificationConfig`].
+///
+/// V1 keeps this simple: whitespace-split the command into argv. Quoted
+/// arguments and shell metacharacters are explicitly *not* honoured -- a
+/// real shell never enters the picture, and a future revision can graft
+/// `shlex` on top without changing the call sites if operators need it.
+/// An empty / `None` value disables verification.
+fn parse_verify_argv(raw: Option<&str>) -> VerificationConfig {
+    let Some(raw) = raw else {
+        return VerificationConfig::default();
+    };
+    let argv: Vec<String> = raw.split_whitespace().map(str::to_owned).collect();
+    VerificationConfig::from_argv(argv)
 }
 
 fn integration_status_label(status: IntegrationStatus) -> &'static str {
@@ -2666,20 +2758,59 @@ mod tests {
                 base,
                 promote,
                 dry_run,
+                discard,
                 cleanup,
                 strategy,
+                verify,
                 json,
             } => {
                 assert_eq!(plan_id, id.to_string());
                 assert_eq!(base, "main");
                 assert!(!promote);
                 assert!(!dry_run);
+                assert!(!discard);
                 assert_eq!(cleanup, "keep_on_failure");
                 assert_eq!(strategy, "tip-cherry-pick");
+                assert!(verify.is_none(), "verify must default to None");
                 assert!(!json);
             }
             other => panic!("expected Integrate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn integrate_verify_flag_round_trips_as_string() {
+        let id = Uuid::new_v4();
+        let action = parse_integrate(&[
+            &id.to_string(),
+            "--base",
+            "main",
+            "--verify",
+            "cargo nextest run -p flowd-cli",
+        ])
+        .expect("parse");
+        let crate::cli::PlanAction::Integrate { verify, .. } = action else {
+            panic!("expected Integrate");
+        };
+        assert_eq!(
+            verify.as_deref(),
+            Some("cargo nextest run -p flowd-cli"),
+            "raw verify string must round-trip; whitespace splitting happens in parse_verify_argv"
+        );
+    }
+
+    #[test]
+    fn parse_verify_argv_splits_on_whitespace_and_handles_empty() {
+        let cfg = parse_verify_argv(Some("cargo nextest run -p flowd-cli"));
+        assert!(cfg.is_enabled());
+        assert_eq!(
+            cfg.command.as_deref().unwrap(),
+            ["cargo", "nextest", "run", "-p", "flowd-cli"]
+        );
+        // Empty string => disabled, not an empty argv. Same for None.
+        assert!(!parse_verify_argv(Some("")).is_enabled());
+        assert!(!parse_verify_argv(Some("   \t  ")).is_enabled());
+        assert!(!parse_verify_argv(None).is_enabled());
     }
 
     #[test]
@@ -2890,6 +3021,7 @@ mod tests {
             IntegrationConfig {
                 base_branch: base.into(),
                 cleanup: CleanupPolicy::DropAlways,
+                verify: VerificationConfig::default(),
             },
         )
         .expect("fixture request")
@@ -2930,6 +3062,7 @@ mod tests {
                 cherry_picks: Vec::new(),
                 mode: IntegrationMode::DryRun,
                 cleanup: CleanupPolicy::DropAlways,
+                verify: VerificationConfig::default(),
             },
         };
         apply_outcome_to_plan(&mut plan, &req, &outcome);
@@ -2962,6 +3095,7 @@ mod tests {
                 cherry_picks: Vec::new(),
                 mode: IntegrationMode::Confirm,
                 cleanup: CleanupPolicy::DropAlways,
+                verify: VerificationConfig::default(),
             },
             integration_tip: "deadbeef".into(),
         };
@@ -2989,6 +3123,7 @@ mod tests {
                 cherry_picks: Vec::new(),
                 mode: IntegrationMode::Confirm,
                 cleanup: CleanupPolicy::KeepOnFailure,
+                verify: VerificationConfig::default(),
             },
             promoted_tip: "cafef00d".into(),
         };

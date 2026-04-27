@@ -45,6 +45,7 @@ use flowd_core::memory::service::MemoryService;
 use flowd_core::memory::{EmbeddingProvider, MemoryBackend, VectorIndex};
 use flowd_core::orchestration::integration::{
     CleanupPolicy, IntegrationConfig, IntegrationMode, IntegrationStatus, PlanIntegrateRequest,
+    VerificationConfig,
 };
 use flowd_core::orchestration::observer::{PlanEvent, SharedPlanObserver};
 use flowd_core::orchestration::{
@@ -928,13 +929,25 @@ where
                 "plan_integrate: `promote=true` is incompatible with `mode=dry_run`".into(),
             ));
         }
+        if p.discard && (p.promote || mode == IntegrationMode::DryRun) {
+            return Err(FlowdError::PlanValidation(
+                "plan_integrate: `discard=true` is incompatible with `promote=true` or \
+                 `mode=dry_run`"
+                    .into(),
+            ));
+        }
 
+        let verify = p
+            .verify_command
+            .map(VerificationConfig::from_argv)
+            .unwrap_or_default();
         let request = PlanIntegrateRequest::new(
             plan_id,
             mode,
             IntegrationConfig {
                 base_branch: p.base_branch,
                 cleanup,
+                verify,
             },
         )
         .map_err(|refusal| FlowdError::PlanValidation(format!("plan_integrate: {refusal}")))?;
@@ -964,6 +977,28 @@ where
                     .into(),
                 metrics: None,
             })?;
+
+        if p.discard {
+            // Discard does not return a `PlanIntegrateOutcome` -- the
+            // integrator surfaces success as `()`. We mint a stable
+            // payload here so MCP callers can route on `kind="discarded"`
+            // without inferring it from an empty body.
+            return match integrator.discard(&plan, &request).await {
+                Ok(()) => Ok(json!({
+                    "kind": "discarded",
+                    "plan_id": plan_id.to_string(),
+                    "base_branch": request.config.base_branch,
+                })),
+                Err(IntegrationError::Refusal(refusal)) => Err(FlowdError::PlanValidation(
+                    format!("plan_integrate refusal: {refusal}"),
+                )),
+                Err(IntegrationError::Failure(failure)) => Err(FlowdError::PlanExecution {
+                    message: format!("plan_integrate failure: {failure}"),
+                    metrics: None,
+                }),
+                Err(IntegrationError::Plan(err)) => Err(err),
+            };
+        }
 
         let outcome = if p.promote {
             integrator.promote(&plan, &request).await

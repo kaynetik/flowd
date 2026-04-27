@@ -43,12 +43,17 @@ pub enum IntegrationError {
 pub type IntegrationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PlanIntegrateOutcome, IntegrationError>> + Send + 'a>>;
 
+/// Boxed async result for the discard surface, which does not return a
+/// [`PlanIntegrateOutcome`] -- discard is a teardown, not a transition.
+pub type IntegrationDiscardFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), IntegrationError>> + Send + 'a>>;
+
 /// Surface the MCP `plan_integrate` handler dispatches to.
 ///
-/// Mirrors the two-phase CLI surface: stage (`integrate`) then
-/// fast-forward (`promote`). Every implementation is responsible for its
-/// own persistence -- the handler only routes the call and returns the
-/// outcome verbatim.
+/// Mirrors the three-phase CLI surface: stage (`integrate`),
+/// fast-forward (`promote`), and explicit teardown (`discard`). Every
+/// implementation is responsible for its own persistence -- the handler
+/// only routes the call and returns the outcome verbatim.
 pub trait IntegrationDriver: Send + Sync {
     fn integrate<'a>(
         &'a self,
@@ -61,4 +66,10 @@ pub trait IntegrationDriver: Send + Sync {
         plan: &'a Plan,
         request: &'a PlanIntegrateRequest,
     ) -> IntegrationFuture<'a>;
+
+    fn discard<'a>(
+        &'a self,
+        plan: &'a Plan,
+        request: &'a PlanIntegrateRequest,
+    ) -> IntegrationDiscardFuture<'a>;
 }

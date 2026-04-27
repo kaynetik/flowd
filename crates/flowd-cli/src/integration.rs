@@ -46,11 +46,13 @@ use std::sync::Arc;
 use flowd_core::error::{FlowdError, Result as FlowdResult};
 use flowd_core::orchestration::Plan;
 use flowd_core::orchestration::integration::{
-    CherryPick, IntegrationFailure, IntegrationMode, IntegrationRefusal, PlanIntegrateOutcome,
-    PlanIntegrateRequest, assess_eligibility,
+    CherryPick, CleanupPolicy, IntegrationFailure, IntegrationMode, IntegrationPlan,
+    IntegrationRefusal, PlanIntegrateOutcome, PlanIntegrateRequest, VerificationConfig,
+    assess_eligibility,
 };
 use flowd_mcp::integration::{
-    IntegrationDriver, IntegrationError as McpIntegrationError, IntegrationFuture,
+    IntegrationDiscardFuture, IntegrationDriver, IntegrationError as McpIntegrationError,
+    IntegrationFuture,
 };
 use flowd_storage::step_branch_store::SqliteStepBranchStore;
 use tokio::process::Command;
@@ -104,6 +106,14 @@ impl IntegrationDriver for PlanIntegrator {
     ) -> IntegrationFuture<'a> {
         Box::pin(async move { self.promote(plan, request).await.map_err(Into::into) })
     }
+
+    fn discard<'a>(
+        &'a self,
+        plan: &'a Plan,
+        request: &'a PlanIntegrateRequest,
+    ) -> IntegrationDiscardFuture<'a> {
+        Box::pin(async move { self.discard(plan, request).await.map_err(Into::into) })
+    }
 }
 
 /// Concrete I/O driver for `plan_integrate`.
@@ -123,9 +133,16 @@ pub struct PlanIntegrator {
     /// subdir so cleanup loops keyed on the spawner's path don't sweep
     /// integration state by accident.
     worktree_root: PathBuf,
+    /// Where the [`crate::spawner::GitWorktreeManager`] materialised the
+    /// per-step worktrees. Used by the cleanup pass to `git worktree
+    /// remove --force` each step's checkout after a successful promote /
+    /// explicit discard. Layout mirrors the spawner's
+    /// `<spawner_worktree_root>/<project>/<plan_id>/<step_id>` convention.
+    spawner_worktree_root: PathBuf,
     /// Durable step→branch map. Optional: tests that pre-create branches
-    /// in the repo do not need it; the daemon always supplies one.
-    #[allow(dead_code)]
+    /// in the repo do not need it; the daemon always supplies one. The
+    /// cleanup pass also drops the plan's rows here when present so the
+    /// store stays in lock-step with the on-disk branches.
     branch_store: Option<Arc<SqliteStepBranchStore>>,
 }
 
@@ -134,11 +151,13 @@ impl PlanIntegrator {
     pub fn new(
         repo: PathBuf,
         worktree_root: PathBuf,
+        spawner_worktree_root: PathBuf,
         branch_store: Option<Arc<SqliteStepBranchStore>>,
     ) -> Self {
         Self {
             repo,
             worktree_root,
+            spawner_worktree_root,
             branch_store,
         }
     }
@@ -247,19 +266,26 @@ impl PlanIntegrator {
     /// Promote a previously-staged integration branch to the configured
     /// base via fast-forward-only.
     ///
-    /// Refuses on a dirty repo (won't stash for the operator) and on a
-    /// non-fast-forward situation (the base advanced after staging --
-    /// the operator must rebase the integration branch and re-confirm).
-    /// Uses `git update-ref` with a CAS old-value so a race between the
-    /// pre-check and the write surfaces as
-    /// [`IntegrationFailure::BaseAdvanced`] rather than a silent
-    /// overwrite.
+    /// Order of operations:
+    ///
+    /// 1. Pure eligibility against the staged plan / request.
+    /// 2. Resolve the configured base + the staged integration tip; refuse
+    ///    on a dirty base or a non-ancestor (`BaseAdvanced`).
+    /// 3. **Optional verification** ([`VerificationConfig`]) inside the
+    ///    integration worktree. A non-zero exit surfaces
+    ///    [`IntegrationFailure::VerificationFailed`] and the base ref is
+    ///    never touched -- the operator can resolve and re-promote.
+    /// 4. CAS `git update-ref` (old-value guard) onto the base branch.
+    /// 5. **Cleanup** per [`CleanupPolicy`] -- only on the successful
+    ///    promote path. Failure paths (verification, dirty base,
+    ///    base-advanced, ...) preserve every artefact for triage.
     ///
     /// # Errors
     /// Same refusal shapes as [`Self::integrate`] for the eligibility
     /// stage, plus:
     /// * [`IntegrationFailure::DirtyBase`]
     /// * [`IntegrationFailure::BaseAdvanced`]
+    /// * [`IntegrationFailure::VerificationFailed`]
     pub async fn promote(
         &self,
         plan: &Plan,
@@ -328,6 +354,18 @@ impl PlanIntegrator {
             }
         }
 
+        // Verification gate. Runs *after* the ff-only ancestor check (so a
+        // BaseAdvanced operator does not waste time re-running tests on a
+        // tree that cannot promote anyway) but *before* update-ref (so a
+        // failure leaves the base ref byte-for-byte where it was). The
+        // command runs inside the integration worktree so `cargo nextest`,
+        // `cargo test`, `make check`, ... see the staged tree -- not the
+        // base checkout.
+        if intended.verify.is_enabled() {
+            let wt_path = self.worktree_path(plan);
+            run_verification(&wt_path, &intended.verify).await?;
+        }
+
         // CAS update: if base advanced between the ancestor check and the
         // ref write, update-ref's old-value guard fails and we surface
         // BaseAdvanced for the operator to retry.
@@ -355,10 +393,184 @@ impl PlanIntegrator {
             }));
         }
 
+        // Cleanup is gated on the successful promote: every error path
+        // above returned before we got here, so reaching this point means
+        // the base now points at the integration tip and the artefacts
+        // are safe to drop. A KeepAlways policy still wins -- the operator
+        // explicitly asked for retention.
+        self.cleanup_after_success(plan, &intended).await;
+
         Ok(PlanIntegrateOutcome::Promoted {
             intended,
             promoted_tip: integration_tip,
         })
+    }
+
+    /// Explicitly discard a staged integration: tear down the integration
+    /// worktree+branch and (per [`CleanupPolicy`]) drop the per-step
+    /// branches and worktrees too. Idempotent: missing artefacts are
+    /// treated as already cleaned.
+    ///
+    /// Distinct from `promote`'s implicit cleanup -- the operator may want
+    /// to throw away an integration whose verification failed, or an
+    /// integration they staged for inspection and decided not to promote.
+    /// The base ref is never touched.
+    ///
+    /// # Errors
+    /// Returns [`IntegrateError::Refusal`] when the request fails the pure
+    /// eligibility check (mirrors [`Self::integrate`] / [`Self::promote`]
+    /// so refusals stay observable through every entry point). Filesystem
+    /// / git errors during the actual teardown are logged best-effort and
+    /// do not abort the call -- a half-cleaned worktree should not
+    /// pretend the discard never happened.
+    pub async fn discard(
+        &self,
+        plan: &Plan,
+        request: &PlanIntegrateRequest,
+    ) -> IntegrateResult<()> {
+        let intended = assess_eligibility(plan, request)?;
+        // Always drop the integration worktree+branch on discard -- that
+        // is the operator's explicit ask. Per-step artefacts then follow
+        // the cleanup policy (KeepAlways still preserves them).
+        let _ = self.cleanup_integration(plan, &intended).await;
+        if intended.cleanup != CleanupPolicy::KeepAlways {
+            self.cleanup_step_artifacts(plan, &intended).await;
+        }
+        Ok(())
+    }
+
+    /// Cleanup pass invoked after a successful promote. Drops the
+    /// integration worktree+branch and the per-step artefacts when the
+    /// policy permits. `KeepAlways` is the no-op short-circuit; the
+    /// other two variants behave identically here (the failure path
+    /// simply never reaches this function).
+    async fn cleanup_after_success(&self, plan: &Plan, intended: &IntegrationPlan) {
+        if intended.cleanup == CleanupPolicy::KeepAlways {
+            return;
+        }
+        let _ = self.cleanup_integration(plan, intended).await;
+        self.cleanup_step_artifacts(plan, intended).await;
+    }
+
+    /// Tear down the integration worktree and delete the integration
+    /// branch. Best-effort: a worktree that git refuses to remove is
+    /// followed by a raw `rmdir`, mirroring
+    /// [`crate::spawner::cleanup_rejected_worktree`] so a stale worktree
+    /// admin entry never blocks future runs.
+    async fn cleanup_integration(
+        &self,
+        plan: &Plan,
+        intended: &IntegrationPlan,
+    ) -> FlowdResult<()> {
+        let repo = self.repo_for_plan(plan);
+        let wt_path = self.worktree_path(plan);
+        let path_arg = wt_path.to_string_lossy().into_owned();
+
+        if wt_path.exists() {
+            let (code, _, stderr) =
+                run_git_capture(repo, &["worktree", "remove", "--force", &path_arg]).await?;
+            if code != 0 {
+                tracing::warn!(
+                    target: "flowd::cli::integrate",
+                    worktree = %wt_path.display(),
+                    stderr = %stderr.trim(),
+                    "git worktree remove failed during integration cleanup; falling back to rmdir"
+                );
+                let _ = tokio::fs::remove_dir_all(&wt_path).await;
+            }
+        }
+
+        // `git branch -D` after the worktree comes down -- otherwise git
+        // refuses with "branch is checked out". A missing branch is not
+        // an error: the discard surface is idempotent.
+        let _ = run_git_capture(repo, &["branch", "-D", &intended.integration_branch]).await?;
+        Ok(())
+    }
+
+    /// Drop every per-step branch and worktree the spawner materialised
+    /// for `plan`. Walks the contract's [`step_branch_ref`] for every step
+    /// in the plan (not just the tips -- interior steps own branches
+    /// too). Worktrees live under
+    /// `<spawner_worktree_root>/<project>/<plan_id>/<step_id>`. Each
+    /// removal is best-effort: a stale step that no longer has a worktree
+    /// or a branch falls through silently so the cleanup pass stays
+    /// idempotent across operator-driven retries.
+    async fn cleanup_step_artifacts(&self, plan: &Plan, intended: &IntegrationPlan) {
+        let repo = self.repo_for_plan(plan);
+        let plan_root = self
+            .spawner_worktree_root
+            .join(sanitize_path(&plan.project))
+            .join(plan.id.to_string());
+
+        for step in &plan.steps {
+            let step_path = plan_root.join(sanitize_path(&step.id));
+            if step_path.exists() {
+                let path_arg = step_path.to_string_lossy().into_owned();
+                let res =
+                    run_git_capture(repo, &["worktree", "remove", "--force", &path_arg]).await;
+                match res {
+                    Ok((code, _, stderr)) if code != 0 => {
+                        tracing::warn!(
+                            target: "flowd::cli::integrate",
+                            worktree = %step_path.display(),
+                            stderr = %stderr.trim(),
+                            "git worktree remove failed during step cleanup; falling back to rmdir"
+                        );
+                        let _ = tokio::fs::remove_dir_all(&step_path).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "flowd::cli::integrate",
+                            worktree = %step_path.display(),
+                            error = %e,
+                            "git worktree remove errored during step cleanup; falling back to rmdir"
+                        );
+                        let _ = tokio::fs::remove_dir_all(&step_path).await;
+                    }
+                    _ => {}
+                }
+            }
+
+            let branch = flowd_core::orchestration::integration::step_branch_ref(
+                &intended.project,
+                intended.plan_id,
+                &step.id,
+            );
+            // `branch -D` is forceful (no merged-into-HEAD check) because
+            // the integration just landed on base via fast-forward; the
+            // step branch's commits already live there. Failure is
+            // logged-and-ignored: a missing branch is the idempotent
+            // common case after a partially-completed prior cleanup.
+            if let Ok((code, _, stderr)) = run_git_capture(repo, &["branch", "-D", &branch]).await {
+                if code != 0 && !stderr.contains("not found") {
+                    tracing::debug!(
+                        target: "flowd::cli::integrate",
+                        branch = %branch,
+                        stderr = %stderr.trim(),
+                        "git branch -D returned non-zero during step cleanup"
+                    );
+                }
+            }
+        }
+
+        // Best-effort: drop the now-empty plan root so the spawner's
+        // `flowd_home/worktrees/<project>/<plan_id>` directory does not
+        // accumulate empty shells across many integrated plans.
+        let _ = tokio::fs::remove_dir(&plan_root).await;
+
+        // Drop the durable step→branch map for this plan if we have one.
+        // Stays in lock-step with the on-disk state so a later daemon
+        // startup does not try to rehydrate dead refs.
+        if let Some(store) = &self.branch_store {
+            if let Err(e) = store.delete_for_plan(plan.id).await {
+                tracing::warn!(
+                    target: "flowd::cli::integrate",
+                    plan_id = %plan.id,
+                    error = %e,
+                    "delete step→branch rows failed during cleanup"
+                );
+            }
+        }
     }
 
     /// Resolve the git repo path to drive operations from. The plan's
@@ -529,11 +741,73 @@ fn sanitize_path(raw: &str) -> String {
         .collect()
 }
 
+/// Cap on the verification stderr we keep on the typed failure. Bounds
+/// the on-wire payload so a verbose `cargo nextest` run does not bloat
+/// the persisted failure metadata; the operator re-runs the command
+/// directly when they need full output.
+const VERIFY_STDERR_TAIL_BYTES: usize = 4096;
+
+/// Run the configured verification command inside `wt_path`. Translates
+/// the process exit (or spawn error) into the typed
+/// [`IntegrationFailure::VerificationFailed`] so the caller surfaces a
+/// stable failure shape that downstream renderers can switch on.
+///
+/// Spawning the program directly (no shell) keeps quoting / metachar
+/// surprises out of the path -- callers compose the argv themselves.
+async fn run_verification(wt_path: &Path, verify: &VerificationConfig) -> IntegrateResult<()> {
+    let argv = verify
+        .command
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| {
+            IntegrateError::Plan(FlowdError::PlanExecution {
+                message: "verification command is enabled but argv is empty".into(),
+                metrics: None,
+            })
+        })?;
+    let program = &argv[0];
+    let extra = &argv[1..];
+
+    let output = Command::new(program)
+        .args(extra)
+        .current_dir(wt_path)
+        .output()
+        .await
+        .map_err(|e| {
+            // A spawn failure (binary not on PATH, permission denied) is
+            // surfaced as VerificationFailed too -- it is functionally a
+            // verification refusal from the operator's perspective, and
+            // mapping it to a Plan error would force downstream renderers
+            // to special-case "could not run the verifier" separately.
+            IntegrationFailure::VerificationFailed {
+                program: program.clone(),
+                arg_count: extra.len(),
+                exit_code: -1,
+                stderr_tail: format!("spawn failed: {e}"),
+            }
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tail_start = stderr.len().saturating_sub(VERIFY_STDERR_TAIL_BYTES);
+    let stderr_tail = stderr[tail_start..].to_owned();
+    Err(IntegrationFailure::VerificationFailed {
+        program: program.clone(),
+        arg_count: extra.len(),
+        exit_code: output.status.code().unwrap_or(-1),
+        stderr_tail,
+    }
+    .into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flowd_core::orchestration::integration::{
-        CleanupPolicy, IntegrationConfig, IntegrationMode, integration_branch_ref, step_branch_ref,
+        IntegrationConfig, integration_branch_ref, step_branch_ref,
     };
     use flowd_core::orchestration::{Plan, PlanStatus, PlanStep, StepStatus};
 
@@ -560,27 +834,21 @@ mod tests {
     }
 
     fn confirm_request(plan_id: uuid::Uuid, base: &str) -> PlanIntegrateRequest {
-        PlanIntegrateRequest::new(
-            plan_id,
-            IntegrationMode::Confirm,
-            IntegrationConfig {
-                base_branch: base.into(),
-                cleanup: CleanupPolicy::KeepOnFailure,
-            },
-        )
-        .expect("fixture request must validate")
+        PlanIntegrateRequest::new(plan_id, IntegrationMode::Confirm, base_config(base))
+            .expect("fixture request must validate")
     }
 
     fn dry_run_request(plan_id: uuid::Uuid, base: &str) -> PlanIntegrateRequest {
-        PlanIntegrateRequest::new(
-            plan_id,
-            IntegrationMode::DryRun,
-            IntegrationConfig {
-                base_branch: base.into(),
-                cleanup: CleanupPolicy::KeepOnFailure,
-            },
-        )
-        .expect("fixture request must validate")
+        PlanIntegrateRequest::new(plan_id, IntegrationMode::DryRun, base_config(base))
+            .expect("fixture request must validate")
+    }
+
+    fn base_config(base: &str) -> IntegrationConfig {
+        IntegrationConfig {
+            base_branch: base.into(),
+            cleanup: CleanupPolicy::KeepOnFailure,
+            verify: VerificationConfig::default(),
+        }
     }
 
     fn git_sync(cwd: &Path, args: &[&str]) {
@@ -730,7 +998,30 @@ mod tests {
     }
 
     fn integrator(repo: &Path, worktrees: &Path) -> PlanIntegrator {
-        PlanIntegrator::new(repo.to_path_buf(), worktrees.to_path_buf(), None)
+        // The dedicated test fixture passes the same root for the
+        // spawner-worktree directory; existing tests do not exercise
+        // step-cleanup, so wiring it as a temp path keeps them unchanged
+        // while still satisfying the new constructor shape.
+        let spawner_root = worktrees.join(".spawner-fixture");
+        PlanIntegrator::new(
+            repo.to_path_buf(),
+            worktrees.to_path_buf(),
+            spawner_root,
+            None,
+        )
+    }
+
+    fn integrator_with_spawner_root(
+        repo: &Path,
+        worktrees: &Path,
+        spawner_root: &Path,
+    ) -> PlanIntegrator {
+        PlanIntegrator::new(
+            repo.to_path_buf(),
+            worktrees.to_path_buf(),
+            spawner_root.to_path_buf(),
+            None,
+        )
     }
 
     /// Configure the plan to point at the test repo so [`PlanIntegrator`]
@@ -1312,5 +1603,439 @@ mod tests {
             }
             other => panic!("expected PlanStatus refusal, got {other:?}"),
         }
+    }
+
+    // -------- Verification gate -----------------------------------------
+
+    fn verify_request(
+        plan_id: uuid::Uuid,
+        base: &str,
+        argv: Vec<String>,
+        cleanup: CleanupPolicy,
+    ) -> PlanIntegrateRequest {
+        PlanIntegrateRequest::new(
+            plan_id,
+            IntegrationMode::Confirm,
+            IntegrationConfig {
+                base_branch: base.into(),
+                cleanup,
+                verify: VerificationConfig::from_argv(argv),
+            },
+        )
+        .expect("verify fixture must validate")
+    }
+
+    /// A configured verification command that exits non-zero must block
+    /// the fast-forward. The base ref must point at exactly the same sha
+    /// it did before the promote attempt -- the entire point of the gate.
+    /// Per the contract this also leaves the integration worktree on
+    /// disk for the operator to inspect.
+    #[tokio::test]
+    async fn verification_failure_leaves_base_untouched_and_preserves_artifacts() {
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let repo = init_repo(repo_dir.path());
+        let worktrees = tempfile::tempdir().expect("worktrees");
+
+        let mut plan = completed_plan("verifyfail", vec![step("a", &[])]);
+        anchor_plan(&mut plan, &repo);
+        make_step_branch(&repo, &plan.project, plan.id, "a", "main");
+
+        let int = integrator(&repo, worktrees.path());
+        // Stage cleanly first -- the verification gate is on the
+        // promote path, not the stage path.
+        int.integrate(&plan, &confirm_request(plan.id, "main"))
+            .await
+            .expect("staged");
+        let base_before = rev_parse(&repo, "main");
+        let int_branch = integration_branch_ref(&plan.project, plan.id);
+        let int_tip_before = rev_parse(&repo, &int_branch);
+
+        // `false` is a POSIX builtin that always exits 1. Available in
+        // every CI image we care about and free of any side effects --
+        // perfect for asserting the gate triggers.
+        let req = verify_request(
+            plan.id,
+            "main",
+            vec!["false".into()],
+            CleanupPolicy::DropAlways,
+        );
+        let err = int
+            .promote(&plan, &req)
+            .await
+            .expect_err("verification failure must surface");
+        match err {
+            IntegrateError::Failure(IntegrationFailure::VerificationFailed {
+                program,
+                exit_code,
+                ..
+            }) => {
+                assert_eq!(program, "false");
+                assert_ne!(exit_code, 0, "false(1) must report a non-zero exit");
+            }
+            other => panic!("expected VerificationFailed, got {other:?}"),
+        }
+
+        // Base ref unchanged: the whole point of the gate is that
+        // promote does not mutate state when verification refuses.
+        assert_eq!(
+            rev_parse(&repo, "main"),
+            base_before,
+            "base must point at exactly the pre-promote sha after a failed verification",
+        );
+        // Integration branch is also still around for the operator to
+        // poke at; even DropAlways must not cleanup on a failure path.
+        assert_eq!(
+            rev_parse(&repo, &int_branch),
+            int_tip_before,
+            "integration branch must survive a verification failure verbatim",
+        );
+        let wt_path = worktrees
+            .path()
+            .join("verifyfail")
+            .join(plan.id.to_string());
+        assert!(
+            wt_path.exists(),
+            "integration worktree must survive a verification failure at {}",
+            wt_path.display(),
+        );
+    }
+
+    /// A configured verification command that exits zero must allow the
+    /// fast-forward to land. Mirrors the failure case above so a single
+    /// regression in either direction surfaces here.
+    #[tokio::test]
+    async fn verification_success_allows_promote_to_fast_forward_base() {
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let repo = init_repo(repo_dir.path());
+        let worktrees = tempfile::tempdir().expect("worktrees");
+
+        let mut plan = completed_plan("verifyok", vec![step("a", &[])]);
+        anchor_plan(&mut plan, &repo);
+        make_step_branch(&repo, &plan.project, plan.id, "a", "main");
+
+        let int = integrator(&repo, worktrees.path());
+        let staged = int
+            .integrate(&plan, &confirm_request(plan.id, "main"))
+            .await
+            .expect("staged");
+        let staged_tip = match staged {
+            PlanIntegrateOutcome::Staged {
+                integration_tip, ..
+            } => integration_tip,
+            other => panic!("expected Staged, got {other:?}"),
+        };
+
+        // `true` always exits 0 -- the verifier reports success.
+        let req = verify_request(
+            plan.id,
+            "main",
+            vec!["true".into()],
+            CleanupPolicy::KeepAlways,
+        );
+        let outcome = int
+            .promote(&plan, &req)
+            .await
+            .expect("verification success must allow promote");
+        match outcome {
+            PlanIntegrateOutcome::Promoted { promoted_tip, .. } => {
+                assert_eq!(promoted_tip, staged_tip);
+            }
+            other => panic!("expected Promoted, got {other:?}"),
+        }
+        assert_eq!(
+            rev_parse(&repo, "main"),
+            staged_tip,
+            "base must fast-forward when verification passes",
+        );
+    }
+
+    // -------- Cleanup gating --------------------------------------------
+
+    /// `KeepAlways` must preserve the integration branch + per-step
+    /// branches even after a successful promote -- the operator
+    /// explicitly asked for retention.
+    #[tokio::test]
+    async fn cleanup_keep_always_retains_step_and_integration_branches() {
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let repo = init_repo(repo_dir.path());
+        let worktrees = tempfile::tempdir().expect("worktrees");
+        let spawner_root = tempfile::tempdir().expect("spawner root");
+
+        let mut plan = completed_plan("keepalways", vec![step("a", &[])]);
+        anchor_plan(&mut plan, &repo);
+        make_step_branch(&repo, &plan.project, plan.id, "a", "main");
+
+        let int = integrator_with_spawner_root(&repo, worktrees.path(), spawner_root.path());
+        int.integrate(
+            &plan,
+            &PlanIntegrateRequest::new(
+                plan.id,
+                IntegrationMode::Confirm,
+                IntegrationConfig {
+                    base_branch: "main".into(),
+                    cleanup: CleanupPolicy::KeepAlways,
+                    verify: VerificationConfig::default(),
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("staged");
+
+        int.promote(
+            &plan,
+            &PlanIntegrateRequest::new(
+                plan.id,
+                IntegrationMode::Confirm,
+                IntegrationConfig {
+                    base_branch: "main".into(),
+                    cleanup: CleanupPolicy::KeepAlways,
+                    verify: VerificationConfig::default(),
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("promoted");
+
+        // KeepAlways: every flowd-managed branch must still resolve.
+        let int_branch = integration_branch_ref(&plan.project, plan.id);
+        let step_branch = step_branch_ref(&plan.project, plan.id, "a");
+        assert!(
+            git_sync_capture(&repo, &["rev-parse", "--verify", &int_branch]).0,
+            "KeepAlways must preserve {int_branch} after successful promote",
+        );
+        assert!(
+            git_sync_capture(&repo, &["rev-parse", "--verify", &step_branch]).0,
+            "KeepAlways must preserve {step_branch} after successful promote",
+        );
+    }
+
+    /// `KeepOnFailure` (the default) drops branches and worktrees once
+    /// the promote lands cleanly, but does **not** touch them when the
+    /// run fails. Pinned together so a future refactor that flipped one
+    /// path without the other surfaces here.
+    #[tokio::test]
+    async fn cleanup_keep_on_failure_drops_artifacts_only_after_successful_promote() {
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let repo = init_repo(repo_dir.path());
+        let worktrees = tempfile::tempdir().expect("worktrees");
+        let spawner_root = tempfile::tempdir().expect("spawner root");
+
+        let mut plan = completed_plan("dropok", vec![step("a", &[])]);
+        anchor_plan(&mut plan, &repo);
+        make_step_branch(&repo, &plan.project, plan.id, "a", "main");
+
+        // Materialise the spawner-style step worktree so the cleanup
+        // pass has a real directory to reap. Mirrors the layout the
+        // spawner produces: `<root>/<project>/<plan_id>/<step_id>`.
+        let step_wt = spawner_root
+            .path()
+            .join(&plan.project)
+            .join(plan.id.to_string())
+            .join("a");
+        std::fs::create_dir_all(step_wt.parent().unwrap()).unwrap();
+        let step_branch = step_branch_ref(&plan.project, plan.id, "a");
+        git_sync(
+            &repo,
+            &["worktree", "add", step_wt.to_str().unwrap(), &step_branch],
+        );
+        assert!(step_wt.exists(), "fixture: step worktree must be on disk");
+
+        let int = integrator_with_spawner_root(&repo, worktrees.path(), spawner_root.path());
+        let req = || {
+            PlanIntegrateRequest::new(
+                plan.id,
+                IntegrationMode::Confirm,
+                IntegrationConfig {
+                    base_branch: "main".into(),
+                    cleanup: CleanupPolicy::KeepOnFailure,
+                    verify: VerificationConfig::default(),
+                },
+            )
+            .unwrap()
+        };
+        int.integrate(&plan, &req()).await.expect("staged");
+        int.promote(&plan, &req()).await.expect("promoted");
+
+        // After a successful promote with KeepOnFailure: integration
+        // branch and step branch must be gone, the integration worktree
+        // teardown leaves no directory behind, and the step worktree
+        // the spawner produced is reclaimed.
+        let int_branch = integration_branch_ref(&plan.project, plan.id);
+        assert!(
+            !git_sync_capture(&repo, &["rev-parse", "--verify", &int_branch]).0,
+            "KeepOnFailure must drop {int_branch} after a clean promote",
+        );
+        assert!(
+            !git_sync_capture(&repo, &["rev-parse", "--verify", &step_branch]).0,
+            "KeepOnFailure must drop {step_branch} after a clean promote",
+        );
+        assert!(
+            !step_wt.exists(),
+            "step worktree must be reclaimed after successful promote, still at {}",
+            step_wt.display(),
+        );
+        let int_wt = worktrees.path().join("dropok").join(plan.id.to_string());
+        assert!(
+            !int_wt.exists(),
+            "integration worktree must be reclaimed after successful promote, still at {}",
+            int_wt.display(),
+        );
+    }
+
+    /// Cleanup is gated on success: a failed promote (here: a deliberate
+    /// dirty base after staging) must leave every artefact in place even
+    /// though the policy would normally drop them. The operator's signal
+    /// is the failure -- they need the artefacts to triage.
+    #[tokio::test]
+    async fn cleanup_does_not_run_on_promote_failure_path() {
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let repo = init_repo(repo_dir.path());
+        let worktrees = tempfile::tempdir().expect("worktrees");
+        let spawner_root = tempfile::tempdir().expect("spawner root");
+
+        let mut plan = completed_plan("nodropfail", vec![step("a", &[])]);
+        anchor_plan(&mut plan, &repo);
+        make_step_branch(&repo, &plan.project, plan.id, "a", "main");
+
+        let step_wt = spawner_root
+            .path()
+            .join(&plan.project)
+            .join(plan.id.to_string())
+            .join("a");
+        std::fs::create_dir_all(step_wt.parent().unwrap()).unwrap();
+        let step_branch = step_branch_ref(&plan.project, plan.id, "a");
+        git_sync(
+            &repo,
+            &["worktree", "add", step_wt.to_str().unwrap(), &step_branch],
+        );
+
+        let int = integrator_with_spawner_root(&repo, worktrees.path(), spawner_root.path());
+        let req = || {
+            PlanIntegrateRequest::new(
+                plan.id,
+                IntegrationMode::Confirm,
+                IntegrationConfig {
+                    base_branch: "main".into(),
+                    // DropAlways still must preserve on failure per the
+                    // task contract: cleanup runs only on success or
+                    // explicit discard.
+                    cleanup: CleanupPolicy::DropAlways,
+                    verify: VerificationConfig::default(),
+                },
+            )
+            .unwrap()
+        };
+        int.integrate(&plan, &req()).await.expect("staged");
+
+        // Force a dirty base so promote refuses without ever touching
+        // base or running cleanup.
+        std::fs::write(repo.join("dirty.txt"), "dirty\n").unwrap();
+        let err = int
+            .promote(&plan, &req())
+            .await
+            .expect_err("dirty base must refuse promote");
+        assert!(matches!(
+            err,
+            IntegrateError::Failure(IntegrationFailure::DirtyBase)
+        ));
+
+        // Every artefact must still be present.
+        let int_branch = integration_branch_ref(&plan.project, plan.id);
+        assert!(
+            git_sync_capture(&repo, &["rev-parse", "--verify", &int_branch]).0,
+            "{int_branch} must survive a failed promote",
+        );
+        assert!(
+            git_sync_capture(&repo, &["rev-parse", "--verify", &step_branch]).0,
+            "{step_branch} must survive a failed promote",
+        );
+        assert!(
+            step_wt.exists(),
+            "step worktree must survive a failed promote, missing at {}",
+            step_wt.display(),
+        );
+    }
+
+    /// Explicit discard tears down the integration artefacts and (per
+    /// policy) drops the per-step branches too. The base ref is never
+    /// touched -- discard is a teardown, not a transition.
+    #[tokio::test]
+    async fn discard_tears_down_integration_and_honors_cleanup_policy() {
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let repo = init_repo(repo_dir.path());
+        let worktrees = tempfile::tempdir().expect("worktrees");
+        let spawner_root = tempfile::tempdir().expect("spawner root");
+
+        let mut plan = completed_plan("discardproj", vec![step("a", &[])]);
+        anchor_plan(&mut plan, &repo);
+        make_step_branch(&repo, &plan.project, plan.id, "a", "main");
+
+        let step_wt = spawner_root
+            .path()
+            .join(&plan.project)
+            .join(plan.id.to_string())
+            .join("a");
+        std::fs::create_dir_all(step_wt.parent().unwrap()).unwrap();
+        let step_branch = step_branch_ref(&plan.project, plan.id, "a");
+        git_sync(
+            &repo,
+            &["worktree", "add", step_wt.to_str().unwrap(), &step_branch],
+        );
+
+        let int = integrator_with_spawner_root(&repo, worktrees.path(), spawner_root.path());
+        int.integrate(
+            &plan,
+            &PlanIntegrateRequest::new(
+                plan.id,
+                IntegrationMode::Confirm,
+                IntegrationConfig {
+                    base_branch: "main".into(),
+                    cleanup: CleanupPolicy::KeepOnFailure,
+                    verify: VerificationConfig::default(),
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("staged");
+
+        let base_before = rev_parse(&repo, "main");
+        int.discard(
+            &plan,
+            &PlanIntegrateRequest::new(
+                plan.id,
+                IntegrationMode::Confirm,
+                IntegrationConfig {
+                    base_branch: "main".into(),
+                    cleanup: CleanupPolicy::KeepOnFailure,
+                    verify: VerificationConfig::default(),
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("discard");
+
+        assert_eq!(
+            rev_parse(&repo, "main"),
+            base_before,
+            "discard must never touch the base ref",
+        );
+        let int_branch = integration_branch_ref(&plan.project, plan.id);
+        assert!(
+            !git_sync_capture(&repo, &["rev-parse", "--verify", &int_branch]).0,
+            "discard must drop {int_branch}",
+        );
+        assert!(
+            !git_sync_capture(&repo, &["rev-parse", "--verify", &step_branch]).0,
+            "discard with KeepOnFailure must also drop {step_branch}",
+        );
+        assert!(
+            !step_wt.exists(),
+            "discard must reap the step worktree at {}",
+            step_wt.display(),
+        );
     }
 }

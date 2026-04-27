@@ -337,14 +337,21 @@ pub enum PlanAction {
 
         /// Stage / promote toggle. With `--promote`, fast-forwards the
         /// previously-staged integration branch onto `--base`. Mutually
-        /// exclusive with `--dry-run`.
-        #[arg(long, conflicts_with = "dry_run")]
+        /// exclusive with `--dry-run` and `--discard`.
+        #[arg(long, conflicts_with_all = ["dry_run", "discard"])]
         promote: bool,
 
         /// Compute and render the planned operations without touching
-        /// the repo. Mutually exclusive with `--promote`.
-        #[arg(long)]
+        /// the repo. Mutually exclusive with `--promote` and `--discard`.
+        #[arg(long, conflicts_with_all = ["discard"])]
         dry_run: bool,
+
+        /// Explicitly discard a previously-staged integration: removes
+        /// the integration worktree+branch and (per `--cleanup`) drops
+        /// the per-step branches and worktrees. The base ref is never
+        /// touched. Mutually exclusive with `--promote` and `--dry-run`.
+        #[arg(long)]
+        discard: bool,
 
         /// What to do with the integration branch and per-step branches
         /// once the run finishes. Persisted with the integration metadata
@@ -358,6 +365,15 @@ pub enum PlanAction {
         /// rejected with a structured error so scripts can pin behaviour.
         #[arg(long, default_value = "tip-cherry-pick", value_name = "STRATEGY")]
         strategy: String,
+
+        /// Optional verification command run inside the integration
+        /// worktree before fast-forward promotion. A non-zero exit
+        /// blocks the promote and leaves the configured base ref
+        /// untouched. Whitespace-split into argv at parse time -- pass
+        /// quoting-free invocations like `cargo nextest run -p flowd-cli`.
+        /// Omit (or pass an empty string) to skip verification.
+        #[arg(long, value_name = "CMD")]
+        verify: Option<String>,
 
         /// Emit the run outcome (or refusal/failure) as JSON instead of
         /// the human-formatted block. Useful for scripted callers that

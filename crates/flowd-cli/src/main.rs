@@ -129,8 +129,10 @@ async fn dispatch_plan(paths: &FlowdPaths, style: Style, action: PlanAction) -> 
             base,
             promote,
             dry_run,
+            discard,
             cleanup,
             strategy,
+            verify,
             json,
         } => {
             commands::plan::integrate(
@@ -141,8 +143,10 @@ async fn dispatch_plan(paths: &FlowdPaths, style: Style, action: PlanAction) -> 
                     base,
                     promote,
                     dry_run,
+                    discard,
                     cleanup,
                     strategy,
+                    verify,
                     json,
                 },
             )

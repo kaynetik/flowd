@@ -33,7 +33,7 @@ use flowd_core::orchestration::{
 };
 use flowd_core::rules::InMemoryRuleEvaluator;
 use flowd_core::types::Embedding;
-use flowd_mcp::integration::{IntegrationDriver, IntegrationFuture};
+use flowd_mcp::integration::{IntegrationDiscardFuture, IntegrationDriver, IntegrationFuture};
 use flowd_mcp::tools::PlanIntegrateParams;
 use flowd_mcp::{FlowdHandlers, McpHandlers, StubPlanCompiler};
 use flowd_storage::plan_store::SqlitePlanStore;
@@ -133,6 +133,20 @@ impl IntegrationDriver for StubIntegrator {
                 intended,
                 promoted_tip: "deadbeef".into(),
             })
+        })
+    }
+
+    fn discard<'a>(
+        &'a self,
+        plan: &'a Plan,
+        request: &'a PlanIntegrateRequest,
+    ) -> IntegrationDiscardFuture<'a> {
+        Box::pin(async move {
+            // Drive the eligibility contract so refusals stay observable
+            // through the discard surface; success is a no-op teardown
+            // for the stub since there are no real artefacts to remove.
+            let _ = assess_eligibility(plan, request)?;
+            Ok(())
         })
     }
 }
@@ -246,6 +260,8 @@ async fn plan_integrate_happy_path_returns_staged_outcome() {
             mode: None,
             promote: false,
             cleanup: None,
+            verify_command: None,
+            discard: false,
         })
         .await
         .expect("plan_integrate succeeds for a Completed plan");
@@ -276,6 +292,8 @@ async fn plan_integrate_dry_run_returns_dry_run_outcome() {
             mode: Some("dry_run".into()),
             promote: false,
             cleanup: None,
+            verify_command: None,
+            discard: false,
         })
         .await
         .expect("dry_run plan_integrate succeeds");
@@ -304,6 +322,8 @@ async fn plan_integrate_refuses_non_completed_plan() {
             mode: None,
             promote: false,
             cleanup: None,
+            verify_command: None,
+            discard: false,
         })
         .await
         .expect_err("non-Completed plan must refuse");
@@ -342,6 +362,13 @@ async fn plan_integrate_is_idempotent_for_already_promoted_plans() {
         ) -> IntegrationFuture<'a> {
             Box::pin(async { panic!("idempotent call must not reach the driver") })
         }
+        fn discard<'a>(
+            &'a self,
+            _plan: &'a Plan,
+            _request: &'a PlanIntegrateRequest,
+        ) -> IntegrationDiscardFuture<'a> {
+            Box::pin(async { panic!("idempotent call must not reach the driver") })
+        }
     }
     let h = build_harness_with_integrator(Some(Arc::new(PanicIntegrator)));
 
@@ -369,6 +396,8 @@ async fn plan_integrate_is_idempotent_for_already_promoted_plans() {
             mode: None,
             promote: false,
             cleanup: None,
+            verify_command: None,
+            discard: false,
         })
         .await
         .expect("idempotent call succeeds");
@@ -400,6 +429,8 @@ async fn plan_integrate_without_driver_returns_structured_error() {
             mode: None,
             promote: false,
             cleanup: None,
+            verify_command: None,
+            discard: false,
         })
         .await
         .expect_err("missing driver must error");
@@ -430,6 +461,8 @@ async fn plan_integrate_refuses_promote_with_dry_run() {
             mode: Some("dry_run".into()),
             promote: true,
             cleanup: None,
+            verify_command: None,
+            discard: false,
         })
         .await
         .expect_err("promote+dry_run is a contradiction");

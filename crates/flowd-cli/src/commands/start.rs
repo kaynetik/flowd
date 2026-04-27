@@ -195,6 +195,7 @@ pub async fn run(
     let integrator: Arc<dyn IntegrationDriver> = Arc::new(PlanIntegrator::new(
         paths.home.clone(),
         paths.integrate_worktrees_dir(),
+        paths.home.join("worktrees"),
         Some(Arc::clone(&step_branch_store)),
     ));
 

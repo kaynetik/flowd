@@ -39,8 +39,8 @@ pub use executor::{AgentOutput, AgentSpawnContext, AgentSpawner, InMemoryPlanExe
 pub use integration::{
     CherryPick, CleanupPolicy, IntegrationConfig, IntegrationFailure, IntegrationMetadata,
     IntegrationMode, IntegrationPlan, IntegrationRefusal, IntegrationStatus, PlanIntegrateOutcome,
-    PlanIntegrateRequest, assess_eligibility, integration_branch_ref, step_branch_ref,
-    topological_tip_cherry_picks,
+    PlanIntegrateRequest, VerificationConfig, assess_eligibility, integration_branch_ref,
+    step_branch_ref, topological_tip_cherry_picks,
 };
 pub use loader::{PlanDefinition, StepDefinition, load_plan, load_plan_json, load_plan_yaml};
 pub use store::{NoOpPlanStore, PlanStore, PlanSummary};
