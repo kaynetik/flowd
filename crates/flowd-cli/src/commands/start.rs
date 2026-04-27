@@ -51,12 +51,14 @@ use flowd_vector::qdrant::{QdrantConfig, QdrantIndex};
 
 use crate::config::{FlowdConfig, LlmConfig, LlmProvider};
 use crate::daemon::PidFile;
+use crate::integration::PlanIntegrator;
 use crate::output::Style;
 use crate::paths::FlowdPaths;
 use crate::plan_compiler::{DaemonPlanCompiler, ProjectScopedPlanCompiler};
 use crate::spawner::BoxedSpawner;
 use flowd_mcp::ClaudeCliCallback;
 use flowd_mcp::ClaudeCliConfig as McpClaudeCliConfig;
+use flowd_mcp::integration::IntegrationDriver;
 
 #[allow(clippy::too_many_lines)]
 pub async fn run(
@@ -185,6 +187,17 @@ pub async fn run(
     // workspace hint.
     let plan_compiler = Arc::new(ProjectScopedPlanCompiler::new(default_compiler));
 
+    // Bind the offline `flowd plan integrate` driver to the MCP
+    // `plan_integrate` tool so the operator can drive integrations
+    // without taking the daemon down. Re-uses the same step→branch
+    // store the spawner persisted into so the integrator finds the
+    // per-step branches the daemon's runs produced.
+    let integrator: Arc<dyn IntegrationDriver> = Arc::new(PlanIntegrator::new(
+        paths.home.clone(),
+        paths.integrate_worktrees_dir(),
+        Some(Arc::clone(&step_branch_store)),
+    ));
+
     let handlers = Arc::new(
         FlowdHandlers::new(memory_service, Arc::clone(&executor), plan_compiler, rules)
             .with_question_budget(Some(config.plan.max_questions))
@@ -192,7 +205,8 @@ pub async fn run(
             // Share the plan-event sink with the executor so clarification
             // and refinement transitions land in the same audit log as
             // step-level events.
-            .with_observer(plan_observer),
+            .with_observer(plan_observer)
+            .with_integrator(integrator),
     );
     let server = Arc::new(McpServer::new(handlers, McpServerConfig::default()));
     let socket = BoundSocket::bind(paths.socket_file())?;

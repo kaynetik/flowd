@@ -17,6 +17,7 @@
 
 pub mod compiler;
 pub mod handlers;
+pub mod integration;
 pub mod llm;
 pub mod observer;
 pub mod protocol;
@@ -26,6 +27,7 @@ pub mod tools;
 
 pub use compiler::{LlmCallback, LlmPlanCompiler, RejectingPlanCompiler, StubPlanCompiler};
 pub use handlers::{FlowdHandlers, McpHandlers};
+pub use integration::{IntegrationDriver, IntegrationError, IntegrationFuture};
 pub use llm::{
     ClaudeCliCallback, ClaudeCliConfig, ClaudeEffort, OpenAiCompatibleCallback,
     OpenAiCompatibleConfig,

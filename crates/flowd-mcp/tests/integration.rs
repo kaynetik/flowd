@@ -11,8 +11,9 @@ use flowd_core::error::Result;
 use flowd_mcp::protocol::{JSON_RPC_VERSION, JsonRpcResponse};
 use flowd_mcp::tools::{
     MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanAnswerParams, PlanCancelParams,
-    PlanConfirmParams, PlanCreateParams, PlanListParams, PlanRecentParams, PlanRefineParams,
-    PlanResumeParams, PlanShowParams, PlanStatusParams, RulesCheckParams, RulesListParams,
+    PlanConfirmParams, PlanCreateParams, PlanIntegrateParams, PlanListParams, PlanRecentParams,
+    PlanRefineParams, PlanResumeParams, PlanShowParams, PlanStatusParams, RulesCheckParams,
+    RulesListParams,
 };
 use flowd_mcp::{McpHandlers, McpServer, McpServerConfig};
 use serde_json::{Value, json};
@@ -60,6 +61,9 @@ impl McpHandlers for EchoHandlers {
     }
     async fn plan_recent(&self, _: PlanRecentParams) -> Result<Value> {
         Ok(json!({"ok": "plan_recent"}))
+    }
+    async fn plan_integrate(&self, _: PlanIntegrateParams) -> Result<Value> {
+        Ok(json!({"ok": "plan_integrate"}))
     }
     async fn rules_check(&self, _: RulesCheckParams) -> Result<Value> {
         Ok(json!({"ok": "rules_check"}))
@@ -128,7 +132,7 @@ async fn full_mcp_session_roundtrip() {
     let tools = responses[1].result.as_ref().unwrap()["tools"]
         .as_array()
         .unwrap();
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 16);
 
     // tools/call rules_check -> success envelope
     let ok_result = responses[2].result.as_ref().unwrap();

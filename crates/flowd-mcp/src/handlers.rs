@@ -43,6 +43,9 @@ use flowd_core::memory::compactor::ActivityMonitor;
 use flowd_core::memory::context::AutoContextQuery;
 use flowd_core::memory::service::MemoryService;
 use flowd_core::memory::{EmbeddingProvider, MemoryBackend, VectorIndex};
+use flowd_core::orchestration::integration::{
+    CleanupPolicy, IntegrationConfig, IntegrationMode, IntegrationStatus, PlanIntegrateRequest,
+};
 use flowd_core::orchestration::observer::{PlanEvent, SharedPlanObserver};
 use flowd_core::orchestration::{
     Answer, Plan, PlanCompiler, PlanDraftSnapshot, PlanExecutor, PlanStatus, PlanSummary,
@@ -51,10 +54,12 @@ use flowd_core::orchestration::{
 use flowd_core::rules::{ProposedAction, RuleEvaluator};
 use flowd_core::types::SearchQuery;
 
+use crate::integration::{IntegrationDriver, IntegrationError};
 use crate::tools::{
     MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanAnswerParams, PlanCancelParams,
-    PlanConfirmParams, PlanCreateParams, PlanListParams, PlanRecentParams, PlanRefineParams,
-    PlanResumeParams, PlanShowParams, PlanStatusParams, RulesCheckParams, RulesListParams,
+    PlanConfirmParams, PlanCreateParams, PlanIntegrateParams, PlanListParams, PlanRecentParams,
+    PlanRefineParams, PlanResumeParams, PlanShowParams, PlanStatusParams, RulesCheckParams,
+    RulesListParams,
 };
 
 /// Maximum number of characters preserved for a derived plan name.
@@ -121,6 +126,11 @@ pub trait McpHandlers: Send + Sync {
 
     fn plan_recent(&self, params: PlanRecentParams) -> impl Future<Output = Result<Value>> + Send;
 
+    fn plan_integrate(
+        &self,
+        params: PlanIntegrateParams,
+    ) -> impl Future<Output = Result<Value>> + Send;
+
     fn rules_check(&self, params: RulesCheckParams) -> impl Future<Output = Result<Value>> + Send;
 
     fn rules_list(&self, params: RulesListParams) -> impl Future<Output = Result<Value>> + Send;
@@ -174,6 +184,12 @@ where
     /// the budget machinery stays inert and existing assertions don't
     /// have to account for the warnings field.
     question_budget: Option<usize>,
+    /// Optional driver for the `plan_integrate` MCP tool. Bound by the
+    /// daemon to a real `PlanIntegrator`; tests inject a stub. When
+    /// `None`, `plan_integrate` returns a structured `PlanExecution`
+    /// error so callers know the surface is unconfigured rather than
+    /// silently accepting the request.
+    integrator: Option<Arc<dyn IntegrationDriver>>,
 }
 
 impl<M, V, E, PE, PC, R> FlowdHandlers<M, V, E, PE, PC, R>
@@ -199,7 +215,18 @@ where
             observer: None,
             monitor: None,
             question_budget: None,
+            integrator: None,
         }
+    }
+
+    /// Attach an [`IntegrationDriver`] that backs the `plan_integrate`
+    /// MCP tool. Returns `self` for chaining. When unset, the tool
+    /// surfaces a structured `PlanExecution` error so callers can tell
+    /// "not configured" apart from "refused".
+    #[must_use]
+    pub fn with_integrator(mut self, integrator: Arc<dyn IntegrationDriver>) -> Self {
+        self.integrator = Some(integrator);
+        self
     }
 
     /// Attach an `ActivityMonitor` so each handler call resets the idle
@@ -416,6 +443,27 @@ fn plan_summaries_payload(summaries: &[PlanSummary]) -> Value {
 
 fn parse_plan_status_filter(raw: Option<String>) -> Result<Option<PlanStatus>> {
     raw.map(|s| parse_plan_status(&s)).transpose()
+}
+
+fn parse_integration_mode(raw: Option<&str>) -> Result<IntegrationMode> {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("" | "confirm") => Ok(IntegrationMode::Confirm),
+        Some("dry_run" | "dry-run") => Ok(IntegrationMode::DryRun),
+        Some(other) => Err(FlowdError::PlanValidation(format!(
+            "plan_integrate: unknown mode `{other}`; expected confirm or dry_run"
+        ))),
+    }
+}
+
+fn parse_cleanup_policy(raw: Option<&str>) -> Result<CleanupPolicy> {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("" | "keep_on_failure" | "keep-on-failure") => Ok(CleanupPolicy::KeepOnFailure),
+        Some("keep_always" | "keep-always") => Ok(CleanupPolicy::KeepAlways),
+        Some("drop_always" | "drop-always") => Ok(CleanupPolicy::DropAlways),
+        Some(other) => Err(FlowdError::PlanValidation(format!(
+            "plan_integrate: unknown cleanup `{other}`; expected keep_on_failure, keep_always, or drop_always"
+        ))),
+    }
 }
 
 fn parse_plan_status(raw: &str) -> Result<PlanStatus> {
@@ -867,6 +915,75 @@ where
         let summaries = self.executor.list_plans(p.project).await?;
         let summaries = filter_plan_summaries(summaries, status, Some(p.limit.unwrap_or(5)));
         Ok(plan_summaries_payload(&summaries))
+    }
+
+    async fn plan_integrate(&self, p: PlanIntegrateParams) -> Result<Value> {
+        self.touch_activity();
+        let plan_id = parse_uuid(&p.plan_id)?;
+        let mode = parse_integration_mode(p.mode.as_deref())?;
+        let cleanup = parse_cleanup_policy(p.cleanup.as_deref())?;
+
+        if p.promote && mode == IntegrationMode::DryRun {
+            return Err(FlowdError::PlanValidation(
+                "plan_integrate: `promote=true` is incompatible with `mode=dry_run`".into(),
+            ));
+        }
+
+        let request = PlanIntegrateRequest::new(
+            plan_id,
+            mode,
+            IntegrationConfig {
+                base_branch: p.base_branch,
+                cleanup,
+            },
+        )
+        .map_err(|refusal| FlowdError::PlanValidation(format!("plan_integrate: {refusal}")))?;
+
+        let plan = self.executor.status(plan_id).await?;
+
+        // Idempotency: a plan whose persisted integration is already
+        // `Promoted` does not re-enter the driver. We mirror back the
+        // recorded metadata so callers can rely on a stable payload
+        // shape (kind=already_promoted) instead of having to remember
+        // which tool emitted the original outcome.
+        if let Some(meta) = &plan.integration {
+            if meta.status == IntegrationStatus::Promoted {
+                return Ok(json!({
+                    "kind": "already_promoted",
+                    "plan_id": plan_id.to_string(),
+                    "integration": meta,
+                }));
+            }
+        }
+
+        let integrator = self
+            .integrator
+            .as_ref()
+            .ok_or_else(|| FlowdError::PlanExecution {
+                message: "plan_integrate: no integration driver is configured for this MCP server"
+                    .into(),
+                metrics: None,
+            })?;
+
+        let outcome = if p.promote {
+            integrator.promote(&plan, &request).await
+        } else {
+            integrator.integrate(&plan, &request).await
+        };
+
+        match outcome {
+            Ok(out) => {
+                serde_json::to_value(&out).map_err(|e| FlowdError::Serialization(e.to_string()))
+            }
+            Err(IntegrationError::Refusal(refusal)) => Err(FlowdError::PlanValidation(format!(
+                "plan_integrate refusal: {refusal}"
+            ))),
+            Err(IntegrationError::Failure(failure)) => Err(FlowdError::PlanExecution {
+                message: format!("plan_integrate failure: {failure}"),
+                metrics: None,
+            }),
+            Err(IntegrationError::Plan(err)) => Err(err),
+        }
     }
 
     async fn rules_check(&self, p: RulesCheckParams) -> Result<Value> {

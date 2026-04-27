@@ -21,9 +21,9 @@ use crate::handlers::McpHandlers;
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::tools::{
     MemoryContextParams, MemorySearchParams, MemoryStoreParams, PlanAnswerParams, PlanCancelParams,
-    PlanConfirmParams, PlanCreateParams, PlanListParams, PlanRecentParams, PlanRefineParams,
-    PlanResumeParams, PlanShowParams, PlanStatusParams, RulesCheckParams, RulesListParams,
-    ToolResult, all_tool_schemas,
+    PlanConfirmParams, PlanCreateParams, PlanIntegrateParams, PlanListParams, PlanRecentParams,
+    PlanRefineParams, PlanResumeParams, PlanShowParams, PlanStatusParams, RulesCheckParams,
+    RulesListParams, ToolResult, all_tool_schemas,
 };
 
 /// MCP server configuration.
@@ -226,6 +226,10 @@ async fn dispatch_tool_call<H: McpHandlers>(
             Ok(p) => handlers.plan_recent(p).await,
             Err(e) => return Err(e),
         },
+        "plan_integrate" => match parse_params::<PlanIntegrateParams>(arguments) {
+            Ok(p) => handlers.plan_integrate(p).await,
+            Err(e) => return Err(e),
+        },
         "rules_check" => match parse_params::<RulesCheckParams>(arguments) {
             Ok(p) => handlers.rules_check(p).await,
             Err(e) => return Err(e),
@@ -346,6 +350,12 @@ mod tests {
         ) -> flowd_core::error::Result<Value> {
             Ok(json!({"plans": []}))
         }
+        async fn plan_integrate(
+            &self,
+            _: crate::tools::PlanIntegrateParams,
+        ) -> flowd_core::error::Result<Value> {
+            Ok(json!({"kind": "dry_run"}))
+        }
         async fn rules_check(
             &self,
             _: crate::tools::RulesCheckParams,
@@ -390,7 +400,7 @@ mod tests {
         .await
         .unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
     }
 
     #[tokio::test]

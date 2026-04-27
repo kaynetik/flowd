@@ -186,6 +186,41 @@ pub struct PlanRecentParams {
     pub limit: Option<usize>,
 }
 
+/// Parameters for `plan_integrate`: stage (and optionally promote) the
+/// per-step branches of a `Completed` plan into a single linear-history
+/// integration branch.
+///
+/// Mirrors the offline CLI front door (`flowd plan integrate`): same
+/// `mode`, `promote`, `cleanup`, and `base_branch` knobs. The MCP tool is
+/// the alternative when the daemon owns the in-memory executor (the
+/// offline CLI refuses while the daemon is alive).
+///
+/// Idempotent: re-invoking on a plan whose persisted integration is
+/// already `Promoted` returns the recorded outcome instead of touching
+/// git again.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlanIntegrateParams {
+    pub plan_id: String,
+    /// Branch the integration eventually promotes to via fast-forward.
+    /// Required: v1 has no inferred default.
+    pub base_branch: String,
+    /// `confirm` (default) stages the integration branch and stops;
+    /// `dry_run` previews without touching git. Promotion is gated on
+    /// the separate `promote` flag and reuses the `confirm` mode under
+    /// the hood.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// When true, fast-forward the configured base ref onto the
+    /// previously-staged integration tip. Mutually exclusive with
+    /// `mode = "dry_run"`; the handler refuses that combination.
+    #[serde(default)]
+    pub promote: bool,
+    /// What to do with the integration / per-step branches once the run
+    /// finishes. Defaults to `keep_on_failure` to match CLI behaviour.
+    #[serde(default)]
+    pub cleanup: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RulesCheckParams {
     pub tool: String,
@@ -506,6 +541,39 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
             }),
         },
         ToolSchema {
+            name: "plan_integrate".into(),
+            description: "Stage (and optionally promote) the per-step branches of a Completed plan \
+                          into a single linear-history integration branch. Mirrors `flowd plan \
+                          integrate`. Idempotent: a plan whose persisted integration is already \
+                          `promoted` returns the recorded outcome instead of touching git. Refuses \
+                          plans that are not Completed."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["plan_id", "base_branch"],
+                "properties": {
+                    "plan_id":     { "type": "string" },
+                    "base_branch": { "type": "string", "description": "Branch the integration eventually promotes to" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["confirm", "dry_run"],
+                        "default": "confirm",
+                        "description": "`confirm` stages the integration branch; `dry_run` previews without git mutation."
+                    },
+                    "promote": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, fast-forward the base ref onto the previously-staged integration tip. Refused with mode=dry_run."
+                    },
+                    "cleanup": {
+                        "type": "string",
+                        "enum": ["keep_on_failure", "keep_always", "drop_always"],
+                        "default": "keep_on_failure"
+                    }
+                }
+            }),
+        },
+        ToolSchema {
             name: "rules_check".into(),
             description: "Validate a proposed tool invocation against loaded rules (warn / deny)."
                 .into(),
@@ -546,7 +614,7 @@ mod tests {
             assert!(!s.description.trim().is_empty());
             assert_eq!(s.input_schema["type"], "object");
         }
-        assert_eq!(schemas.len(), 15);
+        assert_eq!(schemas.len(), 16);
     }
 
     #[test]

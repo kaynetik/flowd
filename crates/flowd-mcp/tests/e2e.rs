@@ -273,7 +273,7 @@ async fn full_composed_session_roundtrip() {
     let tools = responses[1].result.as_ref().unwrap()["tools"]
         .as_array()
         .unwrap();
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 16);
 
     // memory_store: returns the new UUID
     let stored = tool_payload(&responses[2]);

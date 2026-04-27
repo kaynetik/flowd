@@ -49,6 +49,9 @@ use flowd_core::orchestration::integration::{
     CherryPick, IntegrationFailure, IntegrationMode, IntegrationRefusal, PlanIntegrateOutcome,
     PlanIntegrateRequest, assess_eligibility,
 };
+use flowd_mcp::integration::{
+    IntegrationDriver, IntegrationError as McpIntegrationError, IntegrationFuture,
+};
 use flowd_storage::step_branch_store::SqliteStepBranchStore;
 use tokio::process::Command;
 
@@ -74,6 +77,34 @@ pub enum IntegrateError {
 }
 
 pub type IntegrateResult<T> = std::result::Result<T, IntegrateError>;
+
+impl From<IntegrateError> for McpIntegrationError {
+    fn from(err: IntegrateError) -> Self {
+        match err {
+            IntegrateError::Refusal(r) => Self::Refusal(r),
+            IntegrateError::Failure(f) => Self::Failure(f),
+            IntegrateError::Plan(p) => Self::Plan(p),
+        }
+    }
+}
+
+impl IntegrationDriver for PlanIntegrator {
+    fn integrate<'a>(
+        &'a self,
+        plan: &'a Plan,
+        request: &'a PlanIntegrateRequest,
+    ) -> IntegrationFuture<'a> {
+        Box::pin(async move { self.integrate(plan, request).await.map_err(Into::into) })
+    }
+
+    fn promote<'a>(
+        &'a self,
+        plan: &'a Plan,
+        request: &'a PlanIntegrateRequest,
+    ) -> IntegrationFuture<'a> {
+        Box::pin(async move { self.promote(plan, request).await.map_err(Into::into) })
+    }
+}
 
 /// Concrete I/O driver for `plan_integrate`.
 ///
