@@ -12,6 +12,11 @@ mod cli;
 mod commands;
 mod config;
 mod daemon;
+// I/O driver for the pure `plan_integrate` contract. Stands ready for the
+// CLI / MCP wiring landing in a follow-up; suppress dead-code while no
+// caller is hooked up yet.
+#[allow(dead_code)]
+mod integration;
 mod output;
 mod paths;
 mod plan_compiler;
