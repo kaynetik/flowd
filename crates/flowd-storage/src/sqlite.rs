@@ -76,6 +76,11 @@ fn storage_err(e: impl std::fmt::Display) -> FlowdError {
 /// which makes operational logs useless: surfacing the extended code
 /// (e.g. `787` = `SQLITE_CONSTRAINT_FOREIGNKEY`) makes the failure
 /// diagnosable from the log alone.
+///
+/// Owned-`Error` argument so this passes directly to `map_err` without
+/// a closure at every call site; clippy warns about this but the
+/// ergonomics are worth the allow.
+#[allow(clippy::needless_pass_by_value)]
 fn rusqlite_err(e: rusqlite::Error) -> FlowdError {
     if let rusqlite::Error::SqliteFailure(code, ref msg) = e {
         let detail = msg.clone().unwrap_or_else(|| e.to_string());

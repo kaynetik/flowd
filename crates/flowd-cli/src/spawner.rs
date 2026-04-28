@@ -36,17 +36,32 @@
 //! - `--bare` -- skips the Node-side auto-discovery pass that
 //!   otherwise loads `~/.claude`, project `CLAUDE.md`, MCP servers,
 //!   hooks, plugins, skills, auto-memory, OAuth, and the OS
-//!   keychain on every invocation. In headless dispatch we want
-//!   none of that: the prompt comes from `step.prompt`, the
+//!   keychain on every invocation. In headless dispatch we usually
+//!   want none of that: the prompt comes from `step.prompt`, the
 //!   workspace trust gate is already bypassed, and reproducibility
 //!   matters more than convenience. Anthropic has stated `--bare`
-//!   will become the `-p` default in a future release; we adopt it
-//!   now. Bare mode requires `ANTHROPIC_API_KEY` to be set in the
+//!   will become the `-p` default in a future release; we adopt
+//!   it where we can.
+//!
+//!   `FLOWD_AGENT_CLAUDE_BARE` is tri-state:
+//!     - `1` -- force ON (legacy default; pinned reproducibility).
+//!     - `0` -- force OFF (full auto-discovery).
+//!     - unset / anything else -- *Auto*: at construction time the
+//!       spawner probes for a Claude Code credential source the
+//!       upstream CLI can read on its own (macOS keychain entry
+//!       `Claude Code-credentials` or `~/.claude/.credentials.json`
+//!       on Linux). If credentials are reachable AND
+//!       `ANTHROPIC_API_KEY` is unset, bare mode auto-disables so
+//!       the spawned `claude` reuses the operator's existing
+//!       OAuth/keychain auth. If `ANTHROPIC_API_KEY` is set, or
+//!       no credential source is detected, bare mode stays ON.
+//!
+//!   Bare mode requires `ANTHROPIC_API_KEY` to be set in the
 //!   environment (or an `apiKeyHelper` declared via `--settings`)
-//!   because keychain lookup is skipped. Override with
-//!   `FLOWD_AGENT_CLAUDE_BARE=0` if a workflow genuinely depends
-//!   on auto-discovered context (e.g. an in-repo `CLAUDE.md` that
-//!   you cannot pass via `--append-system-prompt-file`).
+//!   because keychain lookup is skipped. The detection only checks
+//!   for the *presence* of the keychain entry (via `security
+//!   find-generic-password -s ...`); it never reads the secret, so
+//!   no authorisation prompt is triggered.
 //! - `--dangerously-skip-permissions` -- headless `-p` mode cannot
 //!   prompt the operator for tool-use approval. Without this flag,
 //!   every `Write` / `Edit` / `Bash` invocation by the spawned step
@@ -178,23 +193,201 @@ fn assemble_args(
 }
 
 /// Env var Anthropic looks for when bare mode is active and OAuth/keychain
-/// are skipped. Used only for the one-shot warning in
-/// [`LocalShellSpawner::detect`] -- the spawner never reads the value.
+/// are skipped. Used by [`LocalShellSpawner::detect`] both for the
+/// auto-decision and the one-shot warning -- the spawner never reads
+/// the value during the spawn hot path.
 const ENV_ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
 
-/// Pure parser for the `FLOWD_AGENT_CLAUDE_BARE` toggle. The default is
-/// `true`; only the literal string `"0"` flips it off, so a stray non-empty
-/// value (a typo, `"true"`, etc.) keeps the safe default rather than
-/// silently disabling the speedup. Pulled out as a free function so unit
-/// tests can exercise it without mutating the process environment.
-fn parse_claude_bare_toggle(raw: Option<&str>) -> bool {
-    !matches!(raw, Some("0"))
+/// Tri-state operator override for the `--bare` injection.
+///
+/// `Auto` means "let `LocalShellSpawner::detect` decide based on
+/// available auth": if Claude Code's OAuth/keychain credentials are
+/// reachable from the daemon's user, default OFF (parity with running
+/// `claude -p` directly); otherwise default ON (the
+/// reproducibility-favouring legacy default).
+///
+/// `On` and `Off` are explicit operator overrides; the resolver never
+/// re-evaluates them against the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeBareToggle {
+    Auto,
+    On,
+    Off,
 }
 
-/// Resolve the toggle from the live process environment. Read once in
-/// [`LocalShellSpawner::detect`] so the hot path is env-free.
-fn read_claude_bare_toggle() -> bool {
+/// Pure parser for the `FLOWD_AGENT_CLAUDE_BARE` env var. Only the
+/// literal strings `"0"` and `"1"` flip the toggle to a hard
+/// `Off` / `On`; anything else (unset, empty, `"true"`, typos)
+/// resolves to `Auto` so the credential probe gets the final say.
+///
+/// Backward compatibility: the previous parser treated *anything but
+/// `"0"`* as ON. Operators who relied on that to force ON (the legacy
+/// default behaviour for unset env) should now set the value to `"1"`
+/// explicitly. Stray non-empty values that previously mapped to ON
+/// now map to Auto, which on a credential-equipped workstation also
+/// resolves to OFF -- a deliberate convenience improvement, not a
+/// silent regression: a missing key path still surfaces via the
+/// `ANTHROPIC_API_KEY` warning below.
+fn parse_claude_bare_toggle(raw: Option<&str>) -> ClaudeBareToggle {
+    match raw {
+        Some("0") => ClaudeBareToggle::Off,
+        Some("1") => ClaudeBareToggle::On,
+        _ => ClaudeBareToggle::Auto,
+    }
+}
+
+/// Read the toggle from the live process environment. Called once per
+/// spawner construction; the hot path stays env-free.
+fn read_claude_bare_toggle() -> ClaudeBareToggle {
     parse_claude_bare_toggle(std::env::var("FLOWD_AGENT_CLAUDE_BARE").ok().as_deref())
+}
+
+/// End-to-end live resolution of the `--bare` flag from the current
+/// process environment. Reads the toggle, probes for credentials only
+/// when the answer can swing the decision, and applies
+/// [`resolve_claude_bare`]. Logging is suppressed -- live callers go
+/// through [`LocalShellSpawner::detect`] which decides when to log.
+fn live_claude_bare() -> bool {
+    let toggle = read_claude_bare_toggle();
+    let env_api_key_set =
+        std::env::var_os(ENV_ANTHROPIC_API_KEY).is_some_and(|v| !v.is_empty());
+    let creds = if matches!(toggle, ClaudeBareToggle::Auto) && !env_api_key_set {
+        detect_claude_credentials()
+    } else {
+        ClaudeCredentialState::Missing
+    };
+    resolve_claude_bare(toggle, creds, env_api_key_set)
+}
+
+/// Outcome of the Claude Code credential probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeCredentialState {
+    /// A credential source the upstream Claude Code CLI can read on
+    /// its own (macOS keychain entry or `~/.claude/.credentials.json`)
+    /// is reachable. Auto-resolution prefers OFF in this case so the
+    /// daemon-spawned `claude` behaves the same as an interactive run.
+    Available,
+    /// No credential source detectable from this process. Auto stays
+    /// ON, which forces the operator to provide `ANTHROPIC_API_KEY`
+    /// (or an `apiKeyHelper` via `--settings`) -- the legacy default.
+    Missing,
+}
+
+/// Probe for a Claude Code credential source the upstream CLI would
+/// pick up on its own. Synchronous and fail-closed: any unexpected
+/// error (missing `security` binary, broken FS, permission denials)
+/// yields `Missing` so the resolver keeps the safer legacy default.
+///
+/// Platform layout (matches what the upstream CLI looks for):
+/// - macOS: `security find-generic-password -s "Claude Code-credentials"`.
+///   We only inspect the exit code -- never the secret itself -- so
+///   this never prompts the user with an authorisation dialog.
+/// - Other platforms: `~/.claude/.credentials.json` (the cross-platform
+///   fallback Claude Code uses where keychain integration isn't
+///   available).
+fn detect_claude_credentials() -> ClaudeCredentialState {
+    #[cfg(target_os = "macos")]
+    {
+        // `security find-generic-password` exits 0 when the entry
+        // exists, regardless of whether the caller has access to
+        // its data. We pass `/dev/null` for stdout/stderr so the
+        // probe never pollutes the daemon log with keychain noise.
+        let probe = std::process::Command::new("security")
+            .args(["find-generic-password", "-s", "Claude Code-credentials"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if matches!(probe, Ok(s) if s.success()) {
+            return ClaudeCredentialState::Available;
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let creds = PathBuf::from(home).join(".claude").join(".credentials.json");
+        if creds.is_file() {
+            return ClaudeCredentialState::Available;
+        }
+    }
+
+    ClaudeCredentialState::Missing
+}
+
+/// Resolve the operator toggle plus environment signals into the
+/// final boolean handed to the spawner. Pure -- so the unit test
+/// suite can exhaustively pin the policy without mutating the
+/// process environment or mocking the keychain probe.
+///
+/// The policy:
+/// - `On` and `Off` always win (explicit operator intent).
+/// - `Auto` + creds available + no `ANTHROPIC_API_KEY`: default OFF
+///   so OAuth/keychain authenticated workstations work without
+///   ceremony.
+/// - `Auto` + `ANTHROPIC_API_KEY` set: default ON. The operator
+///   has provided bare-mode-compatible auth, so we keep the
+///   reproducibility / speed benefits of bare mode.
+/// - `Auto` + no creds + no env key: default ON, matching the
+///   legacy behaviour. The downstream warning still fires because
+///   neither auth source is present, telling the operator how to
+///   recover.
+fn resolve_claude_bare(
+    toggle: ClaudeBareToggle,
+    creds: ClaudeCredentialState,
+    env_api_key_set: bool,
+) -> bool {
+    match toggle {
+        ClaudeBareToggle::On => true,
+        ClaudeBareToggle::Off => false,
+        ClaudeBareToggle::Auto => {
+            if env_api_key_set {
+                true
+            } else {
+                !matches!(creds, ClaudeCredentialState::Available)
+            }
+        }
+    }
+}
+
+/// Emit a one-shot tracing event explaining why bare mode is on or off.
+/// Split out from [`LocalShellSpawner::detect`] so the resolver test
+/// suite stays pure -- and so the format lives next to the policy it
+/// describes.
+fn log_claude_bare_decision(
+    toggle: ClaudeBareToggle,
+    creds: ClaudeCredentialState,
+    env_api_key_set: bool,
+    claude_bare: bool,
+) {
+    let auto = matches!(toggle, ClaudeBareToggle::Auto);
+    let creds_available = matches!(creds, ClaudeCredentialState::Available);
+
+    if claude_bare && !env_api_key_set && !creds_available {
+        tracing::warn!(
+            "Claude bare mode is ON but neither ANTHROPIC_API_KEY nor a \
+             local Claude Code credential source is detectable. Bare mode \
+             skips OAuth and the OS keychain, so spawned `claude` \
+             invocations will fail unless an apiKeyHelper is provided via \
+             `--settings` (in FLOWD_AGENT_EXTRA_ARGS). Set ANTHROPIC_API_KEY \
+             or export FLOWD_AGENT_CLAUDE_BARE=0 to disable bare mode."
+        );
+        return;
+    }
+
+    if auto {
+        if claude_bare {
+            tracing::info!(
+                "Claude bare mode auto-enabled (ANTHROPIC_API_KEY is set). \
+                 Override with FLOWD_AGENT_CLAUDE_BARE=0."
+            );
+        } else {
+            tracing::info!(
+                "Claude bare mode auto-disabled (local Claude Code \
+                 credentials detected, ANTHROPIC_API_KEY unset). \
+                 Spawned `claude` will reuse the operator's OAuth/keychain \
+                 auth. Override with FLOWD_AGENT_CLAUDE_BARE=1."
+            );
+        }
+    }
 }
 
 /// Subset of Claude Code's final `result` event payload (in
@@ -365,27 +558,36 @@ impl LocalShellSpawner {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
 
-        let claude_bare = read_claude_bare_toggle();
+        let toggle = read_claude_bare_toggle();
+        let env_api_key_set =
+            std::env::var_os(ENV_ANTHROPIC_API_KEY).is_some_and(|v| !v.is_empty());
 
-        // Bare mode disables OAuth/keychain lookup, so Anthropic auth has
-        // to come from the environment (or an `apiKeyHelper` declared via
-        // `--settings` in `extra_args`). We can't *prove* the latter from
-        // here, so we only warn when both: bare is on, the bin is
-        // Claude-like, and `ANTHROPIC_API_KEY` is unset. This fires once
-        // per spawner construction (typically once per daemon start) and
-        // never in the spawn hot path.
-        if claude_bare
-            && is_claude_like(&bin)
-            && std::env::var_os(ENV_ANTHROPIC_API_KEY).is_none_or(|v| v.is_empty())
+        // Probe the keychain / credentials file only when we might
+        // actually need the answer: a Claude-like bin in `Auto` mode
+        // without a process-level API key. This keeps the keychain
+        // probe off the hot path for non-Claude bins and for operators
+        // who pinned the toggle explicitly.
+        let claude_like = is_claude_like(&bin);
+        let creds = if claude_like
+            && matches!(toggle, ClaudeBareToggle::Auto)
+            && !env_api_key_set
         {
-            tracing::warn!(
-                "FLOWD_AGENT_CLAUDE_BARE is on but ANTHROPIC_API_KEY is not set; \
-                 bare mode skips OAuth and the OS keychain, so spawned `claude` \
-                 invocations will fail unless an apiKeyHelper is provided via \
-                 `--settings` (in FLOWD_AGENT_EXTRA_ARGS). Set ANTHROPIC_API_KEY \
-                 or export FLOWD_AGENT_CLAUDE_BARE=0 to restore the previous \
-                 behavior."
-            );
+            detect_claude_credentials()
+        } else {
+            ClaudeCredentialState::Missing
+        };
+
+        let claude_bare = resolve_claude_bare(toggle, creds, env_api_key_set);
+
+        // One-shot diagnostic so operators understand why they're in
+        // bare or non-bare mode. Tracing level is chosen by severity:
+        // - `info` for an Auto-resolved decision (informational, the
+        //   common path on a fresh dev box).
+        // - `warn` when bare is ON but neither auth source is present;
+        //   the spawned `claude` is going to fail at run time and the
+        //   operator needs to act.
+        if claude_like {
+            log_claude_bare_decision(toggle, creds, env_api_key_set, claude_bare);
         }
 
         Some(Self {
@@ -411,7 +613,7 @@ impl LocalShellSpawner {
             prompt_flag: DEFAULT_PROMPT_FLAG.to_owned(),
             cwd: None,
             extra_args: Vec::new(),
-            claude_bare: read_claude_bare_toggle(),
+            claude_bare: live_claude_bare(),
         }
     }
 
@@ -1943,25 +2145,75 @@ mod tests {
         assert!(!argv.iter().any(|a| a == "--resume"));
     }
 
-    /// Pin the toggle's parser so a typo doesn't silently switch
-    /// behavior. Anything other than the literal `"0"` keeps the safe
-    /// default ON, including unset, empty, `"false"`, `"no"`, `"1"`.
-    /// We test the pure parser rather than `read_claude_bare_toggle`
-    /// itself so this test does not race with parallel tests over the
-    /// process environment.
+    /// Pin the toggle's tri-state parser. Only the literal strings
+    /// `"0"` and `"1"` map to a hard `Off` / `On`; everything else
+    /// (unset, empty, typos, `"false"`, `"yes"`) resolves to `Auto`
+    /// so the credential probe gets the final say. We test the pure
+    /// parser rather than `read_claude_bare_toggle` itself so this
+    /// test does not race with parallel tests over the process
+    /// environment.
     #[test]
-    fn parse_claude_bare_toggle_only_disables_on_literal_zero() {
-        assert!(parse_claude_bare_toggle(None), "unset defaults to ON");
-        assert!(!parse_claude_bare_toggle(Some("0")), "\"0\" disables");
-        assert!(parse_claude_bare_toggle(Some("1")), "\"1\" stays ON");
-        assert!(
-            parse_claude_bare_toggle(Some("false")),
-            "non-literal-zero values do not disable"
+    fn parse_claude_bare_toggle_tri_state() {
+        assert_eq!(
+            parse_claude_bare_toggle(None),
+            ClaudeBareToggle::Auto,
+            "unset resolves to Auto"
         );
-        assert!(parse_claude_bare_toggle(Some("")), "empty string stays ON");
+        assert_eq!(
+            parse_claude_bare_toggle(Some("0")),
+            ClaudeBareToggle::Off,
+            "\"0\" forces Off"
+        );
+        assert_eq!(
+            parse_claude_bare_toggle(Some("1")),
+            ClaudeBareToggle::On,
+            "\"1\" forces On"
+        );
+        for stray in ["", "false", "true", "yes", "no", "00", "01"] {
+            assert_eq!(
+                parse_claude_bare_toggle(Some(stray)),
+                ClaudeBareToggle::Auto,
+                "unrecognised value {stray:?} must resolve to Auto",
+            );
+        }
+    }
+
+    /// Pin the resolver policy. Pure -- no env mutation, no keychain
+    /// probe -- so we can exhaustively cover the truth table.
+    #[test]
+    fn resolve_claude_bare_truth_table() {
+        use ClaudeBareToggle::{Auto, Off, On};
+        use ClaudeCredentialState::{Available, Missing};
+
+        for creds in [Available, Missing] {
+            for env_api_key_set in [true, false] {
+                assert!(
+                    resolve_claude_bare(On, creds, env_api_key_set),
+                    "explicit On always wins (creds={creds:?}, env={env_api_key_set})"
+                );
+                assert!(
+                    !resolve_claude_bare(Off, creds, env_api_key_set),
+                    "explicit Off always wins (creds={creds:?}, env={env_api_key_set})"
+                );
+            }
+        }
+
         assert!(
-            parse_claude_bare_toggle(Some("00")),
-            "only the exact string \"0\" disables"
+            resolve_claude_bare(Auto, Missing, true),
+            "Auto + ANTHROPIC_API_KEY set must keep bare ON"
+        );
+        assert!(
+            resolve_claude_bare(Auto, Available, true),
+            "Auto + env key set wins over local creds (env is sufficient for bare mode)"
+        );
+        assert!(
+            !resolve_claude_bare(Auto, Available, false),
+            "Auto + creds + no env key must auto-disable bare for OAuth/keychain auth"
+        );
+        assert!(
+            resolve_claude_bare(Auto, Missing, false),
+            "Auto + neither auth source must default to bare ON (legacy safe default; \
+             warning fires from log_claude_bare_decision)"
         );
     }
 
@@ -2772,7 +3024,7 @@ mod tests {
             prompt_flag: DEFAULT_PROMPT_FLAG.to_owned(),
             cwd: Some(workdir.path().to_path_buf()),
             extra_args: Vec::new(),
-            claude_bare: read_claude_bare_toggle(),
+            claude_bare: live_claude_bare(),
         };
 
         let prompt = format!(
@@ -2831,7 +3083,7 @@ mod tests {
             prompt_flag: DEFAULT_PROMPT_FLAG.to_owned(),
             cwd: None,
             extra_args: vec!["--output-format=text".to_owned()],
-            claude_bare: read_claude_bare_toggle(),
+            claude_bare: live_claude_bare(),
         };
         let err = s
             .spawn(ctx(), &step("Reply with exactly the two characters: OK"))
