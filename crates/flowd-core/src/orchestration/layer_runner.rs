@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -45,25 +46,40 @@ use crate::error::{FlowdError, Result};
 use super::Plan;
 use super::executor::{
     AgentMetrics, AgentSpawnContext, AgentSpawner, PlanRuntime, PlanSessionHandle, StepOutcome,
-    apply_outcome, run_step,
+    apply_outcome, mark_step_running, run_step,
 };
 use super::gate::SharedRuleGate;
 use super::observer::{PlanEvent, PlanStepCounts, SharedPlanObserver};
+use super::store::PlanStore;
 use super::template;
 
 /// Per-layer fan-out coordinator. Holds borrowed references to the
 /// executor's collaborators; constructed fresh inside `execute` for every
 /// plan run, so its lifetime is bounded by the run.
-pub(super) struct LayerRunner<'a, S: AgentSpawner + 'static> {
+pub(super) struct LayerRunner<'a, S: AgentSpawner + 'static, PS: PlanStore> {
     pub(super) spawner: &'a Arc<S>,
     pub(super) rule_gate: Option<&'a SharedRuleGate>,
     pub(super) observer: Option<&'a SharedPlanObserver>,
     pub(super) plans: &'a Arc<Mutex<HashMap<Uuid, PlanRuntime>>>,
+    /// Plan snapshot store. Used to publish the per-step Running
+    /// transition mid-layer so any external `plan_status` query (or
+    /// post-restart rehydrate) sees the in-flight state instead of
+    /// the pre-layer Pending row.
+    pub(super) store: &'a PS,
     /// Daemon-wide fallback timeout threaded in from
     /// [`super::executor::InMemoryPlanExecutor::default_step_timeout_secs`].
     /// Consulted per spawned step via [`run_step`]; per-step
     /// `timeout_secs` wins when set.
     pub(super) default_step_timeout_secs: Option<u64>,
+}
+
+/// Per-step record captured at the moment the layer runner flipped a
+/// step to Running. Carries everything the post-spawn `StepStarted`
+/// event needs without re-walking `plan.steps`.
+struct StartedStep {
+    step_id: String,
+    agent_type: String,
+    started_at: DateTime<Utc>,
 }
 
 /// Outcome of a single layer-run.
@@ -84,7 +100,7 @@ pub(super) struct LayerOutcome {
     pub(super) step_count: PlanStepCounts,
 }
 
-impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
+impl<S: AgentSpawner + 'static, PS: PlanStore> LayerRunner<'_, S, PS> {
     /// Run every step in `layer` against `plan`, mutating `plan.steps` in
     /// place with the outcomes and emitting per-step lifecycle events.
     ///
@@ -123,6 +139,7 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
             .collect();
 
         let mut handles: Vec<(String, JoinHandle<StepOutcome>)> = Vec::with_capacity(layer.len());
+        let mut started: Vec<StartedStep> = Vec::with_capacity(layer.len());
         let mut layer_failed = false;
         let mut rollup = AgentMetrics::default();
         let mut step_count = PlanStepCounts::default();
@@ -151,6 +168,14 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
                 continue;
             }
 
+            // Stamp the real start moment *before* spawn so the snapshot
+            // we publish below carries the timestamp the eventual
+            // StepCompleted/Failed/Cancelled outcome will preserve.
+            let started_at = Utc::now();
+            mark_step_running(plan, &step.id, started_at);
+            step.status = super::StepStatus::Running;
+            step.started_at = Some(started_at);
+
             let prior_session_id =
                 resume_id_for_step(layer_serial, last_session.as_ref(), &step.agent_type);
             let ctx = AgentSpawnContext {
@@ -161,6 +186,11 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
                 project_root: plan.project_root.as_deref().map(std::path::PathBuf::from),
                 prior_session_id,
             };
+            started.push(StartedStep {
+                step_id: step.id.clone(),
+                agent_type: step.agent_type.clone(),
+                started_at,
+            });
             let spawner = Arc::clone(self.spawner);
             let cancel_for_task = Arc::clone(cancel);
             let default_timeout = self.default_step_timeout_secs;
@@ -171,6 +201,23 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
         }
 
         self.publish_in_flight(plan_id, &handles)?;
+        // Mirror the Running state into both the in-memory runtime
+        // (so `status()` callers see the live transition) and the
+        // store (so a post-restart rehydrate can settle in-flight
+        // steps as Failed/Interrupted instead of leaving the
+        // pre-layer Pending row in place).
+        if !started.is_empty() {
+            self.publish_running_snapshot(plan_id, plan).await?;
+            for s in &started {
+                self.emit(PlanEvent::StepStarted {
+                    plan_id,
+                    project: plan.project.clone(),
+                    step_id: s.step_id.clone(),
+                    agent_type: s.agent_type.clone(),
+                    started_at: s.started_at,
+                });
+            }
+        }
 
         for (step_id, handle) in handles {
             let outcome = await_outcome(handle, &step_id).await;
@@ -363,6 +410,24 @@ impl<S: AgentSpawner + 'static> LayerRunner<'_, S> {
             runtime.in_flight = handles.iter().map(|(_, h)| h.abort_handle()).collect();
         }
         Ok(())
+    }
+
+    /// Make the just-marked Running steps observable: mirror them into
+    /// the in-memory runtime (so any concurrent `status()` returns the
+    /// transition immediately) and persist via the configured store.
+    /// Persistence runs outside the runtime mutex so a slow store does
+    /// not block readers.
+    async fn publish_running_snapshot(&self, plan_id: Uuid, plan: &Plan) -> Result<()> {
+        {
+            let mut guard = self.plans.lock().map_err(|_| FlowdError::PlanExecution {
+                message: "plan store poisoned".into(),
+                metrics: None,
+            })?;
+            if let Some(runtime) = guard.get_mut(&plan_id) {
+                runtime.plan.steps.clone_from(&plan.steps);
+            }
+        }
+        self.store.save_plan(plan).await
     }
 
     fn emit(&self, event: PlanEvent) {

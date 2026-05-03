@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -61,6 +62,22 @@ pub enum PlanEvent {
     },
     /// `execute` has begun draining DAG layers.
     Started { plan_id: Uuid, project: String },
+    /// A step has been accepted by every executor-side gate and is about
+    /// to spawn. Emitted *after* the step's `PlanStatus::Running` snapshot
+    /// has been mirrored into the in-memory runtime and persisted, so any
+    /// observer that re-queries `status()` on receipt sees the same
+    /// timestamp the event carries.
+    StepStarted {
+        plan_id: Uuid,
+        project: String,
+        step_id: String,
+        agent_type: String,
+        /// Wall-clock moment the executor flipped this step to Running.
+        /// Matches [`super::PlanStep::started_at`] verbatim and is the
+        /// `t0` for any per-step duration the eventual `StepCompleted`
+        /// / `StepFailed` consumer wants to compute.
+        started_at: DateTime<Utc>,
+    },
     /// A step finished successfully and its output was captured.
     StepCompleted {
         plan_id: Uuid,
@@ -204,6 +221,7 @@ impl PlanEvent {
         match self {
             Self::Submitted { plan_id, .. }
             | Self::Started { plan_id, .. }
+            | Self::StepStarted { plan_id, .. }
             | Self::StepCompleted { plan_id, .. }
             | Self::StepFailed { plan_id, .. }
             | Self::StepRefused { plan_id, .. }
@@ -224,6 +242,7 @@ impl PlanEvent {
         match self {
             Self::Submitted { project, .. }
             | Self::Started { project, .. }
+            | Self::StepStarted { project, .. }
             | Self::StepCompleted { project, .. }
             | Self::StepFailed { project, .. }
             | Self::StepRefused { project, .. }

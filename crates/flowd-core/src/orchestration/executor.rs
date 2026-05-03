@@ -37,7 +37,7 @@ use super::gate::SharedRuleGate;
 use super::layer_runner::LayerRunner;
 use super::observer::{PlanEvent, PlanStepCounts, SharedPlanObserver};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
@@ -672,6 +672,7 @@ impl<S: AgentSpawner + 'static, PS: PlanStore> PlanExecutor for InMemoryPlanExec
             rule_gate: self.rule_gate.as_ref(),
             observer: self.observer.as_ref(),
             plans: &self.plans,
+            store: &self.store,
             default_step_timeout_secs: self.default_step_timeout_secs,
         };
 
@@ -983,31 +984,61 @@ pub(super) async fn run_step<S: AgentSpawner + ?Sized>(
     }
 }
 
+/// Flip a step to [`StepStatus::Running`] and stamp its real start
+/// timestamp. Called by the layer runner *after* every executor-side
+/// gate (currently the rule gate) has accepted the step and before
+/// the spawn loop hands it to the agent.
+///
+/// The mutation is idempotent on `started_at`: if the slot is already
+/// populated (e.g. a future resume path that re-enters a half-run
+/// layer) we preserve the original moment so per-step duration stays
+/// truthful even across restarts.
+pub(super) fn mark_step_running(
+    plan: &mut Plan,
+    step_id: &str,
+    started_at: DateTime<Utc>,
+) {
+    if let Some(step) = plan.steps.iter_mut().find(|s| s.id == step_id) {
+        step.status = StepStatus::Running;
+        if step.started_at.is_none() {
+            step.started_at = Some(started_at);
+        }
+    }
+}
+
 pub(super) fn apply_outcome(plan: &mut Plan, step_id: &str, outcome: &StepOutcome) {
     let Some(step) = plan.steps.iter_mut().find(|s| s.id == step_id) else {
         return;
     };
     let now = Some(Utc::now());
-    if step.started_at.is_none() {
-        step.started_at = now;
-    }
-    step.completed_at = now;
     match outcome {
         StepOutcome::Completed { output, .. } => {
             step.status = StepStatus::Completed;
             step.output = Some(output.clone());
+            // started_at was set when the layer runner flipped the step to
+            // Running; preserve it so duration = completed_at - started_at
+            // reflects the real execution span, not just settlement time.
+            step.completed_at = now;
         }
         StepOutcome::Failed { error, .. } => {
             step.status = StepStatus::Failed;
             step.error = Some(error.clone());
+            step.completed_at = now;
         }
         StepOutcome::Cancelled => {
             step.status = StepStatus::Cancelled;
             step.error = Some("cancelled".into());
+            step.completed_at = now;
         }
         StepOutcome::Refused { reason } => {
+            // Refused steps were never spawned -- leaving started_at as
+            // None lets downstream consumers distinguish "never ran" from
+            // "ran and failed instantly". completed_at still records the
+            // settlement moment so the row has a deterministic terminal
+            // timestamp.
             step.status = StepStatus::Skipped;
             step.error = Some(reason.clone());
+            step.completed_at = now;
         }
     }
 }
@@ -1506,10 +1537,14 @@ mod tests {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             if let Ok(p) = exec_a.status(id).await {
+                // Wait until the executor has settled layer 1 (a, b
+                // both Completed) and started layer 2 -- step c is
+                // marked Running before its spawn, so the live
+                // snapshot now surfaces that transition mid-flight.
                 if p.status == PlanStatus::Running
                     && p.steps.iter().find(|s| s.id == "a").unwrap().status == StepStatus::Completed
                     && p.steps.iter().find(|s| s.id == "b").unwrap().status == StepStatus::Completed
-                    && p.steps.iter().find(|s| s.id == "c").unwrap().status == StepStatus::Pending
+                    && p.steps.iter().find(|s| s.id == "c").unwrap().status == StepStatus::Running
                 {
                     break;
                 }
@@ -1674,19 +1709,24 @@ mod tests {
             .iter()
             .map(crate::orchestration::plan_events::event_kind)
             .collect();
+        // Per-step lifecycle is `step_started -> step_completed`; the
+        // two layers (a, then b) interleave them so the executor can
+        // publish each step's Running snapshot before its outcome lands.
         assert_eq!(
             kinds,
             vec![
                 "submitted",
                 "started",
+                "step_started",
                 "step_completed",
+                "step_started",
                 "step_completed",
                 "finished"
             ],
             "unexpected event sequence: {kinds:?}"
         );
 
-        match &events[4] {
+        match events.last().expect("at least one event") {
             PlanEvent::Finished {
                 status,
                 step_count,
@@ -1748,6 +1788,230 @@ mod tests {
             0,
             "denied step must not be spawned"
         );
+    }
+
+    /// Truthful live state: while a step is in flight the executor must
+    /// publish a snapshot showing the step as Running with a real
+    /// `started_at`, then preserve that timestamp when the outcome
+    /// settles. Pre-fix, `apply_outcome` always overwrote `started_at`
+    /// with the settlement moment, so per-step duration came out as zero
+    /// even for long-running steps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_step_publishes_snapshot_and_preserves_started_at() {
+        use crate::orchestration::observer::{PlanEvent, PlanObserver};
+        use std::sync::atomic::AtomicBool;
+
+        // Spawner that blocks on a release flag so the test can observe
+        // the in-flight Running snapshot before the step settles.
+        struct GatedSpawner {
+            release: Arc<AtomicBool>,
+        }
+        impl AgentSpawner for GatedSpawner {
+            async fn spawn(&self, _ctx: AgentSpawnContext, step: &PlanStep) -> Result<AgentOutput> {
+                while !self.release.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Ok(AgentOutput::success(format!("ran:{}", step.id)))
+            }
+        }
+
+        #[derive(Default)]
+        struct CollectingObserver {
+            events: Mutex<Vec<PlanEvent>>,
+        }
+        impl PlanObserver for CollectingObserver {
+            fn on_event(&self, event: PlanEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let release = Arc::new(AtomicBool::new(false));
+        let store = MapPlanStore::default();
+        let obs = Arc::new(CollectingObserver::default());
+        let exec = Arc::new(
+            InMemoryPlanExecutor::with_plan_store(
+                GatedSpawner {
+                    release: Arc::clone(&release),
+                },
+                store.clone(),
+            )
+            .with_observer(Arc::clone(&obs) as Arc<dyn PlanObserver>),
+        );
+
+        let plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        let id = plan.id;
+        exec.submit(plan).await.unwrap();
+        exec.confirm(id).await.unwrap();
+
+        let exec_for_task = Arc::clone(&exec);
+        let jh = tokio::spawn(async move { exec_for_task.execute(id).await });
+
+        // Wait until the executor has marked step `a` Running and
+        // mirrored the snapshot.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = exec.status(id).await.unwrap();
+            if snap.status == PlanStatus::Running
+                && snap.steps[0].status == StepStatus::Running
+                && snap.steps[0].started_at.is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "step never reached Running with started_at",
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Persisted snapshot must agree with the in-memory view: a
+        // post-restart rehydrate would otherwise see the pre-layer
+        // Pending row instead of the in-flight Running state.
+        let persisted_running = store.0.lock().unwrap().get(&id).unwrap().clone();
+        assert_eq!(persisted_running.status, PlanStatus::Running);
+        assert_eq!(persisted_running.steps[0].status, StepStatus::Running);
+        let live_started_at = persisted_running.steps[0]
+            .started_at
+            .expect("running snapshot must carry started_at");
+
+        release.store(true, Ordering::SeqCst);
+        jh.await.unwrap().unwrap();
+
+        let final_plan = exec.status(id).await.unwrap();
+        assert_eq!(final_plan.status, PlanStatus::Completed);
+        assert_eq!(final_plan.steps[0].status, StepStatus::Completed);
+        assert_eq!(
+            final_plan.steps[0].started_at,
+            Some(live_started_at),
+            "settled outcome must preserve the started_at stamped at Running",
+        );
+        let completed_at = final_plan.steps[0]
+            .completed_at
+            .expect("completed step must carry completed_at");
+        assert!(
+            completed_at >= live_started_at,
+            "completed_at ({completed_at}) precedes started_at ({live_started_at})",
+        );
+
+        // StepStarted must have been emitted exactly once for the
+        // single accepted step, with the same timestamp the snapshot
+        // exposed.
+        let events = obs.events.lock().unwrap().clone();
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                PlanEvent::StepStarted {
+                    step_id,
+                    started_at,
+                    ..
+                } => Some((step_id.clone(), *started_at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "expected exactly one StepStarted event");
+        assert_eq!(starts[0].0, "a");
+        assert_eq!(starts[0].1, live_started_at);
+    }
+
+    /// Refused (rule-gate denied) steps are *not* started: no
+    /// `StepStarted` event, no `started_at` stamp, and the row settles
+    /// straight to `Skipped`. Sibling steps in the same layer that the
+    /// gate accepts still go through the normal Running -> Completed
+    /// lifecycle.
+    #[test]
+    fn refused_step_never_reports_started_but_sibling_does() {
+        use crate::error::RuleLevel;
+        use crate::orchestration::gate::RuleGate;
+        use crate::orchestration::observer::{PlanEvent, PlanObserver};
+        use crate::rules::{InMemoryRuleEvaluator, Rule, RuleEvaluator};
+
+        #[derive(Default)]
+        struct CollectingObserver {
+            events: Mutex<Vec<PlanEvent>>,
+        }
+        impl PlanObserver for CollectingObserver {
+            fn on_event(&self, event: PlanEvent) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let mut ev = InMemoryRuleEvaluator::new();
+        ev.register_rule(Rule {
+            id: "ban-banned".into(),
+            scope: "**".into(),
+            level: RuleLevel::Deny,
+            description: "the `banned` agent is forbidden".into(),
+            match_pattern: "^banned$".into(),
+        })
+        .unwrap();
+        let gate: Arc<dyn RuleGate> = Arc::new(ev);
+
+        let obs = Arc::new(CollectingObserver::default());
+        let exec = InMemoryPlanExecutor::new(EchoSpawner {
+            invocations: Arc::new(AtomicUsize::new(0)),
+        })
+        .with_rule_gate(gate)
+        .with_observer(Arc::clone(&obs) as Arc<dyn PlanObserver>);
+
+        // One layer with two parallel steps: `keep` (echo, allowed) and
+        // `drop` (banned, refused). Validates that the refusal of one
+        // does not poison the other's lifecycle.
+        let mut banned = step("drop", &[]);
+        banned.agent_type = "banned".into();
+        let plan = Plan::new("p", "flowd", vec![step("keep", &[]), banned]);
+        let plan_id = plan.id;
+
+        rt().block_on(async {
+            exec.submit(plan).await.unwrap();
+            exec.confirm(plan_id).await.unwrap();
+            exec.execute(plan_id).await.unwrap();
+        });
+
+        let final_plan = rt().block_on(exec.status(plan_id)).unwrap();
+        let drop_step = final_plan
+            .steps
+            .iter()
+            .find(|s| s.id == "drop")
+            .expect("drop step present");
+        assert_eq!(drop_step.status, StepStatus::Skipped);
+        assert!(
+            drop_step.started_at.is_none(),
+            "refused step must never carry a started_at, got {:?}",
+            drop_step.started_at,
+        );
+
+        let keep_step = final_plan
+            .steps
+            .iter()
+            .find(|s| s.id == "keep")
+            .expect("keep step present");
+        assert_eq!(keep_step.status, StepStatus::Completed);
+        assert!(
+            keep_step.started_at.is_some(),
+            "accepted step must carry a started_at",
+        );
+
+        let events = obs.events.lock().unwrap().clone();
+        let started_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                PlanEvent::StepStarted { step_id, .. } => Some(step_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started_ids,
+            vec!["keep"],
+            "only the accepted sibling may emit StepStarted",
+        );
+        let refused_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                PlanEvent::StepRefused { step_id, .. } => Some(step_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused_ids, vec!["drop"]);
     }
 
     #[test]

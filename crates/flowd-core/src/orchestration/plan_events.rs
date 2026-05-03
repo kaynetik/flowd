@@ -60,6 +60,7 @@ fn attach_metrics(payload: &mut JsonValue, metrics: Option<&AgentMetrics>) {
 pub mod kind {
     pub const SUBMITTED: &str = "submitted";
     pub const STARTED: &str = "started";
+    pub const STEP_STARTED: &str = "step_started";
     pub const STEP_COMPLETED: &str = "step_completed";
     pub const STEP_FAILED: &str = "step_failed";
     pub const STEP_REFUSED: &str = "step_refused";
@@ -79,6 +80,7 @@ pub fn event_kind(event: &PlanEvent) -> &'static str {
     match event {
         PlanEvent::Submitted { .. } => kind::SUBMITTED,
         PlanEvent::Started { .. } => kind::STARTED,
+        PlanEvent::StepStarted { .. } => kind::STEP_STARTED,
         PlanEvent::StepCompleted { .. } => kind::STEP_COMPLETED,
         PlanEvent::StepFailed { .. } => kind::STEP_FAILED,
         PlanEvent::StepRefused { .. } => kind::STEP_REFUSED,
@@ -99,7 +101,8 @@ pub fn event_kind(event: &PlanEvent) -> &'static str {
 #[must_use]
 pub fn event_step_id(event: &PlanEvent) -> Option<&str> {
     match event {
-        PlanEvent::StepCompleted { step_id, .. }
+        PlanEvent::StepStarted { step_id, .. }
+        | PlanEvent::StepCompleted { step_id, .. }
         | PlanEvent::StepFailed { step_id, .. }
         | PlanEvent::StepRefused { step_id, .. }
         | PlanEvent::StepCancelled { step_id, .. } => Some(step_id.as_str()),
@@ -119,7 +122,8 @@ pub fn event_step_id(event: &PlanEvent) -> Option<&str> {
 #[must_use]
 pub fn event_agent_type(event: &PlanEvent) -> Option<&str> {
     match event {
-        PlanEvent::StepCompleted { agent_type, .. }
+        PlanEvent::StepStarted { agent_type, .. }
+        | PlanEvent::StepCompleted { agent_type, .. }
         | PlanEvent::StepFailed { agent_type, .. }
         | PlanEvent::StepRefused { agent_type, .. }
         | PlanEvent::StepCancelled { agent_type, .. } => Some(agent_type.as_str()),
@@ -145,6 +149,9 @@ pub fn event_payload(event: &PlanEvent) -> JsonValue {
     match event {
         PlanEvent::Submitted { name, .. } => json!({ "name": name }),
         PlanEvent::Started { .. } | PlanEvent::StepCancelled { .. } => json!({}),
+        PlanEvent::StepStarted { started_at, .. } => json!({
+            "started_at": started_at.to_rfc3339(),
+        }),
         PlanEvent::StepCompleted {
             output, metrics, ..
         } => {
@@ -319,6 +326,16 @@ mod tests {
                     project: project.clone(),
                 },
                 kind::STARTED,
+            ),
+            (
+                PlanEvent::StepStarted {
+                    plan_id,
+                    project: project.clone(),
+                    step_id: "a".into(),
+                    agent_type: "echo".into(),
+                    started_at: Utc::now(),
+                },
+                kind::STEP_STARTED,
             ),
             (
                 PlanEvent::StepCompleted {
