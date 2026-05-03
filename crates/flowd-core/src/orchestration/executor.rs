@@ -993,11 +993,7 @@ pub(super) async fn run_step<S: AgentSpawner + ?Sized>(
 /// populated (e.g. a future resume path that re-enters a half-run
 /// layer) we preserve the original moment so per-step duration stays
 /// truthful even across restarts.
-pub(super) fn mark_step_running(
-    plan: &mut Plan,
-    step_id: &str,
-    started_at: DateTime<Utc>,
-) {
+pub(super) fn mark_step_running(plan: &mut Plan, step_id: &str, started_at: DateTime<Utc>) {
     if let Some(step) = plan.steps.iter_mut().find(|s| s.id == step_id) {
         step.status = StepStatus::Running;
         if step.started_at.is_none() {

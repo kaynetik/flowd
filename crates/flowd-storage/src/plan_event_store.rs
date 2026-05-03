@@ -482,10 +482,7 @@ mod tests {
         // payload carries only the executor-stamped `started_at` so a
         // post-restart consumer can recover the real start moment even
         // if the row's `created_at` drifted past it.
-        let payload_obj = rows[2]
-            .payload
-            .as_object()
-            .expect("payload is an object");
+        let payload_obj = rows[2].payload.as_object().expect("payload is an object");
         assert_eq!(
             payload_obj.len(),
             1,

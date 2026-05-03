@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "flowd-cli"
-version = "0.5.3"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "flowd-core"
-version = "0.4.2"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "flowd-storage"
-version = "0.4.1"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "chrono",

@@ -249,8 +249,7 @@ fn read_claude_bare_toggle() -> ClaudeBareToggle {
 /// through [`LocalShellSpawner::detect`] which decides when to log.
 fn live_claude_bare() -> bool {
     let toggle = read_claude_bare_toggle();
-    let env_api_key_set =
-        std::env::var_os(ENV_ANTHROPIC_API_KEY).is_some_and(|v| !v.is_empty());
+    let env_api_key_set = std::env::var_os(ENV_ANTHROPIC_API_KEY).is_some_and(|v| !v.is_empty());
     let creds = if matches!(toggle, ClaudeBareToggle::Auto) && !env_api_key_set {
         detect_claude_credentials()
     } else {
@@ -304,7 +303,9 @@ fn detect_claude_credentials() -> ClaudeCredentialState {
     }
 
     if let Some(home) = std::env::var_os("HOME") {
-        let creds = PathBuf::from(home).join(".claude").join(".credentials.json");
+        let creds = PathBuf::from(home)
+            .join(".claude")
+            .join(".credentials.json");
         if creds.is_file() {
             return ClaudeCredentialState::Available;
         }
@@ -568,10 +569,7 @@ impl LocalShellSpawner {
         // probe off the hot path for non-Claude bins and for operators
         // who pinned the toggle explicitly.
         let claude_like = is_claude_like(&bin);
-        let creds = if claude_like
-            && matches!(toggle, ClaudeBareToggle::Auto)
-            && !env_api_key_set
-        {
+        let creds = if claude_like && matches!(toggle, ClaudeBareToggle::Auto) && !env_api_key_set {
             detect_claude_credentials()
         } else {
             ClaudeCredentialState::Missing

@@ -433,8 +433,10 @@ mod tests {
         let payload = event_payload(&evt);
         let obj = payload.as_object().expect("payload is an object");
         assert_eq!(obj.len(), 1, "unexpected payload shape: {payload}");
-        assert_eq!(obj.get("started_at").and_then(|v| v.as_str()),
-            Some(started_at.to_rfc3339().as_str()));
+        assert_eq!(
+            obj.get("started_at").and_then(|v| v.as_str()),
+            Some(started_at.to_rfc3339().as_str())
+        );
     }
 
     #[test]
