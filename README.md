@@ -356,7 +356,7 @@ All read commands hit `SQLite` directly. `SQLite` WAL mode makes this safe while
 
 #### Plan event log
 
-`flowd plan events <plan_id>` replays the persisted lifecycle log for one plan. Per-step rows carry the cost and token block mined from the agent's own JSON envelope (success *and* failure paths -- expensive refusals are not silently dropped). The trailing `finished` row carries a per-plan rollup with total spend, compact token counts, cache read/create totals with a one-decimal reuse rate, and per-outcome step counts. The runtime line splits explicitly summed agent / API durations from wall-clock elapsed -- with parallel layers the sum exceeds elapsed, and the layout makes that visible:
+`flowd plan events <plan_id>` replays the persisted lifecycle log for one plan. `step_started` rows fire as each step flips to `Running` -- the same moment `plan_status` exposes via the step's `started_at` field, so a polling caller and the event log agree on `t0` for in-flight work. Per-step terminal rows carry the cost and token block mined from the agent's own JSON envelope (success *and* failure paths -- expensive refusals are not silently dropped). The trailing `finished` row carries a per-plan rollup with total spend, compact token counts, cache read/create totals with a one-decimal reuse rate, and per-outcome step counts. The runtime line splits explicitly summed agent / API durations from wall-clock elapsed -- with parallel layers the sum exceeds elapsed, and the layout makes that visible:
 
 ```text
 events: 8e2f1c9a-3b4d-4e07-9c11-1a2b3c4d5e6f
@@ -364,6 +364,7 @@ events: 8e2f1c9a-3b4d-4e07-9c11-1a2b3c4d5e6f
   2026-04-24 14:01:33Z  submitted
     name: refactor-auth
   2026-04-24 14:01:34Z  started
+  2026-04-24 14:01:35Z  step_started   step=extract-jwt  agent=rust-engineer
   2026-04-24 14:01:39Z  step_completed  step=extract-jwt  agent=rust-engineer
     output: pulled JWT helpers out of auth/mod.rs
     cost: $0.4231   tokens: in 2,148   out 8,392   cache_read 15,820   cache_creation 4,216
@@ -373,7 +374,7 @@ events: 8e2f1c9a-3b4d-4e07-9c11-1a2b3c4d5e6f
     runtime sum: api 24.7s   agent 268.1s   elapsed 258.0s
 ```
 
-Filter by event kind with `--kind step_failed,finished` and cap rows with `--limit`. Older plans recorded before metrics capture render without the cost lines rather than as `$0.0000` placeholders.
+Filter by event kind with `--kind step_started,step_failed,finished` and cap rows with `--limit`. Older plans recorded before metrics capture render without the cost lines rather than as `$0.0000` placeholders.
 
 What the cache columns mean:
 

@@ -208,8 +208,8 @@ pub enum PlanAction {
         /// Restrict to one or more event kinds. Pass either repeatedly
         /// (`--kind step_failed --kind step_completed`) or as a single
         /// comma-separated value. Allowed: `submitted`, `started`,
-        /// `step_completed`, `step_failed`, `step_refused`,
-        /// `step_cancelled`, `finished`.
+        /// `step_started`, `step_completed`, `step_failed`,
+        /// `step_refused`, `step_cancelled`, `finished`.
         #[arg(short, long, value_delimiter = ',')]
         kind: Vec<String>,
     },
