@@ -418,6 +418,26 @@ mod tests {
     }
 
     #[test]
+    fn step_started_populates_step_columns_and_started_at_payload() {
+        let started_at = Utc::now();
+        let evt = PlanEvent::StepStarted {
+            plan_id: Uuid::nil(),
+            project: "demo".into(),
+            step_id: "build".into(),
+            agent_type: "codex".into(),
+            started_at,
+        };
+        assert_eq!(event_kind(&evt), kind::STEP_STARTED);
+        assert_eq!(event_step_id(&evt), Some("build"));
+        assert_eq!(event_agent_type(&evt), Some("codex"));
+        let payload = event_payload(&evt);
+        let obj = payload.as_object().expect("payload is an object");
+        assert_eq!(obj.len(), 1, "unexpected payload shape: {payload}");
+        assert_eq!(obj.get("started_at").and_then(|v| v.as_str()),
+            Some(started_at.to_rfc3339().as_str()));
+    }
+
+    #[test]
     fn payload_finished_lowercases_status() {
         let evt = PlanEvent::Finished {
             plan_id: Uuid::nil(),

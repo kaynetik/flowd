@@ -439,6 +439,13 @@ mod tests {
                 plan_id,
                 project: project.clone(),
             },
+            PlanEvent::StepStarted {
+                plan_id,
+                project: project.clone(),
+                step_id: "build".into(),
+                agent_type: "echo".into(),
+                started_at: Utc::now(),
+            },
             PlanEvent::StepCompleted {
                 plan_id,
                 project: project.clone(),
@@ -465,15 +472,85 @@ mod tests {
             .await
             .expect("list");
 
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 5);
         assert_eq!(rows[0].kind, kind::SUBMITTED);
         assert_eq!(rows[1].kind, kind::STARTED);
-        assert_eq!(rows[2].kind, kind::STEP_COMPLETED);
+        assert_eq!(rows[2].kind, kind::STEP_STARTED);
         assert_eq!(rows[2].step_id.as_deref(), Some("build"));
         assert_eq!(rows[2].agent_type.as_deref(), Some("echo"));
-        assert_eq!(rows[2].payload["output"], "ok");
-        assert_eq!(rows[3].kind, kind::FINISHED);
-        assert_eq!(rows[3].payload["status"], "completed");
+        // Per-step identity / agent live on dedicated columns; the JSON
+        // payload carries only the executor-stamped `started_at` so a
+        // post-restart consumer can recover the real start moment even
+        // if the row's `created_at` drifted past it.
+        let payload_obj = rows[2]
+            .payload
+            .as_object()
+            .expect("payload is an object");
+        assert_eq!(
+            payload_obj.len(),
+            1,
+            "unexpected step_started payload shape: {}",
+            rows[2].payload
+        );
+        assert!(
+            payload_obj
+                .get("started_at")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "step_started payload must carry started_at; got {}",
+            rows[2].payload
+        );
+        assert_eq!(rows[3].kind, kind::STEP_COMPLETED);
+        assert_eq!(rows[3].step_id.as_deref(), Some("build"));
+        assert_eq!(rows[3].agent_type.as_deref(), Some("echo"));
+        assert_eq!(rows[3].payload["output"], "ok");
+        assert_eq!(rows[4].kind, kind::FINISHED);
+        assert_eq!(rows[4].payload["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_step_started_kind() {
+        // The kind-filter path is a separate code branch from the
+        // unfiltered list; exercise it for the new variant so a future
+        // tweak to the placeholder builder cannot silently drop
+        // step_started rows.
+        let store = store();
+        let plan_id = Uuid::new_v4();
+        let project = "demo".to_owned();
+
+        store
+            .record(&PlanEvent::StepStarted {
+                plan_id,
+                project: project.clone(),
+                step_id: "build".into(),
+                agent_type: "claude".into(),
+                started_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        store
+            .record(&PlanEvent::StepCompleted {
+                plan_id,
+                project,
+                step_id: "build".into(),
+                agent_type: "claude".into(),
+                output: "ok".into(),
+                metrics: None,
+            })
+            .await
+            .unwrap();
+
+        let only_started = store
+            .list_for_plan(
+                plan_id,
+                PlanEventQuery::new(100).with_kinds([kind::STEP_STARTED]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(only_started.len(), 1);
+        assert_eq!(only_started[0].kind, kind::STEP_STARTED);
+        assert_eq!(only_started[0].step_id.as_deref(), Some("build"));
+        assert_eq!(only_started[0].agent_type.as_deref(), Some("claude"));
     }
 
     #[tokio::test]

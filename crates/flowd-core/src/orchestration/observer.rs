@@ -66,7 +66,10 @@ pub enum PlanEvent {
     /// to spawn. Emitted *after* the step's `PlanStatus::Running` snapshot
     /// has been mirrored into the in-memory runtime and persisted, so any
     /// observer that re-queries `status()` on receipt sees the same
-    /// timestamp the event carries.
+    /// timestamp the event carries. Paired with the eventual
+    /// `StepCompleted` / `StepFailed` / `StepCancelled` outcome; consumers
+    /// can use the gap between `StepStarted` and its terminal outcome to
+    /// surface in-flight steps without polling the plan snapshot.
     StepStarted {
         plan_id: Uuid,
         project: String,

@@ -503,6 +503,7 @@ async fn persist_atomic(path: &std::path::Path, snapshot: &ObserverHealth) -> st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use flowd_core::error::Result;
     use flowd_core::orchestration::PlanStatus;
     use flowd_core::orchestration::plan_events::{PlanEventQuery, StoredPlanEvent, kind};
@@ -583,6 +584,13 @@ mod tests {
                 plan_id,
                 project: project.clone(),
             },
+            PlanEvent::StepStarted {
+                plan_id,
+                project: project.clone(),
+                step_id: "a".into(),
+                agent_type: "echo".into(),
+                started_at: Utc::now(),
+            },
             PlanEvent::StepCompleted {
                 plan_id,
                 project: project.clone(),
@@ -641,6 +649,7 @@ mod tests {
             vec![
                 kind::SUBMITTED,
                 kind::STARTED,
+                kind::STEP_STARTED,
                 kind::STEP_COMPLETED,
                 kind::STEP_FAILED,
                 kind::STEP_REFUSED,
