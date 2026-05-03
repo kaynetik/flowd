@@ -2791,4 +2791,175 @@ mod tests {
             "tail step must not resume any parallel-layer session"
         );
     }
+
+    // ---- mark_step_running / apply_outcome unit tests --------------------
+    //
+    // The layer runner stamps `Running` + `started_at` *before* spawn, then
+    // `apply_outcome` settles the row and stamps `completed_at`. End-to-end
+    // tests exercise the full path through `LayerRunner`, but these direct
+    // unit tests pin the two helpers in isolation so a regression in either
+    // step (forgetting to flip the status, overwriting `started_at` on
+    // settlement, leaving `completed_at` unset) surfaces immediately
+    // without needing a multi-thread executor harness.
+
+    #[test]
+    fn mark_step_running_stamps_status_and_started_at_when_unset() {
+        let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        let stamp = Utc::now();
+        mark_step_running(&mut plan, "a", stamp);
+
+        let s = &plan.steps[0];
+        assert_eq!(s.status, StepStatus::Running);
+        assert_eq!(
+            s.started_at,
+            Some(stamp),
+            "first transition must record the supplied moment verbatim",
+        );
+    }
+
+    #[test]
+    fn mark_step_running_preserves_existing_started_at() {
+        // Idempotency on `started_at` is the contract a future resume path
+        // (re-entering a half-run layer after a daemon restart) relies on:
+        // the original moment must survive so per-step duration stays
+        // truthful across restarts. Stamping a fresh `Utc::now()` would
+        // silently inflate any "ran for 0ms" row into "ran for the gap
+        // between crash and resume."
+        let original = Utc::now() - chrono::Duration::seconds(30);
+        let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        plan.steps[0].status = StepStatus::Running;
+        plan.steps[0].started_at = Some(original);
+
+        let later = Utc::now();
+        assert!(later > original, "test precondition: later > original");
+        mark_step_running(&mut plan, "a", later);
+
+        assert_eq!(plan.steps[0].status, StepStatus::Running);
+        assert_eq!(
+            plan.steps[0].started_at,
+            Some(original),
+            "second call must NOT overwrite the original started_at",
+        );
+    }
+
+    #[test]
+    fn mark_step_running_unknown_step_id_is_a_noop() {
+        // Defensive: a stray id (race with a delete, or a bug in the
+        // spawn loop) must not panic and must leave every other step's
+        // status / started_at unchanged.
+        let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        let before = plan.steps[0].clone();
+        mark_step_running(&mut plan, "ghost", Utc::now());
+        assert_eq!(plan.steps[0].status, before.status);
+        assert_eq!(plan.steps[0].started_at, before.started_at);
+    }
+
+    #[test]
+    fn apply_outcome_completed_preserves_started_at_and_stamps_completed_at() {
+        // Pre-fix, `apply_outcome` overwrote `started_at` with the
+        // settlement moment, collapsing every per-step duration to zero.
+        // This test pins the contract: started_at is what the layer
+        // runner stamped at Running; completed_at is the settlement
+        // moment; the gap between them is the real execution span.
+        let started_at = Utc::now() - chrono::Duration::seconds(5);
+        let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        plan.steps[0].status = StepStatus::Running;
+        plan.steps[0].started_at = Some(started_at);
+
+        let outcome = StepOutcome::Completed {
+            output: "done".into(),
+            metrics: None,
+            session_id: None,
+        };
+        apply_outcome(&mut plan, "a", &outcome);
+
+        let s = &plan.steps[0];
+        assert_eq!(s.status, StepStatus::Completed);
+        assert_eq!(s.output.as_deref(), Some("done"));
+        assert_eq!(
+            s.started_at,
+            Some(started_at),
+            "completed outcome must preserve the running-time started_at",
+        );
+        let completed_at = s.completed_at.expect("completed_at must be set");
+        assert!(
+            completed_at >= started_at,
+            "completed_at ({completed_at}) precedes started_at ({started_at})",
+        );
+    }
+
+    #[test]
+    fn apply_outcome_failed_preserves_started_at_and_stamps_completed_at() {
+        let started_at = Utc::now() - chrono::Duration::seconds(2);
+        let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        plan.steps[0].status = StepStatus::Running;
+        plan.steps[0].started_at = Some(started_at);
+
+        apply_outcome(
+            &mut plan,
+            "a",
+            &StepOutcome::Failed {
+                error: "boom".into(),
+                metrics: None,
+            },
+        );
+
+        let s = &plan.steps[0];
+        assert_eq!(s.status, StepStatus::Failed);
+        assert_eq!(s.error.as_deref(), Some("boom"));
+        // Failed steps still ran, so `started_at` must survive in the
+        // same way as Completed -- otherwise the cost / duration roll-up
+        // will report a zero-duration span for every retried failure.
+        assert_eq!(s.started_at, Some(started_at));
+        assert!(s.completed_at.is_some());
+    }
+
+    #[test]
+    fn apply_outcome_cancelled_preserves_started_at_and_stamps_completed_at() {
+        let started_at = Utc::now() - chrono::Duration::seconds(1);
+        let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        plan.steps[0].status = StepStatus::Running;
+        plan.steps[0].started_at = Some(started_at);
+
+        apply_outcome(&mut plan, "a", &StepOutcome::Cancelled);
+
+        let s = &plan.steps[0];
+        assert_eq!(s.status, StepStatus::Cancelled);
+        assert_eq!(s.error.as_deref(), Some("cancelled"));
+        assert_eq!(s.started_at, Some(started_at));
+        assert!(s.completed_at.is_some());
+    }
+
+    #[test]
+    fn apply_outcome_refused_leaves_started_at_none_and_settles_skipped() {
+        // Refused steps were never spawned: the layer runner emits a
+        // `StepRefused` event without ever calling `mark_step_running`,
+        // so `started_at` stays `None`. apply_outcome must NOT
+        // back-fill it -- doing so would erase the "never ran" signal
+        // that lets downstream consumers distinguish a gate refusal
+        // from an instant failure.
+        let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        assert!(plan.steps[0].started_at.is_none(), "test precondition");
+
+        apply_outcome(
+            &mut plan,
+            "a",
+            &StepOutcome::Refused {
+                reason: "rule deny".into(),
+            },
+        );
+
+        let s = &plan.steps[0];
+        assert_eq!(s.status, StepStatus::Skipped);
+        assert_eq!(s.error.as_deref(), Some("rule deny"));
+        assert!(
+            s.started_at.is_none(),
+            "refused step must never carry a started_at, got {:?}",
+            s.started_at,
+        );
+        assert!(
+            s.completed_at.is_some(),
+            "completed_at must still be stamped so the row has a deterministic terminal moment",
+        );
+    }
 }

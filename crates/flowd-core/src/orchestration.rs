@@ -1341,6 +1341,54 @@ mod tests {
         assert_eq!(meta.base_branch, "main");
     }
 
+    /// `plan_status` serialisation must surface an in-flight step --
+    /// `PlanStatus::Running` plus a `StepStatus::Running` step with a
+    /// real `started_at` -- exactly as the executor stamped it. This is
+    /// the wire contract every status consumer (CLI `plan status`, MCP
+    /// `plan_status` tool, post-restart rehydrate) depends on; if a
+    /// future refactor accidentally serialises Running as `pending` or
+    /// drops `started_at`, observers will silently lose all visibility
+    /// of the live transition the layer runner publishes mid-layer.
+    #[test]
+    fn plan_status_serialises_running_step_with_started_at() {
+        let started_at: DateTime<Utc> = Utc::now();
+        let mut plan = Plan::new("p", "proj", vec![step("a", &[])]);
+        plan.status = PlanStatus::Running;
+        plan.started_at = Some(started_at);
+        plan.steps[0].status = StepStatus::Running;
+        plan.steps[0].started_at = Some(started_at);
+
+        // First, pin the wire shape: lowercase status discriminants and
+        // an RFC-3339 `started_at` string. The CLI / MCP renderers all
+        // inspect these exact field names.
+        let value: serde_json::Value = serde_json::to_value(&plan).unwrap();
+        assert_eq!(value["status"], serde_json::Value::String("running".into()));
+        assert_eq!(
+            value["steps"][0]["status"],
+            serde_json::Value::String("running".into()),
+        );
+        assert!(
+            value["steps"][0]["started_at"].is_string(),
+            "step started_at must serialise as a string, got {:?}",
+            value["steps"][0]["started_at"],
+        );
+
+        // Then pin the round trip: a re-deserialised plan must carry
+        // identical Running discriminants and the same `started_at`
+        // moment, so a daemon that rehydrates a persisted snapshot
+        // sees the in-flight state instead of a Pending row.
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: Plan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, PlanStatus::Running);
+        assert_eq!(back.started_at, Some(started_at));
+        assert_eq!(back.steps[0].status, StepStatus::Running);
+        assert_eq!(back.steps[0].started_at, Some(started_at));
+        assert!(
+            back.steps[0].completed_at.is_none(),
+            "in-flight step must not carry completed_at",
+        );
+    }
+
     /// Pre-integration plan JSON must still deserialise cleanly so
     /// existing rows in the `plans.definition` blob keep loading after
     /// the field is added. Mirrors the legacy-fallback tests that

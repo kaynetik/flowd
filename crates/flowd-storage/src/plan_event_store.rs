@@ -553,6 +553,71 @@ mod tests {
         assert_eq!(only_started[0].agent_type.as_deref(), Some("claude"));
     }
 
+    /// End-to-end persistence regression: a recorded `StepStarted`
+    /// must materialise as a row whose `kind` is `step_started`, whose
+    /// dedicated `step_id` and `agent_type` columns are populated (so
+    /// they're indexable independently of the JSON payload), and whose
+    /// `started_at` payload string round-trips back to the *exact*
+    /// timestamp the executor stamped. The existing happy-path tests
+    /// assert the field is "a string"; this test pins the value, so a
+    /// future precision tweak (sub-second truncation, timezone drop)
+    /// surfaces immediately instead of silently shifting every per-step
+    /// duration the CLI / MCP renderers compute downstream.
+    #[tokio::test]
+    async fn step_started_persists_kind_columns_and_exact_started_at() {
+        let store = store();
+        let plan_id = Uuid::new_v4();
+        // Use a fixed moment (truncated to microseconds, the SQLite
+        // text-storage precision) rather than `Utc::now()` so the
+        // assertion is deterministic and any precision regression is
+        // immediately attributable.
+        let started_at: DateTime<Utc> = DateTime::parse_from_rfc3339("2026-05-03T08:15:30.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        store
+            .record(&PlanEvent::StepStarted {
+                plan_id,
+                project: "demo".into(),
+                step_id: "build".into(),
+                agent_type: "claude".into(),
+                started_at,
+            })
+            .await
+            .unwrap();
+
+        let rows = store
+            .list_for_plan(plan_id, PlanEventQuery::new(100))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one persisted row expected");
+        let row = &rows[0];
+        assert_eq!(row.kind, kind::STEP_STARTED);
+        // Dedicated columns -- not just buried in payload JSON -- so
+        // the existing `idx_plan_events_kind` index keeps subscriber
+        // queries fast even when callers filter on (kind, step_id).
+        assert_eq!(row.step_id.as_deref(), Some("build"));
+        assert_eq!(row.agent_type.as_deref(), Some("claude"));
+        assert_eq!(row.plan_id, plan_id);
+
+        // Payload carries only `started_at` (the columns above already
+        // cover step / agent identity); decode it back to a UTC moment
+        // and compare verbatim with the input.
+        let payload_started_at = row
+            .payload
+            .as_object()
+            .and_then(|o| o.get("started_at"))
+            .and_then(|v| v.as_str())
+            .expect("payload must carry started_at as a string");
+        let parsed: DateTime<Utc> = DateTime::parse_from_rfc3339(payload_started_at)
+            .expect("started_at payload must be RFC-3339")
+            .with_timezone(&Utc);
+        assert_eq!(
+            parsed, started_at,
+            "persisted started_at must round-trip to the exact recorded moment",
+        );
+    }
+
     #[tokio::test]
     async fn list_filters_by_kind() {
         let store = store();
